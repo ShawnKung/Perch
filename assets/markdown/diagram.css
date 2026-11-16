@@ -1,0 +1,26 @@
+.mermaid-diagram{margin:10px 0;border:1px solid var(--perch-line);border-radius:8px;overflow:hidden;background:#fff}
+.diagram-toolbar{display:flex;flex-wrap:wrap;gap:5px;padding:7px 8px;background:var(--perch-sidebar);border-bottom:1px solid var(--perch-line);text-align:left}
+.diagram-toolbar button,.diagram-source-toolbar button{border:1px solid var(--perch-line);border-radius:5px;background:white;color:var(--perch-accent);padding:3px 8px;font:11px -apple-system;cursor:pointer}
+.diagram-mode{display:flex;align-items:center;gap:7px;padding:2px 3px}
+.diagram-mode-label{color:var(--perch-accent);font:11px -apple-system}
+.diagram-toolbar .diagram-switch{position:relative;width:28px;height:16px;padding:0;border:0;border-radius:8px;background:var(--perch-line)}
+.diagram-switch::before{content:'';position:absolute;left:3px;top:3px;width:10px;height:10px;border-radius:50%;background:white}
+.diagram-toolbar .diagram-switch[aria-checked=true]{background:var(--perch-accent)}
+.diagram-switch[aria-checked=true]::before{transform:translateX(12px)}
+.diagram-toolbar button:disabled{opacity:.45;cursor:default}
+.diagram-toolbar button:focus-visible{outline:2px solid var(--perch-accent);outline-offset:1px}
+.diagram-image{position:relative;overflow:hidden;min-height:20px;padding:0;cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none}
+.diagram-image.dragging{cursor:grabbing}
+.diagram-image svg{position:absolute;left:0;top:0;transform-origin:0 0}
+.diagram-image .diagram-reset{position:absolute;right:8px;top:8px;z-index:1;border:1px solid var(--perch-line);border-radius:5px;background:white;color:var(--perch-accent);padding:3px 8px;font:11px -apple-system;cursor:pointer}
+.diagram-image svg{max-width:100%;height:auto}
+.diagram-source{display:flex;flex-direction:column;min-height:0;background:var(--perch-mint);text-align:left;user-select:text;-webkit-user-select:text}
+.diagram-source-toolbar{display:flex;justify-content:flex-end;padding:6px 8px}
+.mermaid-diagram .diagram-source pre{margin:0;border-radius:0;padding:12px;overflow:auto;user-select:text;-webkit-user-select:text}
+.mermaid-diagram [hidden]{display:none!important}
+.diagram-viewer{height:100%;margin:0;border:0;border-radius:0;display:flex;flex-direction:column}
+.diagram-viewer .diagram-image{flex:1;min-height:0;position:relative;overflow:hidden;padding:0;text-align:left;cursor:grab;touch-action:none;user-select:none}
+.diagram-viewer .diagram-image.dragging{cursor:grabbing}
+.diagram-viewer svg{position:absolute;left:0;top:0;transform-origin:0 0}
+.diagram-viewer .diagram-source{flex:1;overflow:hidden}
+.diagram-viewer .diagram-source pre{flex:1;min-height:0;white-space:pre;font:13px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace}
