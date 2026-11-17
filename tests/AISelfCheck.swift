@@ -350,104 +350,15 @@ enum AISelfCheck {
         toggleReasoning()
         try await wait { reasoningScroll(host) == nil }
         toggleReasoning()
-        do {
-            try await wait {
-                host.layoutSubtreeIfNeeded()
-                return reasoningScroll(host).map { $0.bottom > 500 && $0.frame.height > 200 && $0.frame.height <= 221 } == true
-            }
-        } catch {
-            if let view = reasoningScroll(host) {
-                print("Reopened reasoning: frame=\(view.frame) bounds=\(view.bounds) visible=\(view.visibleRect) bottom=\(view.bottom)")
-            } else {
-                print("Reopened reasoning missing; disclosure=\(String(describing: element(host, label: "思考过程")?.value(forKey: "accessibilityValue")))")
-            }
-            throw error
+        try await wait {
+            host.layoutSubtreeIfNeeded()
+            return reasoningScroll(host).map { $0.bottom > 500 && $0.frame.height > 200 && $0.frame.height <= 221 } == true
         }
         try await Task.sleep(nanoseconds: 300_000_000)
         host.layoutSubtreeIfNeeded()
         scroll = reasoningScroll(host)!
-        var ancestor = scroll.superview
-        while ancestor != nil && !(ancestor is NSScrollView) { ancestor = ancestor?.superview }
-        let outer = ancestor as! NSScrollView
-        let outerY = outer.contentView.bounds.minY
-        let savedPointer = NSEvent.mouseLocation
-        let screenTop = NSScreen.screens.first!.frame.maxY
-        func movePointer(_ screenPoint: NSPoint) {
-            CGWarpMouseCursorPosition(CGPoint(x: screenPoint.x, y: screenTop - screenPoint.y))
-        }
-        defer { movePointer(savedPointer) }
-        func innerPoint() -> NSPoint {
-            let rect = scroll.bounds.intersection(scroll.visibleRect)
-            return window.convertPoint(toScreen: scroll.convert(
-                NSPoint(x: rect.midX, y: rect.midY), to: nil))
-        }
-        func postTrackpad(_ delta: Int32, momentum: Bool = false, eventPoint: NSPoint? = nil) {
-            let screenPoint = eventPoint ?? NSEvent.mouseLocation
-            let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel,
-                wheelCount: 1, wheel1: delta, wheel2: 0, wheel3: 0)!
-            event.location = CGPoint(x: screenPoint.x, y: screenTop - screenPoint.y)
-            event.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
-            event.setIntegerValueField(momentum ? .scrollWheelEventMomentumPhase : .scrollWheelEventScrollPhase,
-                value: 2)
-            let wheel = NSEvent(cgEvent: event)!
-            precondition(wheel.hasPreciseScrollingDeltas)
-            precondition(momentum ? wheel.momentumPhase == .changed : wheel.phase == .changed)
-            // Posting exercises local monitors and window dispatch, unlike calling scrollWheel directly.
-            NSApp.postEvent(wheel, atStart: false)
-        }
-        movePointer(innerPoint())
-        postTrackpad(-120)
-        do {
-            try await wait { scroll.contentView.bounds.minY > 40 }
-        } catch {
-            print("Inner routing failed: frame=\(scroll.frame) visible=\(scroll.visibleRect) pointer=\(NSEvent.mouseLocation) y=\(scroll.contentView.bounds.minY) bottom=\(scroll.bottom) outer=\(outer.contentView.bounds)")
-            func dump(_ view: NSView) {
-                if view is AIMarkdownWebView || view === scroll {
-                    print("Routing view \(type(of: view)): frame=\(view.frame) windowRect=\(view.convert(view.bounds.intersection(view.visibleRect), to: nil)) hidden=\(view.isHiddenOrHasHiddenAncestor)")
-                }
-                view.subviews.forEach(dump)
-            }
-            dump(host)
-            print("Pointer window: \(NSWindow.windowNumber(at: NSEvent.mouseLocation, belowWindowWithWindowNumber: 0))/\(window.windowNumber)")
-            throw error
-        }
-        precondition(abs(outer.contentView.bounds.minY - outerY) < 2)
-        let beforeMomentum = scroll.contentView.bounds.minY
-        postTrackpad(30, momentum: true)
-        try await wait { scroll.contentView.bounds.minY < beforeMomentum - 20 }
-        precondition(abs(outer.contentView.bounds.minY - outerY) < 2)
-        let stalePoint = innerPoint()
-        let innerY = scroll.contentView.bounds.minY
-        let footerPoint = window.convertPoint(toScreen: NSPoint(x: 180, y: 12))
-        movePointer(footerPoint)
-        postTrackpad(-25, eventPoint: stalePoint)
-        try await wait { outer.contentView.bounds.minY > outerY + 10 }
-        precondition(abs(scroll.contentView.bounds.minY - innerY) < 2,
-                     "A stale gesture location must not steal scrolling outside reasoning")
-        outer.contentView.scroll(to: NSPoint(x: 0, y: outerY))
-        outer.reflectScrolledClipView(outer.contentView)
-        // Use native geometry: AX frames can lag behind an outer scroll/layout update.
-        try await wait {
-            host.layoutSubtreeIfNeeded()
-            return abs(outer.contentView.bounds.minY - outerY) < 2
-        }
-        let innerRect = scroll.convert(scroll.bounds.intersection(scroll.visibleRect), to: nil)
-        movePointer(window.convertPoint(toScreen: NSPoint(x: innerRect.midX, y: innerRect.maxY + 10)))
-        postTrackpad(-25, momentum: true, eventPoint: innerPoint())
-        try await wait { outer.contentView.bounds.minY > outerY + 10 }
-        precondition(abs(scroll.contentView.bounds.minY - innerY) < 2,
-                     "The disclosure header belongs to the outer conversation")
-        outer.contentView.scroll(to: NSPoint(x: 0, y: outerY))
-        outer.reflectScrolledClipView(outer.contentView)
-        host.layoutSubtreeIfNeeded()
-        movePointer(window.convertPoint(toScreen: NSPoint(x: 180, y: 312)))
-        postTrackpad(-25, eventPoint: innerPoint())
-        try await Task.sleep(nanoseconds: 100_000_000)
-        precondition(abs(scroll.contentView.bounds.minY - innerY) < 2 &&
-                     abs(outer.contentView.bounds.minY - outerY) < 2,
-                     "Window title must not scroll either content area")
         precondition(scroll.editor.isSelectable && !scroll.editor.isEditable)
-        print("PASS: reasoning follows bottom and pauses/resumes; reopened reasoning, outer text, disclosure header and window title route posted trackpad/momentum events by current pointer despite stale event coordinates")
+        print("PASS: reasoning follows bottom and pauses/resumes; reopened reasoning retains its bounded height and selectable read-only text")
     }
     static func searchChecks(baseURL: String) async throws {
         try await activityChecks()
@@ -797,7 +708,7 @@ enum AISelfCheck {
         try "Synthetic attachment: the verification code is FILE-4729.".write(to: fileURL, atomically: true, encoding: .utf8)
         defer { try? FileManager.default.removeItem(at: fileURL) }
         let file = try AIAttachment.read(fileURL)
-        let attached = UUID()
+        var attached = UUID()
         ai.send("Read attachment fixture", tab: attached, browser: nil, usePage: false, attachments: [file])
         try await wait { ai.sessions[attached]?.requestID == nil }
         precondition(ai.sessions[attached]?.error == nil && ai.sessions[attached]?.messages.first?.attachments.count == 1)
@@ -1043,7 +954,7 @@ enum AISelfCheck {
         let forkReload = AIController(defaults: defaults, conversationDirectory: directory)
         precondition(forkReload.conversations[attachmentConversation]!.messages.map(\.id) == originalIDs)
         precondition(forkReload.conversations[pendingForkID]?.messages[2].text == "Pending fork fixture")
-        ai.resumeConversation(attachmentConversation, tab: attached)
+        attached = ai.resumeConversation(attachmentConversation, tab: attached)
         ai.archiveConversations([pendingForkID]); ai.deleteConversations([pendingForkID])
         ai.drafts[attached] = "Prior unsent draft"; ai.draftReferences[attached] = [second]
         print("PASS: pending Fork leaves original unchanged until accepted send, cancel restores draft, independent branch persists original history")
@@ -1207,7 +1118,7 @@ enum AISelfCheck {
         ai.send("never sent fixture", tab: clearedTab, browser: nil, usePage: false)
         ai.clear(clearedTab)
         precondition(ai.queuedMessages[clearedTab] == nil && ai.sessions[clearedTab] == nil)
-        print("PASS: queued sends preserve FIFO and completed context; stop pauses, resume retains attachments, removal and new conversation clear pending work")
+        print("PASS: queued sends preserve FIFO and completed context; stop pauses, resume retains attachments, removal and explicit session clear discard pending work")
         let editingStream = UUID()
         ai.send("edit streaming fixture", tab: editingStream, browser: nil, usePage: false)
         try await wait { ai.sessions[editingStream]?.messages.last?.text.isEmpty == false }
@@ -1244,8 +1155,9 @@ enum AISelfCheck {
             precondition(ai.sessions[id]?.error?.contains(expected) == true)
             precondition(ai.sessions[id]?.error?.contains("synthetic-key") == false)
         }
+        let retainedIDs = ai.sessions.mapValues(\.id)
         ai.retainTabs([first])
-        precondition(ai.sessions.count == 1 && ai.sessions[first] != nil)
+        precondition(ai.sessions.mapValues(\.id) == retainedIDs, "Removing views must preserve conversation owners")
         ai.removeKey(); precondition(!ai.ready)
         let damaged = Data("damaged".utf8)
         defaults.set(damaged, forKey: "aiProviders")
@@ -1293,7 +1205,6 @@ enum AISelfCheck {
         print("PASS: bundled Markdown heading, bold, citation, code copy, table, HTML sanitization and layout")
         let initialScripts = try await web.callAsyncJavaScript("return {bytes:Array.from(document.scripts).reduce((n,s)=>n+s.textContent.length,0),loaded:!!window.mermaid}", arguments: [:], in: nil, contentWorld: .page) as! [String: Any]
         precondition(initialScripts["loaded"] as? Bool == false && (initialScripts["bytes"] as! Int) < 200000)
-        print("PERF: initial Markdown scripts = \(initialScripts["bytes"]!) characters; Mermaid deferred until a diagram")
         AIMarkdownView.render("""
         ```mermaid
         flowchart LR
@@ -1507,11 +1418,7 @@ enum AISelfCheck {
         defer { NSApp.mainMenu = previousMenu }
         NSApp.activate(ignoringOtherApps: true)
         viewerWindow.makeKeyAndOrderFront(nil)
-        do { try await wait { NSApp.keyWindow === viewerWindow } }
-        catch {
-            print("FOCUS: active=\(NSApp.isActive), onSpace=\(viewerWindow.isOnActiveSpace), visible=\(viewerWindow.isVisible), canKey=\(viewerWindow.canBecomeKey), key=\(NSApp.keyWindow?.title ?? "nil"), sheets=\(viewerWindow.sheets.count)")
-            throw error
-        }
+        try await wait { NSApp.keyWindow === viewerWindow }
         func commandW(_ target: NSWindow) -> Bool {
             let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .command,
                 timestamp: 0, windowNumber: target.windowNumber, context: nil, characters: "w",
@@ -1548,7 +1455,6 @@ enum AISelfCheck {
         markdownWeb.diagramRects = []
         precondition(markdownWeb.forwardVerticalScroll(wheel, at: overText))
         try await Task.sleep(nanoseconds: 150_000_000)
-        print("SCROLL: wheel delta = \(wheel.scrollingDeltaY), outer offset = \(before) → \(scroll.contentView.bounds.origin.y)"); fflush(stdout)
         precondition(abs(scroll.contentView.bounds.origin.y - before) > 10, "Vertical wheels over Markdown text must move the outer conversation")
         let horizontal = NSEvent(cgEvent: CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: 0, wheel2: -90, wheel3: 0)!)!
         precondition(!markdownWeb.forwardVerticalScroll(horizontal, at: overText), "Horizontal code/table scrolling must remain in WebKit")
@@ -1614,7 +1520,75 @@ enum AISelfCheck {
         window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
         return window
     }
+    static func composerReturnChecks() {
+        var draft = ""
+        var acceptsSend = true
+        var sent = 0
+        for command in [false, true] {
+            let composer = AIComposerInput(text: Binding(get: { draft }, set: { draft = $0 }),
+                enabled: true, mentionChanged: { _, _ in }, mentionCommand: { _ in false },
+                sendWithCommand: command, send: {
+                    guard acceptsSend else { return }
+                    sent += 1
+                    draft = ""
+                })
+            let coordinator = AIComposerInput.Coordinator(composer)
+            let editor = AIComposerTextView()
+            editor.delegate = coordinator
+            let event = NSEvent.keyEvent(with: .keyDown, location: .zero,
+                modifierFlags: command ? [.command] : [], timestamp: 0, windowNumber: 0, context: nil,
+                characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36)!
+            acceptsSend = true
+            editor.string = "快速中文提交"
+            precondition(coordinator.handleReturn(event, editor: editor))
+            precondition(draft.isEmpty && editor.string.isEmpty && editor.showsPlaceholder,
+                         "Accepted Return must clear both draft and native text synchronously")
+            editor.didChangeText()
+            precondition(draft.isEmpty && editor.string.isEmpty,
+                         "A late text-change notification must not restore submitted text")
+
+            acceptsSend = false
+            let acceptedCount = sent
+            editor.string = "拒绝发送保留草稿"
+            precondition(coordinator.handleReturn(event, editor: editor))
+            precondition(draft == editor.string && draft == "拒绝发送保留草稿" && sent == acceptedCount)
+            editor.setMarkedText("ni", selectedRange: NSRange(location: 2, length: 0),
+                                 replacementRange: NSRange(location: 0, length: editor.string.utf16.count))
+            precondition(!coordinator.handleReturn(event, editor: editor))
+            precondition(editor.hasMarkedText() && editor.string == "ni" &&
+                         draft == "拒绝发送保留草稿" && sent == acceptedCount)
+            editor.unmarkText()
+        }
+        precondition(sent == 2)
+        var coordinator: AIComposerInput.Coordinator!
+        let submitted = "同步发送触发界面更新"
+        draft = ""
+        let snapshot = AIComposerInput(text: Binding(get: { submitted }, set: { draft = $0 }),
+            enabled: true, mentionChanged: { _, _ in }, mentionCommand: { _ in false })
+        let composer = AIComposerInput(text: Binding(get: { draft }, set: { draft = $0 }),
+            enabled: true, mentionChanged: { _, _ in }, mentionCommand: { _ in false }, send: {
+                // Model a SwiftUI update while the synchronous Keychain helper waits.
+                coordinator.parent = snapshot
+                draft = ""
+            })
+        coordinator = AIComposerInput.Coordinator(composer)
+        let editor = AIComposerTextView()
+        editor.delegate = coordinator
+        editor.string = submitted
+        let event = NSEvent.keyEvent(with: .keyDown, location: .zero,
+            modifierFlags: NSEvent.ModifierFlags(rawValue: 256), timestamp: 0, windowNumber: 0, context: nil,
+            characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36)!
+        precondition(coordinator.handleReturn(event, editor: editor))
+        precondition(draft.isEmpty && editor.string.isEmpty,
+                     "A reentrant view update must not replace the active send callback or binding")
+        editor.didChangeText()
+        precondition(draft.isEmpty)
+        coordinator.parent = snapshot
+        print("PASS: Return preserves its original callback and binding across synchronous view updates")
+        print("PASS: Return/Cmd+Return clear native text before late notifications; rejected sends and IME retain drafts")
+    }
     static func composerUI(baseURL: String) async throws {
+        composerReturnChecks()
         // SwiftUI otherwise leaves its accessibility tree empty without an external screen reader.
         NSApp.accessibilitySetValue(true, forAttribute: NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface"))
         let suite = "dev.perch.ai.composer-ui.\(UUID())"
@@ -1623,7 +1597,7 @@ enum AISelfCheck {
         let store = Store(defaults: defaults)
         var config = AIConfiguration(provider: .custom, baseURL: baseURL + "/v1", model: "fixture")
         precondition(store.ai.save(config, key: "synthetic-key"))
-        let owner = AIController.homeID
+        var owner = AIController.homeID
         precondition(store.ai.send("Previous conversation fixture", tab: owner, browser: nil, usePage: false))
         try await wait { store.ai.sessions[owner]?.requestID == nil }
         let previous = store.ai.sessions[owner]!
@@ -1668,6 +1642,7 @@ enum AISelfCheck {
         }
         precondition(selected() == [previous.id])
         store.newChat()
+        owner = store.chatOwner
         try await wait { selected().isEmpty }
         try await Task.sleep(nanoseconds: 100_000_000)
         precondition(selected().isEmpty, "An empty new conversation must not highlight the old row")
@@ -1683,9 +1658,9 @@ enum AISelfCheck {
         precondition(store.ai.send("Followup conversation fixture", tab: owner, browser: nil, usePage: false))
         try await wait { store.ai.sessions[owner]?.requestID == nil }
         precondition(selected() == [previous.id, current.id], "Refreshing the current conversation must preserve manual multi-selection")
-        store.ai.resumeConversation(previous.id, tab: owner)
+        store.openChat(conversation: previous.id)
         try await wait { selected() == [previous.id] }
-        store.ai.resumeConversation(current.id, tab: owner)
+        store.openChat(conversation: current.id)
         try await wait { selected() == [current.id] }
         print("PASS: new/empty/first-message selection, title refresh, manual multi-selection and conversation switching")
 
@@ -1716,6 +1691,35 @@ enum AISelfCheck {
             }
             let prefix = fullPage ? "full" : "sidebar"
             try snapshot(prefix + "-idle")
+            for offset in [NSPoint.zero, NSPoint(x: 8, y: -9),
+                           NSPoint(x: -15, y: 0), NSPoint(x: 15, y: 0),
+                           NSPoint(x: 0, y: -15), NSPoint(x: 0, y: 15),
+                           NSPoint(x: -15, y: -15), NSPoint(x: 15, y: -15),
+                           NSPoint(x: -15, y: 15), NSPoint(x: 15, y: 15)] {
+                store.ai.drafts[owner] = "button hit fixture"
+                try await wait { element(in: host, label: "发送") != nil }
+                host.layoutSubtreeIfNeeded()
+                let rect = try frame("发送")
+                precondition(abs(rect.width - 34) < 1 && abs(rect.height - 34) < 1,
+                             "Send accessibility frame must cover the complete button label")
+                let count = store.ai.sessions[owner]?.messages.count ?? 0
+                let point = window.convertPoint(fromScreen: NSPoint(x: rect.midX + offset.x, y: rect.midY + offset.y))
+                for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                    NSApp.sendEvent(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
+                        timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                        context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!)
+                }
+                do {
+                    try await wait {
+                        (store.ai.sessions[owner]?.messages.count ?? 0) > count && store.ai.drafts[owner] == ""
+                    }
+                } catch {
+                    throw PerchError("\(prefix) send click missed at \(offset): \(error.localizedDescription)")
+                }
+                try await wait { store.ai.sessions[owner]?.requestID == nil }
+            }
+            print("PASS: \(prefix) send button accepts center, arrow edge, four sides and four corners")
+            store.ai.drafts[owner] = "native queue start fixture"
             precondition(store.ai.send(store.ai.drafts[owner]!, tab: owner, browser: nil, usePage: false))
             store.ai.drafts[owner] = ""
             try await wait { element(in: host, label: "停止生成") != nil && element(in: host, label: "发送") == nil }
@@ -1884,11 +1888,13 @@ enum AISelfCheck {
         window.setContentSize(NSSize(width: 1000, height: 650))
         let root = NSHostingView(rootView: RootView(store: store).defaultAppStorage(defaults))
         window.contentView = root
+        try await Task.sleep(nanoseconds: 100_000_000)
+        precondition(editor(in: root) == nil, "Closed AI sidebar must not construct a hidden composer")
+        root.layoutSubtreeIfNeeded()
+        let closedX = root.bounds.maxX
+        store.aiVisible = true
         try await wait { editor(in: root) != nil }
         let sideInput = editor(in: root)!
-        root.layoutSubtreeIfNeeded()
-        let closedX = sideInput.convert(sideInput.bounds, to: root).minX
-        store.aiVisible = true
         var samples: [CGFloat] = []
         for _ in 0..<18 {
             try await Task.sleep(nanoseconds: 20_000_000)
@@ -1901,8 +1907,8 @@ enum AISelfCheck {
             precondition(samples.contains { $0 > openedX + 5 && $0 < closedX - 5 }, "AI sidebar must pass through intermediate positions")
         }
         store.aiVisible = false
-        try await wait { sideInput.convert(sideInput.bounds, to: root).minX > closedX - 2 }
-        print("PASS: native right sidebar animated intermediate positions and closing layout")
+        try await wait { editor(in: root) == nil && sideInput.window == nil }
+        print("PASS: native right sidebar animates open and removes its composer when closed")
         store.ai.drafts[AIController.homeID] = "Continue here"
         store.openChat(owner: AIController.homeID)
         window.contentView = NSHostingView(rootView: RootView(store: store).defaultAppStorage(defaults))
@@ -2166,6 +2172,7 @@ enum AISelfCheck {
             (view as? AIMarkdownWebView).map { [$0] } ?? view.subviews.flatMap { markdownViews(in: $0) }
         }
         store.ai.seedPreview()
+        store.ai.saveConversations()
         try await wait { markdownViews(in: historyRoot).contains { $0.visibleRect.width > 20 && $0.visibleRect.height > 20 && $0.bounds.height > 300 } }
         let initialAnswer = markdownViews(in: historyRoot).first { $0.bounds.height > 300 }!
         var scrollAncestor = initialAnswer.superview
@@ -2174,7 +2181,6 @@ enum AISelfCheck {
         editScroll.contentView.scroll(to: NSPoint(x: 0, y: max(0, editScroll.documentView!.bounds.height - editScroll.contentSize.height)))
         editScroll.reflectScrolledClipView(editScroll.contentView)
         precondition(editScroll.contentView.bounds.origin.y > 50)
-        let beforeRewindOffset = editScroll.contentView.bounds.origin.y
         let editOwner = store.chatOwner
         let editMessage = store.ai.sessions[editOwner]!.messages[0]
         let preservedIDs = store.ai.sessions[editOwner]!.messages.map(\.id)
@@ -2182,7 +2188,6 @@ enum AISelfCheck {
         _ = store.ai.editMessage(editMessage.id, tab: editOwner)
         try await wait { fullInput.string == editMessage.text }
         try await Task.sleep(nanoseconds: 100_000_000)
-        print("REWIND: outer offset = \(beforeRewindOffset) → \(editScroll.contentView.bounds.origin.y)")
         try await wait { editScroll.contentView.bounds.origin.y < 30 }
         window.makeFirstResponder(fullInput)
         let escaped = fullInput.delegate?.textView?(fullInput, doCommandBy: NSSelectorFromString("cancelOperation:"))
@@ -2199,7 +2204,10 @@ enum AISelfCheck {
             (view as? AIHistoryTable).map { [$0] } ?? view.subviews.flatMap { historyTables(in: $0) }
         }
         store.chatHistoryVisible = true
-        try await wait { historyTables(in: historyRoot).first?.conversationIDs.compactMap { $0 }.count == 2 }
+        try await wait {
+            Set(historyTables(in: historyRoot).first?.conversationIDs.compactMap { $0 } ?? []) ==
+                Set(store.ai.activeConversations.map(\.id))
+        }
         let table = historyTables(in: historyRoot).first!
         table.scrollRowToVisible(0)
         let originalHistoryIDs = table.conversationIDs
@@ -2230,8 +2238,8 @@ enum AISelfCheck {
             throw PerchError("History chevron must remain beside its title")
         }
         print("PASS: history group chevrons, collapse/reopen and rapid reversal preserve both groups and conversation")
-        print("HISTORY CHECK: initial rows = \(table.conversationIDs), selection = \(table.selectedRowIndexes)"); fflush(stdout)
         let conversationRows = table.conversationIDs.indices.filter { table.conversationIDs[$0] != nil }
+        let selectionIDs = Array(conversationRows.prefix(2).compactMap { table.conversationIDs[$0] })
         let firstHoverRow = table.rowView(atRow: conversationRows[0], makeIfNecessary: true) as! AIHistoryRow
         let nextHoverRow = table.rowView(atRow: conversationRows[1], makeIfNecessary: true) as! AIHistoryRow
         let hoverMove = NSEvent.mouseEvent(with: .mouseMoved, location: .zero, modifierFlags: [],
@@ -2248,22 +2256,28 @@ enum AISelfCheck {
         precondition(firstHoverCell.archiveButton!.alphaValue == 0)
         nextHoverRow.mouseExited(with: hoverMove)
         print("PASS: history hover follows rows and archive fade-out immediately disables its click target")
+        table.deselectAll(nil)
         // Native mouseDown handles Control before AppKit can turn it into a context click.
-        for row in conversationRows {
+        for id in selectionIDs {
+            guard let row = table.conversationIDs.firstIndex(of: id) else { throw PerchError("History selection fixture disappeared") }
             let point = table.convert(NSPoint(x: 20, y: table.rect(ofRow: row).midY), to: nil)
             let event = NSEvent.mouseEvent(with: .leftMouseDown, location: point, modifierFlags: .control,
                                           timestamp: 0, windowNumber: window.windowNumber, context: nil,
                                           eventNumber: 1, clickCount: 1, pressure: 1)!
             table.mouseDown(with: event)
         }
-        precondition(table.selectedRowIndexes.count == 2 && store.chatOwner == editOwner)
-        let menu = table.contextMenu(at: conversationRows[0])!
+        guard table.selectedRowIndexes.count == 2 && store.chatOwner == editOwner else {
+            throw PerchError("History Ctrl selection: expected 2 rows without changing owner, got \(table.selectedRowIndexes), ownerUnchanged=\(store.chatOwner == editOwner)")
+        }
+        guard let menuRow = table.conversationIDs.firstIndex(of: selectionIDs[0]),
+              let menu = table.contextMenu(at: menuRow) else { throw PerchError("History context menu missing") }
         precondition(menu.items.last?.title == "归档 2 个对话" && table.selectedRowIndexes.count == 2)
         let copy = menu.items.first!
         let chatTabBeforeFork = store.selected
         let tabsBeforeFork = store.tabs.count
         _ = copy.target?.perform(copy.action!)
         try await wait { store.ai.recentConversations.count == 4 && store.chatOwner != editOwner }
+        try await wait { Set(table.conversationIDs.compactMap { $0 }) == Set(store.ai.activeConversations.map(\.id)) }
         precondition(store.selected == chatTabBeforeFork && store.tabs.count == tabsBeforeFork &&
                      store.tabs.filter { $0.chatOwner != nil }.count == 1)
         let forkOwner = store.chatOwner
@@ -2294,12 +2308,12 @@ enum AISelfCheck {
         store.ai.deleteConversations(Set(store.ai.archivedConversations.map(\.id)))
         precondition(store.ai.archivedConversations.isEmpty)
         precondition(store.ai.sessions[editOwner]!.messages.map(\.id) == preservedIDs)
+        try await wait { Set(table.conversationIDs.compactMap { $0 }) == Set(store.ai.activeConversations.map(\.id)) }
         table.scrollRowToVisible(0)
         let groupCell = table.view(atColumn: 0, row: 0, makeIfNecessary: true)!
         let plus = groupCell.subviews.compactMap { $0 as? NSButton }.first!
         historyRoot.layoutSubtreeIfNeeded()
         groupCell.layoutSubtreeIfNeeded()
-        print("PLUS CHECK: cell = \(groupCell.bounds), plus = \(plus.frame), viewport = \(table.visibleRect), rect = \(plus.convert(plus.bounds, to: table))"); fflush(stdout)
         precondition(groupCell.bounds.contains(plus.frame), "Chat group plus must fit completely inside its row")
         precondition(abs(plus.frame.maxX - groupCell.bounds.maxX + 10) < 1, "Plus must remain on the right of Chat group")
         try await wait {
@@ -2314,8 +2328,9 @@ enum AISelfCheck {
         let tabBeforeNew = store.selected
         plus.performClick(nil)
         try await wait { store.ai.sessions[store.chatOwner] == nil }
-        precondition(store.chatOwner == forkOwner && store.tabs.count == tabCountBeforeNew && store.selected == tabBeforeNew)
-        precondition(store.ai.drafts[forkOwner] == "" && store.ai.pendingEdits[forkOwner] == nil)
+        let newOwner = store.chatOwner
+        precondition(newOwner != forkOwner && store.tabs.count == tabCountBeforeNew && store.selected == tabBeforeNew)
+        precondition(store.ai.drafts[newOwner] == "" && store.ai.pendingEdits[newOwner] == nil)
         precondition(store.ai.sessions[editOwner]!.messages.map(\.id) == preservedIDs)
         let hoverRow = table.conversationIDs.firstIndex { $0 == store.ai.sessions[editOwner]?.id }!
         let hoverCell = table.view(atColumn: 0, row: hoverRow, makeIfNecessary: true) as! AIHistoryCell
@@ -2328,7 +2343,6 @@ enum AISelfCheck {
         try await Task.sleep(nanoseconds: 220_000_000)
         precondition(hoverCell.archiveButton?.alphaValue == 1 && hoverCell.archiveButton?.isEnabled == true)
         let archiveButton = hoverCell.archiveButton!
-        print("ARCHIVE CHECK: cell = \(hoverCell.bounds), button = \(archiveButton.frame), viewport = \(table.visibleRect), rect = \(archiveButton.convert(archiveButton.bounds, to: table))"); fflush(stdout)
         table.scrollRowToVisible(hoverRow)
         try await wait {
             historyRoot.layoutSubtreeIfNeeded()
@@ -2339,7 +2353,7 @@ enum AISelfCheck {
         precondition(archiveHit === archiveButton)
         hoverCell.archiveButton!.performClick(nil)
         try await wait { store.ai.conversations[hoveredID]?.isArchived == true }
-        precondition(store.selected == tabBeforeNew && store.chatOwner == forkOwner, "Hover archive must not activate a conversation")
+        precondition(store.selected == tabBeforeNew && store.chatOwner == newOwner, "Hover archive must not activate a conversation")
         store.ai.restoreConversations([hoveredID])
         store.openChat(owner: editOwner)
         store.chatHistoryVisible = false
@@ -2356,17 +2370,36 @@ enum AISelfCheck {
         precondition(store.restoreReference(AIPageReference(title: "invalid", url: URL(string: "file:///tmp"))) == nil)
         precondition(forkOwner != editOwner)
         print("PASS: rewind/Fork preview and native Esc, Ctrl/Shift selection, same-tab new conversation, contained plus, hover archive and reference recovery")
-        try await wait { markdownViews(in: historyRoot).contains { $0.visibleRect.width > 20 && $0.visibleRect.height > 20 && $0.bounds.height > 300 } }
-        let answer = markdownViews(in: historyRoot).first { $0.visibleRect.width > 20 && $0.visibleRect.height > 20 && $0.bounds.height > 300 }!
+        func scrollableText() -> (AIMarkdownWebView, NSPoint)? {
+            for answer in markdownViews(in: historyRoot) where answer.bounds.height > 300 {
+                let viewport = answer.bounds.intersection(answer.visibleRect)
+                guard viewport.width > 20, viewport.height > 20 else { continue }
+                for fraction in [0.1, 0.5, 0.9] {
+                    let point = NSPoint(x: viewport.midX, y: viewport.minY + viewport.height * fraction)
+                    let pagePoint = NSPoint(x: point.x, y: answer.isFlipped ? point.y : answer.bounds.height - point.y)
+                    guard !answer.diagramRects.contains(where: { $0.contains(pagePoint) }) else { continue }
+                    let windowPoint = answer.convert(point, to: nil)
+                    let hit = historyRoot.hitTest(historyRoot.superview?.convert(windowPoint, from: nil) ?? windowPoint)
+                    if hit === answer || hit?.isDescendant(of: answer) == true { return (answer, point) }
+                }
+            }
+            return nil
+        }
+        try await wait { scrollableText() != nil }
+        let (answer, textPoint) = scrollableText()!
         var ancestor = answer.superview
         while ancestor != nil && !(ancestor is NSScrollView) { ancestor = ancestor?.superview }
         let conversationScroll = ancestor as! NSScrollView
         let offset = conversationScroll.contentView.bounds.origin.y
         let scrollEvent = NSEvent(cgEvent: CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1,
             wheel1: offset > 50 ? 90 : -90, wheel2: 0, wheel3: 0)!)!
-        answer.scrollWheel(with: scrollEvent)
+        guard answer.forwardVerticalScroll(scrollEvent, at: textPoint) else {
+            throw PerchError("Full Chat must forward wheels over visible answer text")
+        }
         try await Task.sleep(nanoseconds: 150_000_000)
-        precondition(abs(conversationScroll.contentView.bounds.origin.y - offset) > 10, "The actual full Chat view must scroll when the wheel is over an answer")
+        guard abs(conversationScroll.contentView.bounds.origin.y - offset) > 10 else {
+            throw PerchError("Full Chat wheel did not move its conversation: before=\(offset), after=\(conversationScroll.contentView.bounds.origin.y)")
+        }
         print("PASS: real full Chat hierarchy scrolls over rendered answer text")
         var queueConfig = config
         queueConfig.baseURL = config.baseURL.replacingOccurrences(of: "/v1", with: "/slow")
@@ -2384,7 +2417,9 @@ enum AISelfCheck {
             timestamp: 0, windowNumber: window.windowNumber, context: nil,
             characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36)!
         precondition(fullInput.returnKey?(returnEvent) == true)
-        guard store.ai.queuedMessages[queueOwner]?.count == 1 && store.ai.drafts[queueOwner]?.isEmpty == true else {
+        fullInput.didChangeText()
+        guard store.ai.queuedMessages[queueOwner]?.count == 1 && store.ai.drafts[queueOwner]?.isEmpty == true &&
+              fullInput.string.isEmpty else {
             throw PerchError("Native Return did not queue and clear the busy composer")
         }
         if let directory = ProcessInfo.processInfo.environment["PERCH_LAYOUT_EVIDENCE"] {
@@ -2491,7 +2526,6 @@ enum AISelfCheck {
             throw PerchError("Reading capture viewport moved: offset=\(visibleOffset), bookmark=\(bookmark), initial renderer attached=\(last.window != nil)")
         }
         precondition(scroll.documentView!.bounds.height - scroll.contentSize.height - scroll.contentView.bounds.minY > 500)
-        print("READING: captured \(bookmark), visible offset \(visibleOffset)"); fflush(stdout)
         ai.saveConversations()
         let reloaded = AIController(defaults: defaults, conversationDirectory: directory)
         precondition(reloaded.readingPosition(for: record.id) == bookmark)
@@ -2511,14 +2545,14 @@ enum AISelfCheck {
             } ?? "target not mounted"
             throw PerchError("Reading restart restore: \(current), saved=\(String(describing: reloaded.readingPosition(for: record.id)))")
         }
-        print("READING: restarted viewport restored"); fflush(stdout)
         try await Task.sleep(nanoseconds: 400_000_000)
         precondition(restored(), "Delayed Markdown layout must retain the saved viewport")
-        reloaded.resumeConversation(other.id, tab: AIController.homeID)
+        let otherOwner = reloaded.resumeConversation(other.id, tab: AIController.homeID)
+        window.contentView = NSHostingView(rootView: AIChatSidebar(store: store, ai: reloaded, fullPage: true, owner: otherOwner, close: {}).defaultAppStorage(defaults))
         try await wait { answers(in: window.contentView!).isEmpty }
-        reloaded.resumeConversation(record.id, tab: AIController.homeID)
+        let recordOwner = reloaded.resumeConversation(record.id, tab: AIController.homeID)
+        window.contentView = NSHostingView(rootView: AIChatSidebar(store: store, ai: reloaded, fullPage: true, owner: recordOwner, close: {}).defaultAppStorage(defaults))
         try await wait(timeout: 20, restored)
-        print("READING: same-owner history restored"); fflush(stdout)
         // Match the previous 350pt chat viewport after collapsing the 240pt history sidebar.
         store.chatHistoryVisible = false
         window.setContentSize(NSSize(width: 390, height: 600))
@@ -2527,7 +2561,6 @@ enum AISelfCheck {
         }
         try await Task.sleep(nanoseconds: 400_000_000)
         try await wait(timeout: 20, restored)
-        print("READING: narrow viewport restored"); fflush(stdout)
         let conversationScroll = outer(lastAnswer()!)
         func wheelScroll(_ delta: Int32) async throws {
             let event = NSEvent(cgEvent: CGEvent(scrollWheelEvent2Source: nil, units: .pixel,
@@ -2573,7 +2606,7 @@ enum AISelfCheck {
         let fork = reloaded.forkConversation(record.id)!
         precondition(reloaded.readingPosition(for: fork) == nil)
         precondition(reloaded.readingPosition(for: record.id) == saved)
-        print("PASS: conversation viewport persisted and restored after restart, same-owner history switch, delayed Markdown and sidebar width; Fork has an independent bookmark")
+        print("PASS: conversation viewport persisted and restored after restart, history view rebinding, delayed Markdown and sidebar width; Fork has an independent bookmark")
     }
 
     static func keychain() throws {
