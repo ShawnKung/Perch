@@ -13,12 +13,27 @@ permissions:
 jobs:
   build:
     name: Build Apple Silicon app
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - name: Build and test
+      - name: Restore fixed signing identity
         env:
-          PERCH_CI_TRUST_SIGNING_CERT: '1'
+          SIGNING_KEYCHAIN: ${{ secrets.PERCH_SIGNING_KEYCHAIN_BASE64 }}
+          SIGNING_PASSWORD: ${{ secrets.PERCH_SIGNING_PASSWORD }}
+          SIGNING_CERTIFICATE: ${{ secrets.PERCH_SIGNING_CERTIFICATE_BASE64 }}
+        run: |
+          set -euo pipefail
+          test -n "$SIGNING_KEYCHAIN" && test -n "$SIGNING_PASSWORD" && test -n "$SIGNING_CERTIFICATE"
+          umask 077
+          signing="$HOME/Library/Application Support/Perch Signing"
+          mkdir -p "$signing"
+          printf '%s' "$SIGNING_KEYCHAIN" | base64 --decode > "$signing/signing.keychain-db"
+          printf '%s' "$SIGNING_PASSWORD" > "$signing/keychain-password"
+          printf '%s' "$SIGNING_CERTIFICATE" | base64 --decode > "$signing/certificate.pem"
+          security list-keychains -d user -s "$signing/signing.keychain-db" /Library/Keychains/System.keychain
+          sudo -n security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$signing/certificate.pem"
+      - name: Build and test
         run: |
           set -euo pipefail
           test "$(uname -m)" = arm64
