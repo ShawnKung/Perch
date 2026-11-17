@@ -9,26 +9,29 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `main.swift` | 应用入口、Browser / Store、主界面、菜单栏、窗口与生命周期 |
-| `Library.swift` / `Bookmarks.swift` | 侧栏、管理页、书签目录树及选择/拖动/剪贴板 |
-| `NativeTabs.swift` | 原生标签表格、中键关闭、排序和菜单 |
-| `AddressSuggestions.swift` / `URLInput.swift` | 地址输入、建议、规范化及协议限制 |
-| `Settings.swift` | 搜索引擎、UA、全局快捷键、登录项和预览设置 |
-| `AIChat.swift` / `AIViews.swift` / `AISelfCheck.swift` | AI 配置、独立钥匙串、页面提取与流式请求 / AI 界面 / 隔离合成回归与预览 |
-| `AISearch.swift` | 原生搜索协议、独立 DeepSeek Search 配置、搜索参数与来源校验 |
-| `AIGeneratedFile.swift` | 独立文本文件工具、原生文件卡片、下载与另存为 |
-| `AIInteraction.swift` / `AIFilePreview.swift` / `AITable.swift` / `assets/markdown/tables.js` | 澄清与后续建议、隔离文件预览、表格独立窗口与引用摘要 |
-| `AIExperienceCheck.swift` | 三协议交互往返与 WebKit 沙箱/表格合成回归 |
-| `AIKeyHelper.swift` / `ai-self-check.py` | 稳定签名的 AI Key 组件 / 本地合成 SSE 供应商 |
-| `AIAttachment.swift` / `AIMarkdown.swift` | 文本/PDF 提取和标准图片内容 / 本地 Markdown 渲染与代码复制 |
-| `AIDiagram.swift` / `assets/markdown/diagram.js` | Mermaid 独立查看窗口、PNG 原生保存 / 图片源码切换、平移缩放及 PNG 生成 |
-| `LinkPreview.swift` / `Favicon.swift` | 链接临时预览、网站图标及缓存 |
-| `Passwords.swift` / `VaultHelper.swift` | 密码界面与表单桥 / 独立钥匙串组件 |
-| `BrowserImport.swift` / `ImportView.swift` | 只读浏览器数据解析 / 导入 UI 与 WebKit 写入 |
-| `SelfTests.swift` | 合成数据、WebKit、原生 UI、窗口和钥匙串验证 |
-| `Info.plist` / `make-icon.swift` / `assets/` | 应用元数据、图标生成与许可 |
-| `optimize-icon.py` | 构建期 ICNS 内 PNG 无损重压缩与校验（Python 3 标准库） |
-| `build.sh` / `sign-app.sh` / `install.sh` | 构建、稳定本机签名、安装 |
+| `src/App/main.swift` | 应用入口、Browser / Store、主界面、菜单栏、窗口与生命周期 |
+| `src/App/Library.swift` / `src/Browser/Bookmarks.swift` | 侧栏、管理页、书签目录树及选择/拖动/剪贴板 |
+| `src/Browser/NativeTabs.swift` | 原生标签表格、中键关闭、排序和菜单 |
+| `src/Browser/AddressSuggestions.swift` / `src/Browser/URLInput.swift` | 地址输入、建议、规范化及协议限制 |
+| `src/App/Settings.swift` | 搜索引擎、UA、全局快捷键、登录项和预览设置 |
+| `src/AI/AIChat.swift` / `src/AI/AIViews.swift` / `tests/AISelfCheck.swift` | AI 配置、独立钥匙串、页面提取与流式请求 / AI 界面 / 隔离合成回归与预览 |
+| `src/AI/AIHistory.swift` | 对话历史侧栏、选择、归档与宽度管理 |
+| `src/AI/AISearch.swift` | 原生搜索协议、独立 DeepSeek Search 配置、搜索参数与来源校验 |
+| `src/AI/AIGeneratedFile.swift` | 独立文本文件工具、原生文件卡片、下载与另存为 |
+| `src/AI/AIInteraction.swift` / `src/AI/AIFilePreview.swift` / `src/AI/AITable.swift` / `assets/markdown/tables.js` | 澄清与后续建议、隔离文件预览、表格独立窗口与引用摘要 |
+| `tests/AIExperienceCheck.swift` | 三协议交互往返与 WebKit 沙箱/表格合成回归 |
+| `src/Helpers/AIKeyHelper.swift` / `tests/ai-self-check.py` | 稳定签名的 AI Key 组件 / 本地合成 SSE 供应商 |
+| `src/AI/AIAttachment.swift` / `src/AI/AIMarkdown.swift` | 文本/PDF 提取和标准图片内容 / 本地 Markdown 渲染与代码复制 |
+| `src/AI/AIDiagram.swift` / `assets/markdown/diagram.js` | Mermaid 独立查看窗口、PNG 原生保存 / 图片源码切换、平移缩放及 PNG 生成 |
+| `src/Browser/LinkPreview.swift` / `src/Browser/Favicon.swift` | 链接临时预览、网站图标及缓存 |
+| `src/Browser/Passwords.swift` / `src/Helpers/VaultHelper.swift` | 密码界面与表单桥 / 独立钥匙串组件 |
+| `src/Browser/BrowserImport.swift` / `src/Browser/ImportView.swift` | 只读浏览器数据解析 / 导入 UI 与 WebKit 写入 |
+| `tests/SelfTests.swift` | 合成数据、WebKit、原生 UI、窗口和钥匙串验证 |
+| `resources/Info.plist` / `scripts/make-icon.swift` / `assets/` | 应用元数据、图标生成与许可 |
+| `scripts/optimize-icon.py` | 构建期 ICNS 内 PNG 无损重压缩与校验（Python 3 标准库） |
+| `build.sh` / `scripts/sign-app.sh` / `scripts/install.sh` | 构建、稳定本机签名、安装 |
+
+- 目录分组不改变编译模块：应用与 `tests/*.swift` 仍编译进主程序，`src/Helpers` 内组件各自独立编译。根目录保留 `build.sh` 与 Makefile 作为开发入口。
 
 ## 常用命令
 
@@ -45,7 +48,7 @@ make clean       # 仅清理 build/
 
 - `make check` 和 `test-web` / `test-ui` / `test-window` 需要可用的 macOS 桌面会话；窗口和 UI 检查不要并行运行，以免争抢焦点。
 - `make test-keychain` 单独运行，仅使用合成记录；修改密码组件或签名时还需验证升级后可读及不同签名被拒绝的既有回归，不能只验证首次创建。
-- 联网专项回归可在构建后运行 `python3 ai-self-check.py build/Perch.app/Contents/MacOS/Perch --search-only`，覆盖真实请求协议和本地合成 HTTP/SSE；不包含完整 Chat/Mermaid UI 回归。
+- 联网专项回归可在构建后运行 `python3 tests/ai-self-check.py build/Perch.app/Contents/MacOS/Perch --search-only`，覆盖真实请求协议和本地合成 HTTP/SSE；不包含完整 Chat/Mermaid UI 回归。
 - 思考展示用 AIMessage.reasoning 可选字段保存，独立于正文、搜索记录和协议工具回放；三协议增量及 Responses 快照必须去重，展示限额不能中止回答。文件专项同时覆盖实时展示、存档、Fork、导出及旧消息兼容。
 - 活动行从请求开始即显示脑图标与动态反馈，phase 仅存于运行中的 AISession，不写入历史。状态依据当前流事件和工具执行更新，不能用累计正文是否为空推断。减少动态效果时使用静态提示；取消、归档、Fork 及历史恢复必须结束进行中的搜索状态。专项覆盖正文加工具后继续思考、搜索等待时取消和历史状态。
 - `make preview ARGS="--compact"` 打开隔离侧栏；`ARGS="--preview-settings --verify-preview"` 验证管理页切换；`ARGS="--preview-bookmarks --verify-preview"` 验证书签交互。
@@ -64,12 +67,30 @@ make clean       # 仅清理 build/
 - 窗口仅由主动操作隐藏；失焦不自动隐藏。保留多屏相对位置、可用区域限制、快速反向动画和「减少动态效果」支持。
 - 菜单栏图标保持系统 template 渲染、`squareLength` 和当前符号；修改后需检查选中/未选中及多个显示器的实际渲染，单张截图不能证明其他屏幕正常。
 - 改 UI 时先使用隔离预览和合成数据，说明实际检查了哪些交互，区分自动检查通过与真实桌面操作已验证。
-- 仅在用户明确确认发版时增加版本号或构建号；普通提交、修复、测试、构建和本机安装均不递增，同一个版本可以包含多个提交。版本信息以 `Info.plist` 为准，发版时同步 `README.md`。
+- 自动回归不移动系统鼠标或向系统注入鼠标事件；交互检查限定在隔离窗口内的合成事件或原生辅助功能操作。
+
+## 版本号规则
+
+- 版本唯一来源为 `resources/Info.plist`：`CFBundleShortVersionString` 使用 `主版本.次版本.修订版本`，`CFBundleVersion` 使用单调递增的整数构建号。
+- 仅在用户明确确认发版时增加版本号或构建号。单独提交、修复、测试、构建和本机安装均不递增；同一个版本可以包含多个提交。发版时按自上次发布以来的实际应用行为变化决定版本级别，自检虽编译进主程序，但仅影响自检入口的修改仍属于测试修改。
+
+| 改动 | 版本处理 |
+| --- | --- |
+| 仅新增、修复或删除测试；调整断言、合成数据、测试窗口激活或等待时序 | 版本号和构建号均不变 |
+| 仅改文档、README Logo、AGENTS.md、目录结构、CI、开发工具，或行为不变的重构、资源无损压缩 | 版本号和构建号均不变 |
+| 修复应用实际缺陷，包括焦点、交互、协议、数据、安全、性能问题 | 确认发版时修订版本加 1，例如 `0.1.0 → 0.1.1` |
+| 新增兼容现有使用方式的功能 | 确认发版时次版本加 1，修订版本归零，例如 `0.1.1 → 0.2.0` |
+| 不兼容的使用方式、配置或存储格式变化 | 确认发版时主版本加 1，次版本和修订版本归零；`0.x` 阶段使用次版本递增，不自动进入 `1.0.0` |
+
+- 一次发版按其中最高级别的实际应用变化升一次版本；发版前后的排查、重试、修复、补回归和普通提交不继续累加，直到用户再次确认发版。
+- 升应用版本时构建号同时加 1；构建号不因主、次或修订版本归零而重置。日常 build、test、check、preview、install 不自动增加任何版本字段。用户明确要求重新发布同一应用版本时，可仅将构建号加 1。
+- 升版本时同步 `README.md` 中相关应用行为说明，并在交付中说明具体变化。纯测试修改仍执行对应的构建和检查，版本字段保持不变；纯文档修改无需重新构建或安装。
+- 示例：修复 AI 历史自检或正常浏览时地址栏焦点并单独提交，均保持当前版本；确认发布包含地址栏焦点修复的新版本时，才升修订版本及构建号。
 
 ## 数据与签名约束
 
 - 保留 `~/Library/Application Support/Perch Signing/`：含本机代码证书、专用钥匙串和稳定 `PerchVault` 缓存。不能为了修复编译删除它、改成 ad-hoc 签名或重建证书。
-- 不涉及密码功能时不要改 `VaultHelper.swift`。`make install` 在已有安装的密码组件与新包逐字节不一致时停止；确需变更时先验证稳定签名、访问控制和迁移，再安排手动安装。
+- 不涉及密码功能时不要改 `src/Helpers/VaultHelper.swift`。`make install` 在已有安装的密码组件与新包逐字节不一致时停止；确需变更时先验证稳定签名、访问控制和迁移，再安排手动安装。
 - 本机签名不等于 Developer ID 或公证；不要自动修改系统信任、钥匙串搜索列表或系统权限。
 - 不读取真实密码/Cookie 来测试，不将秘密写入命令参数、日志或临时文件；不自动操作真实账号登录。密码修改、查看/复制与旧记录授权的现有认证边界必须保留。
 - 书签、标签、设置、窗口与历史保存在 `dev.perch.menubar` UserDefaults；遇到损坏值保留原值并阻止覆盖，不重置真实用户数据。WebKit 网站数据和钥匙串不属于构建产物。
@@ -111,10 +132,10 @@ make clean       # 仅清理 build/
 - 网页 AI 侧栏开关按 Tab 保存，切换回来保留工作状态；打开侧栏和侧栏新建对话默认引用当前网页，完整 Chat 新对话无默认引用。右侧栏只用时钟历史下拉，不展示 sidebar.left 和设置图标；历史限定此网页发起或完整 Chat 实际引用此网页的未归档会话，使用去除凭据/查询/片段后的完整 URL 匹配，缺少来源的旧记录不猜测。默认回车发送，设置可改 Command+回车，Shift+回车换行；原生输入法和 @ 候选确认优先。左侧分隔线全高度命中须高于窗口标题拖动区。
 
 - 编译和签名验证必做，按改动运行对应自检；逻辑变化用合成数据补必要回归，纯文档改动不新增测试。
-- 独立文本文件通过三协议共用的 create_text_file(name, content) 交付，AIMessage.generatedFiles 可选字段兼容旧历史。仅在完整流结束、调用 ID 和参数有效后登记，不执行源码、不使用模型指定路径；同轮同名更新稳定 ID，后续轮次保留原版本。单文件 64 KiB、每轮 8 个/256 KiB；只有此工具放宽参数限制，历史预算包含 calls.arguments。下载使用排他创建避让同名，另存为用 NSSavePanel；源码只显示文本。普通代码块保留显式另存为，不靠 Markdown 猜测独立产物。专项回归为 ai-self-check.py build/Perch.app/Contents/MacOS/Perch --files-only。
+- 独立文本文件通过三协议共用的 create_text_file(name, content) 交付，AIMessage.generatedFiles 可选字段兼容旧历史。仅在完整流结束、调用 ID 和参数有效后登记，不执行源码、不使用模型指定路径；同轮同名更新稳定 ID，后续轮次保留原版本。单文件 64 KiB、每轮 8 个/256 KiB；只有此工具放宽参数限制，历史预算包含 calls.arguments。下载使用排他创建避让同名，另存为用 NSSavePanel；源码只显示文本。普通代码块保留显式另存为，不靠 Markdown 猜测独立产物。专项回归为 tests/ai-self-check.py build/Perch.app/Contents/MacOS/Perch --files-only。
 - Markdown/图表独立回归使用 build/Perch.app/Contents/MacOS/Perch --ai-markdown-self-test。若通过 open -W 启动，open 的退出码不代表被启动应用的自检结果，必须核对自检 stdout/stderr 中的完成断言和 FAIL；窗口焦点超时不得算作通过。
 - 安装工具变化需实际验证 `make install`，确认完整应用包、版本、签名和运行路径；不创建备份，保留替换期间的失败回滚。
 - 最后用中文简洁说明改了什么、检查结果、尚未验证的具体边界，并提供文件链接。
 - AI 表格复用本地渲染器，排序/复制/CSV/展开不加入第三方依赖；CSV 包含 UTF-8 BOM、RFC 引号转义及公式前缀保护。文件版本仅关联当前消息及此前的会话同名文件，不泄露后续轮次；复制/保存使用选中版本，diff 有 3000 行计算上限。HTML/SVG 预览使用 nonPersistent WebKit + sandbox=allow-scripts 的 srcdoc，不允许 same-origin、弹窗、下载、网络、文件系统或宿主桥；不要复用浏览器网站数据或给预览添加 markdown 消息桥。
 - 原生 searchEvents 的 1 MiB 限额仅保存搜索调用/结果、来源及搜索用量，不保存普通 reasoning/text/function 参数流；response.completed 仅投影其中的搜索证据。完整协议历史仍由 toolRounds 保存，用量由 usage 独立保存。合成搜索回归必须覆盖累计超过 1 MiB 的 reasoning、完成包中的 reasoning 与真正搜索记录超限，避免长思考被误报为搜索记录超限。
-- ask_clarification 仅在完整工具流验证后登记，保存正式工具结果 awaiting_user 并结束本轮；不能等待悬挂的网络任务。答案用新一轮用户消息续聊，提交校验当前最后消息/未回答/非归档/非编辑/非忙碌，绕过已暂停队列且保留草稿，旧队列保持暂停。suggest_followups 随消息保存，点击提示文字/右箭头直接发送并保留当前草稿，常驻气泡图标仅填草稿；两者使用独立点击区域，图标操作不能冒泡触发发送。新增字段可选以兼容旧存档。合成专项命令：ai-self-check.py build/Perch.app/Contents/MacOS/Perch --experience-only。
+- ask_clarification 仅在完整工具流验证后登记，保存正式工具结果 awaiting_user 并结束本轮；不能等待悬挂的网络任务。答案用新一轮用户消息续聊，提交校验当前最后消息/未回答/非归档/非编辑/非忙碌，绕过已暂停队列且保留草稿，旧队列保持暂停。suggest_followups 随消息保存，点击提示文字/右箭头直接发送并保留当前草稿，常驻气泡图标仅填草稿；两者使用独立点击区域，图标操作不能冒泡触发发送。新增字段可选以兼容旧存档。合成专项命令：tests/ai-self-check.py build/Perch.app/Contents/MacOS/Perch --experience-only。

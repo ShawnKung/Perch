@@ -1780,6 +1780,9 @@ final class Panel: NSPanel {
     private func captureFocus(for tab: UUID?) {
         guard let tab, let view = firstResponder as? NSView, view.window === self else { return }
         if let editor = view as? NSTextView, editor.isFieldEditor, !(editor.delegate is NSTextField) { return }
+        if let editor = view as? NSTextView, let nativeField = editor.delegate as? NSTextField,
+           let field = nativeField as? AddressTextField.Field,
+           field.ownerTab != tab { return }
         if let pending = pendingFieldSelection, pending.0 == tab,
            let editor = view as? NSTextView, (editor.delegate as? NSTextField)?.identifier == pending.1 { return }
         var ancestor: NSView? = view
@@ -1805,16 +1808,17 @@ final class Panel: NSPanel {
 
     func cancelPendingFieldSelection() { pendingFieldSelection = nil }
 
-    private func field(with identifier: NSUserInterfaceItemIdentifier, in view: NSView) -> NSTextField? {
-        if let field = view as? NSTextField, field.identifier == identifier { return field }
-        return view.subviews.lazy.compactMap { self.field(with: identifier, in: $0) }.first
+    private func field(with identifier: NSUserInterfaceItemIdentifier, tab: UUID, in view: NSView) -> NSTextField? {
+        if let field = view as? NSTextField, field.identifier == identifier,
+           (field as? AddressTextField.Field).map({ $0.ownerTab == tab }) ?? true { return field }
+        return view.subviews.lazy.compactMap { self.field(with: identifier, tab: tab, in: $0) }.first
     }
 
     private func restoreFocus(for tab: UUID) {
-        guard let snapshot = tabFocus[tab] else { return }
+        guard tab == selectedTab, let snapshot = tabFocus[tab] else { return }
         let target: NSView?
         if let identifier = snapshot.fieldIdentifier, let contentView {
-            target = field(with: identifier, in: contentView)
+            target = field(with: identifier, tab: tab, in: contentView)
         } else if let field = snapshot.field, field.window === self {
             target = field
         } else if let responder = snapshot.responder, responder.window === self {
@@ -2372,8 +2376,12 @@ if CommandLine.arguments.contains("--web-tabs-self-test") {
     let app = NSApplication.shared
     // A CLI-launched test needs its own foreground identity while the installed menu-bar app is running.
     app.setActivationPolicy(CommandLine.arguments.contains("--ui-self-test") ? .regular : .accessory)
-    let check = LayoutSelfCheck(preview: CommandLine.arguments.contains("--ui-preview"))
-    withExtendedLifetime(check) { app.run() }
+    Task { @MainActor in
+        setbuf(stdout, nil)
+        // Activate only after AppKit has finished launching the CLI process.
+        _ = LayoutSelfCheck(preview: CommandLine.arguments.contains("--ui-preview"))
+    }
+    app.run()
 } else if CommandLine.arguments.contains("--window-self-test") {
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)

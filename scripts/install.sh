@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 umask 077
-ROOT="$(dirname "$(realpath "$0")")"
+ROOT="$(dirname "$(dirname "$(realpath "$0")")")"
 SOURCE="$ROOT/build/Perch.app"
 TARGET="/Applications/Perch.app"
 log() { printf '[%s] [%s] %s\n' "$(date '+%H:%M:%S')" "$1" "$2"; }

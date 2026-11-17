@@ -80,7 +80,6 @@ extension AISelfCheck {
                 guard renderer(host) == nil else { throw PerchError("Body renderer was created before the first text delta") }
                 for prefix in ["第一段", "第一段\n\n第二段", "第一段\n\n第二段\n\n第三段"] {
                     try await wait { ai.sessions[tab]?.messages.last?.text == prefix }
-                    let received = Date()
                     let expected = prefix.components(separatedBy: .whitespacesAndNewlines).joined()
                     let deadline = Date().addingTimeInterval(2)
                     var rendered = ""
@@ -93,7 +92,6 @@ extension AISelfCheck {
                     guard rendered == expected, ai.sessions[tab]?.requestID != nil else {
                         throw PerchError("Chat body failed to stream after thinking: \(api.rawValue), fullPage=\(fullPage), rendered=\(rendered)")
                     }
-                    print("STREAM: \(api.rawValue), fullPage=\(fullPage), visible=\(rendered), delay=\(Date().timeIntervalSince(received))")
                 }
                 try await wait { ai.sessions[tab]?.requestID == nil }
                 precondition(ai.sessions[tab]?.error == nil)
@@ -126,7 +124,6 @@ extension AISelfCheck {
                let count = try? await web.evaluateJavaScript("document.getElementById('content').textContent.length") as? Int,
                count > 0, lengths.last != count {
                 lengths.append(count)
-                print("BURST: rendered=\(count), model=\(live.sessions[AIController.homeID]?.messages.last?.text.count ?? 0)")
             }
             try await Task.sleep(nanoseconds: 20_000_000)
         }
