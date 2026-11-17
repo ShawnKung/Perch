@@ -33,6 +33,10 @@ struct Site: Identifiable, Codable {
 
 final class PageWebView: WKWebView {
     var extendMenu: ((NSMenu) -> Void)?
+    private let scrollRouting = ScrollRouting()
+    override func scrollWheel(with event: NSEvent) {
+        for routed in scrollRouting.events(for: event) { super.scrollWheel(with: routed) }
+    }
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         window?.acceptsMouseMovedEvents = true
@@ -111,6 +115,8 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         configuration.userContentController.add(bridge, contentWorld: .defaultClient, name: "perchPassword")
         configuration.userContentController.addUserScript(WKUserScript(source: PasswordBridge.script,
             injectionTime: .atDocumentStart, forMainFrameOnly: true, in: .defaultClient))
+        configuration.userContentController.addUserScript(WKUserScript(source: ScrollRouting.script,
+            injectionTime: .atDocumentStart, forMainFrameOnly: false, in: .defaultClient))
         if let tracker {
             configuration.userContentController.add(tracker, contentWorld: .defaultClient, name: "perchHoverLink")
             configuration.userContentController.addUserScript(WKUserScript(source: HoverLinkTracker.script,
@@ -381,7 +387,7 @@ final class Store: ObservableObject {
             parts?.user = nil; parts?.password = nil; parts?.query = nil; parts?.fragment = nil
             ai.referenceClosed(page.id, reference: AIPageReference(title: page.title, url: parts?.url))
         }
-        ai.retainTabs(Set(tabs.map(\.id) + tabs.compactMap(\.chatOwner) + [AIController.homeID]))
+        ai.retainTabs(Set(tabs.map(\.id) + tabs.compactMap(\.chatOwner) + tabs.compactMap(\.aiOwner) + [AIController.homeID]))
     } }
     @Published var history: [Visit] = [] { didSet { suggestionRevision &+= 1 } }
     @Published var importedBookmarks: [String: [BookmarkNode]] = [:] { didSet { suggestionRevision &+= 1 } }
@@ -429,7 +435,7 @@ final class Store: ObservableObject {
     @Published var settings: BrowserSettings
     @Published var icons: [UUID: NSImage] = [:]
     private var browsers: [UUID: Browser] = [:]
-    private let defaults: UserDefaults
+    let defaults: UserDefaults
     func cachedFavicon(_ address: String) -> NSImage? { FaviconCache.image(for: address, defaults: defaults) }
     func openBookmarks(history: Bool = false) {
         libraryShowsHistory = history
@@ -454,6 +460,7 @@ final class Store: ObservableObject {
             catch { protectedKeys.insert("settings"); notice = "设置数据无法读取，已保留原数据。" }
         }
         PerchTheme.shared.selection = settings.theme
+        PerchTheme.shared.chatFontSize = settings.chatFontSize
         if let data = defaults.data(forKey: "sites") {
             do { sites = try JSONDecoder().decode([Site].self, from: data) }
             catch { notice = "收藏数据无法读取，原始数据已保留。请先备份再添加网站。" }
@@ -463,7 +470,7 @@ final class Store: ObservableObject {
         let chatTab = restoredTabs.first { $0.chatOwner != nil && $0.id == restoredSelection } ??
             restoredTabs.first { $0.chatOwner != nil }
         tabs = restoredTabs.filter { $0.chatOwner == nil || $0.id == chatTab?.id }
-        ai.classifyWebConversations(owners: Set(tabs.filter { !$0.address.isEmpty && $0.chatOwner == nil }.map(\.id)))
+        ai.classifyWebConversations(owners: Set(tabs.filter { !$0.address.isEmpty && $0.chatOwner == nil }.map { $0.aiOwner ?? $0.id }))
         for tab in tabs { icons[tab.id] = FaviconCache.image(for: tab.address, defaults: defaults) }
         history = restore([Visit].self, key: "history") ?? []
         importedBookmarks = restore([String: [BookmarkNode]].self, key: "importedBookmarks") ?? [:]
@@ -479,6 +486,7 @@ final class Store: ObservableObject {
         guard let selected else { return nil }
         return browsers[selected]
     }
+    func cachedBrowser(for id: UUID) -> Browser? { browsers[id] }
 
     func open(_ site: Site) {
         newTab(address: site.address, title: site.title)
@@ -582,7 +590,10 @@ final class Store: ObservableObject {
     }
 
     @Published var chatHistoryVisible = true
-    var chatOwner: UUID { tabs.first(where: { $0.id == selected })?.chatOwner ?? selected ?? AIController.homeID }
+    var chatOwner: UUID {
+        let page = tabs.first(where: { $0.id == selected })
+        return page?.chatOwner ?? page?.aiOwner ?? selected ?? AIController.homeID
+    }
     var isChatPage: Bool { tabs.first(where: { $0.id == selected })?.chatOwner != nil }
     var currentPageURL: URL? {
         guard !isChatPage, let page = tabs.first(where: { $0.id == selected }),
@@ -597,15 +608,27 @@ final class Store: ObservableObject {
         }
     }
     func newChat() {
-        let owner = chatOwner
-        ai.clear(owner)
+        let previous = chatOwner
+        let owner = ai.sessions[previous] == nil ? previous : UUID()
+        ai.selections[owner] = ai.selections[previous]
+        ai.selectedModels[owner] = ai.selectedModels[previous]
+        if let index = tabs.firstIndex(where: { $0.id == selected }) {
+            if isChatPage { tabs[index].chatOwner = owner }
+            else { tabs[index].aiOwner = owner }
+            persistTabs()
+        }
         ai.drafts[owner] = ""; ai.draftFiles[owner] = []
         ai.draftReferences[owner] = []; ai.draftClosedReferences[owner] = []
         if aiVisible { referenceCurrentPage() }
         if !isChatPage && browser == nil { openChat(owner: owner) }
     }
+    func openSidebarConversation(_ conversation: UUID) {
+        guard let index = tabs.firstIndex(where: { $0.id == selected }), !isChatPage else { return }
+        tabs[index].aiOwner = ai.resumeConversation(conversation, tab: chatOwner)
+        persistTabs()
+    }
     func openChat(owner: UUID? = nil, conversation: UUID? = nil) {
-        let owner = conversation.map { id in ai.sessions.first(where: { $0.value.id == id })?.key ?? UUID() } ?? owner ?? chatOwner
+        let owner = conversation.map { ai.resumeConversation($0, tab: UUID()) } ?? owner ?? chatOwner
         if let index = tabs.firstIndex(where: { $0.chatOwner != nil }) {
             let chatID = tabs[index].id
             tabs[index].chatOwner = owner
@@ -620,7 +643,6 @@ final class Store: ObservableObject {
             let tab = Tab(title: "Chat", address: "", chatOwner: owner)
             tabs.append(tab); activate(tab.id)
         }
-        if let conversation, ai.sessions[owner]?.id != conversation { ai.resumeConversation(conversation, tab: owner) }
         chatHistoryVisible = true
         aiVisible = false
     }
@@ -645,10 +667,14 @@ final class Store: ObservableObject {
     func close(_ id: UUID) {
         guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
         homeAddressDrafts[id] = nil
-        recentlyClosed.append(tabs.remove(at: index))
+        var closed = tabs[index]
+        if closed.chatOwner == nil { closed.aiOwner = closed.aiOwner ?? closed.id }
+        tabs.remove(at: index)
+        recentlyClosed.append(closed)
         recentlyClosed = Array(recentlyClosed.suffix(20))
         if let browser = browsers.removeValue(forKey: id) {
             browser.passwordBridge.dismiss(); browser.favicon.reset(); browser.webView.stopLoading()
+            browser.webView.removeFromSuperview()
         }
         icons.removeValue(forKey: id)
         if selected == id {
@@ -749,6 +775,7 @@ final class Store: ObservableObject {
         let changed = settings.userAgent != value.userAgent
         settings = value
         PerchTheme.shared.selection = value.theme
+        PerchTheme.shared.chatFontSize = value.chatFontSize
         linkPreview.settingsChanged()
         persist(value, key: "settings")
         if changed {
@@ -1127,38 +1154,30 @@ struct WebContent: NSViewRepresentable {
     let browser: Browser
     func makeNSView(context: Context) -> WebPageContainer { WebPageContainer() }
     func updateNSView(_ view: WebPageContainer, context: Context) {
-        view.show(pages: [browser.webView], selected: browser.webView)
+        view.show(browser.webView)
     }
 }
 
 final class WebPageContainer: NSView {
-    private var selected: WKWebView?
+    private var page: WKWebView?
 
-    func show(pages: [WKWebView], selected: WKWebView?) {
-        for view in subviews where !pages.contains(where: { $0 === view }) { view.removeFromSuperview() }
-        for page in pages where page.superview !== self {
-            page.isHidden = true
-            addSubview(page)
-        }
-        self.selected = selected
-        for page in pages { page.isHidden = page !== selected }
+    func show(_ page: WKWebView) {
+        for view in subviews where view !== page { view.removeFromSuperview() }
+        if page.superview !== self { addSubview(page) }
+        self.page = page
         needsLayout = true
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window != nil { needsLayout = true }
     }
 
     override func layout() {
         super.layout()
-        // Hidden pages keep their viewport; only the visible page follows actual container resizing.
-        guard let selected, bounds.width > 0, bounds.height > 0 else { return }
-        if selected.frame != bounds { selected.frame = bounds }
-    }
-}
-
-struct WebTabsContent: NSViewRepresentable {
-    @ObservedObject var store: Store
-    func makeNSView(context: Context) -> WebPageContainer { WebPageContainer() }
-    func updateNSView(_ view: WebPageContainer, context: Context) {
-        view.show(pages: store.loadedReferencePages.map(\.webView),
-                  selected: store.browser?.webView)
+        // The native tab controller owns visibility; detached pages keep their viewport.
+        guard window != nil, let page, bounds.width > 0, bounds.height > 0 else { return }
+        if page.frame != bounds { page.frame = bounds }
     }
 }
 
@@ -1601,33 +1620,9 @@ struct RootView: View {
                                 sidebarCollapsed = false; sidebarWidth = 145
                             } else if !sidebarCollapsed { sidebarWidth = width }
                         }
-                    VStack(spacing: 0) {
-                        if !store.isChatPage { HStack(spacing: 6) {
-                            if let browser = store.browser {
-                                BrowserAddressBar(browser: browser, store: store).id(ObjectIdentifier(browser))
-                            } else { HomeAddressBar(store: store) }
-                            WindowTools(store: store)
-                        }.frame(height: 28).padding(.horizontal, 8).padding(.leading, controlsInset)
-                            .padding(.vertical, 8).background(Style.paper).background(WindowDragArea()).zIndex(10) }
-                        ZStack {
-                            WebTabsContent(store: store)
-                            if let chatTab = store.tabs.first(where: { $0.chatOwner != nil }), let owner = chatTab.chatOwner {
-                                AIChatSidebar(store: store, ai: store.ai, fullPage: true,
-                                              owner: owner,
-                                              windowControlsInset: controlsInset) { if let id = store.selected { store.close(id) } }
-                                    .opacity(store.isChatPage ? 1 : 0)
-                                    .allowsHitTesting(store.isChatPage)
-                                    .disabled(!store.isChatPage)
-                                    .accessibilityHidden(!store.isChatPage)
-                            }
-                            if !store.isChatPage, let browser = store.browser {
-                                BrowserScreen(browser: browser)
-                            } else if !store.isChatPage {
-                                HomeScreen(store: store)
-                            }
-                        }.modifier(ContentTopChrome(enabled: !store.isChatPage))
-                    }.frame(maxWidth: .infinity, maxHeight: .infinity)
-                    if !store.isChatPage { HStack(spacing: 0) {
+                    TabContents(store: store, controlsInset: controlsInset)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    if store.aiVisible && !store.isChatPage { HStack(spacing: 0) {
                         SidebarResizeHandle(changed: { translation in
                             if aiDragWidth == nil { aiDragWidth = aiSize(geometry.size.width) }
                             aiWidth = min(max(aiDragWidth! - translation, 260), 480)
@@ -1639,10 +1634,9 @@ struct RootView: View {
                         AIChatSidebar(store: store, ai: store.ai) { store.aiVisible = false }
                             .id(store.chatOwner)
                             .frame(width: aiSize(geometry.size.width))
-                    }.frame(width: store.aiVisible && !store.isChatPage ? aiSize(geometry.size.width) + 1 : 0, alignment: .leading)
-                        .clipped().allowsHitTesting(store.aiVisible && !store.isChatPage)
-                        .disabled(!store.aiVisible || store.isChatPage)
-                        .accessibilityHidden(!store.aiVisible || store.isChatPage)
+                    }.frame(width: aiSize(geometry.size.width) + 1, alignment: .leading)
+                        .clipped()
+                        .transition(.move(edge: .trailing))
                     }
                 }.overlay(alignment: .topLeading) {
                     ZStack(alignment: .topLeading) {
@@ -1780,6 +1774,9 @@ final class Panel: NSPanel {
     private func captureFocus(for tab: UUID?) {
         guard let tab, let view = firstResponder as? NSView, view.window === self else { return }
         if let editor = view as? NSTextView, editor.isFieldEditor, !(editor.delegate is NSTextField) { return }
+        if let editor = view as? NSTextView, let nativeField = editor.delegate as? NSTextField,
+           let field = nativeField as? AddressTextField.Field,
+           field.ownerTab != tab { return }
         if let pending = pendingFieldSelection, pending.0 == tab,
            let editor = view as? NSTextView, (editor.delegate as? NSTextField)?.identifier == pending.1 { return }
         var ancestor: NSView? = view
@@ -1805,16 +1802,17 @@ final class Panel: NSPanel {
 
     func cancelPendingFieldSelection() { pendingFieldSelection = nil }
 
-    private func field(with identifier: NSUserInterfaceItemIdentifier, in view: NSView) -> NSTextField? {
-        if let field = view as? NSTextField, field.identifier == identifier { return field }
-        return view.subviews.lazy.compactMap { self.field(with: identifier, in: $0) }.first
+    private func field(with identifier: NSUserInterfaceItemIdentifier, tab: UUID, in view: NSView) -> NSTextField? {
+        if let field = view as? NSTextField, field.identifier == identifier,
+           (field as? AddressTextField.Field).map({ $0.ownerTab == tab }) ?? true { return field }
+        return view.subviews.lazy.compactMap { self.field(with: identifier, tab: tab, in: $0) }.first
     }
 
     private func restoreFocus(for tab: UUID) {
-        guard let snapshot = tabFocus[tab] else { return }
+        guard tab == selectedTab, let snapshot = tabFocus[tab] else { return }
         let target: NSView?
         if let identifier = snapshot.fieldIdentifier, let contentView {
-            target = field(with: identifier, in: contentView)
+            target = field(with: identifier, tab: tab, in: contentView)
         } else if let field = snapshot.field, field.window === self {
             target = field
         } else if let responder = snapshot.responder, responder.window === self {
@@ -2217,7 +2215,16 @@ static func main() throws {
 var appearanceDefaults = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
 appearanceDefaults["AppleShowScrollBars"] = "WhenScrolling"
 UserDefaults.standard.setVolatileDomain(appearanceDefaults, forName: UserDefaults.argumentDomain)
-if CommandLine.arguments.contains("--web-tabs-self-test") {
+if CommandLine.arguments.contains("--scroll-self-test") {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.regular)
+    Task { @MainActor in
+        setbuf(stdout, nil)
+        do { try await ScrollSelfCheck.run(); exit(0) }
+        catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
+    }
+    app.run()
+} else if CommandLine.arguments.contains("--web-tabs-self-test") {
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)
     Task { @MainActor in
@@ -2234,6 +2241,16 @@ if CommandLine.arguments.contains("--web-tabs-self-test") {
         catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
     }
     app.run()
+} else if CommandLine.arguments.contains("--ai-typography-self-test") {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.regular)
+    Task { @MainActor in
+        setbuf(stdout, nil)
+        app.activate(ignoringOtherApps: true)
+        do { try await AISelfCheck.typographyUI(); exit(0) }
+        catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
+    }
+    app.run()
 } else if CommandLine.arguments.contains("--ai-markdown-self-test") {
     let app = NSApplication.shared
     app.setActivationPolicy(.regular)
@@ -2241,6 +2258,15 @@ if CommandLine.arguments.contains("--web-tabs-self-test") {
         setbuf(stdout, nil)
         app.activate(ignoringOtherApps: true)
         do { try await AISelfCheck.markdown(); exit(0) }
+        catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
+    }
+    app.run()
+} else if let index = CommandLine.arguments.firstIndex(of: "--ai-background-self-test"), CommandLine.arguments.count > index + 1 {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    Task { @MainActor in
+        setbuf(stdout, nil)
+        do { try await AISelfCheck.backgroundChatChecks(baseURL: CommandLine.arguments[index + 1]); exit(0) }
         catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
     }
     app.run()
@@ -2372,8 +2398,12 @@ if CommandLine.arguments.contains("--web-tabs-self-test") {
     let app = NSApplication.shared
     // A CLI-launched test needs its own foreground identity while the installed menu-bar app is running.
     app.setActivationPolicy(CommandLine.arguments.contains("--ui-self-test") ? .regular : .accessory)
-    let check = LayoutSelfCheck(preview: CommandLine.arguments.contains("--ui-preview"))
-    withExtendedLifetime(check) { app.run() }
+    Task { @MainActor in
+        setbuf(stdout, nil)
+        // Activate only after AppKit has finished launching the CLI process.
+        _ = LayoutSelfCheck(preview: CommandLine.arguments.contains("--ui-preview"))
+    }
+    app.run()
 } else if CommandLine.arguments.contains("--window-self-test") {
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)

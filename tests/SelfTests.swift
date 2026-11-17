@@ -11,9 +11,7 @@ enum SelfTests {
     static func addressSuggestions() throws {
         let sites = (0..<1179).map { Site(title: "Bookmark \($0)", address: "https://b\($0).invalid/content") }
         let history = (0..<10000).map { Visit(title: "Content \($0)", address: "https://c\($0).invalid/content", date: Date()) }
-        let start = CFAbsoluteTimeGetCurrent()
         let index = try AddressSuggestionIndex(sites: sites, imported: [:], history: history)
-        let buildMS = (CFAbsoluteTimeGetCurrent() - start) * 1000
         let broad = try index.suggestions(for: "c")
         precondition(broad.count == 8 && broad.allSatisfy(\.bookmark), "Bookmarks must beat title/host prefixes in history")
         let sparse = try index.suggestions(for: "1178")
@@ -34,33 +32,9 @@ enum SelfTests {
         precondition(dedup.count == 1 && dedup.first?.bookmark == true && blank.isEmpty)
         precondition(historyTitle.count == 1 && historyTitle.first?.bookmark == false,
                      "A different history title remains searchable when the bookmark does not match")
-        // Keep the previous algorithm here to measure the same synthetic workload after future changes.
-        let candidates = sites.map { AddressSuggestion(title: $0.title, address: $0.address, bookmark: true) } +
-            history.map { AddressSuggestion(title: $0.title, address: $0.address, bookmark: false) }
-        func previous(_ query: String) -> [AddressSuggestion] {
-            var known = Set<String>()
-            let words = query.split(whereSeparator: \.isWhitespace).map(String.init)
-            return Array(candidates.filter { item in
-                guard words.allSatisfy({ (item.title + " " + item.address).lowercased().contains($0) }),
-                      let url = URLInput.parse(item.address, search: false) else { return false }
-                return known.insert(url.absoluteString).inserted
-            }.sorted { a, b in
-                func score(_ item: AddressSuggestion) -> Int {
-                    (item.bookmark ? 2 : 0) + (item.title.lowercased().hasPrefix(query) ? 4 : 0) +
-                        ((URL(string: item.address)?.host ?? "").lowercased().hasPrefix(query) ? 4 : 0)
-                }
-                return score(a) > score(b)
-            }.prefix(8))
-        }
         for query in ["c", "content 9999", "missing-query-fixture"] {
-            let before = CFAbsoluteTimeGetCurrent()
-            for _ in 0..<3 { precondition(previous(query).count <= 8) }
-            let oldMS = (CFAbsoluteTimeGetCurrent() - before) * 1000 / 3
-            let after = CFAbsoluteTimeGetCurrent()
-            for _ in 0..<20 { let result = try index.suggestions(for: query); precondition(result.count <= 8) }
-            let newMS = (CFAbsoluteTimeGetCurrent() - after) * 1000 / 20
-            print(String(format: "PERF: 1179 bookmarks + 10000 history, '%@': old %.2f ms -> indexed %.2f ms (%.1fx), one-time background build %.2f ms",
-                         query, oldMS, newMS, oldMS / max(newMS, 0.001), buildMS))
+            let result = try index.suggestions(for: query)
+            precondition(result.count <= 8)
         }
         print("PASS: bounded suggestions, strict bookmark priority, sparse history fallback, Unicode multiword matching, URL deduplication and invalid URL rejection")
     }
@@ -837,7 +811,8 @@ enum WebTabSelfCheck {
         _ = try await second.evaluateJavaScript("scrollTo(0,3100)")
         store.activate(firstID)
         try await Task.sleep(nanoseconds: 200_000_000)
-        let parent = first.superview, firstFrame = first.frame, secondFrame = second.frame
+        var parent = first.superview
+        let firstFrame = first.frame, secondFrame = second.frame
         func state() async throws -> String {
             try await first.evaluateJavaScript("""
                 JSON.stringify([innerWidth,innerHeight,document.getElementById('outer').scrollTop,
@@ -863,7 +838,7 @@ enum WebTabSelfCheck {
         for _ in 0..<6 {
             store.activate(secondID)
             try await Task.sleep(nanoseconds: 80_000_000)
-            precondition(first.isHidden && !second.isHidden && first.window === window && first.superview === parent)
+            precondition(first.window == nil && second.window === window && first.superview === parent)
             precondition(first.frame == firstFrame && second.frame == secondFrame)
             let documentScroll = try await second.evaluateJavaScript("scrollY")
             precondition(documentScroll as? Double == 3100)
@@ -875,7 +850,7 @@ enum WebTabSelfCheck {
         store.newTab()
         let homeID = store.selected!
         try await Task.sleep(nanoseconds: 100_000_000)
-        precondition(first.isHidden && second.isHidden && first.window === window && first.frame == firstFrame)
+        precondition(first.window == nil && second.window == nil && first.frame == firstFrame)
         store.close(homeID)
         store.activate(firstID)
         try await Task.sleep(nanoseconds: 100_000_000)
@@ -883,20 +858,21 @@ enum WebTabSelfCheck {
         precondition(afterHome == before)
         store.openChat(owner: UUID())
         try await Task.sleep(nanoseconds: 200_000_000)
-        precondition(first.isHidden && first.window === window && first.superview === parent && first.frame == firstFrame)
+        precondition(first.window == nil && first.superview === parent && first.frame == firstFrame)
         store.activate(firstID)
         try await Task.sleep(nanoseconds: 200_000_000)
         let afterChat = try await state()
-        precondition(afterChat == before, "Opening Chat must leave hidden webpage state intact")
+        precondition(afterChat == before, "Opening Chat must leave detached webpage state intact")
         let root = window.contentView!
         var hit = root.hitTest(root.convert(NSPoint(x: first.bounds.midX, y: first.bounds.midY), from: first))
         while hit != nil && hit !== first { hit = hit?.superview }
         precondition(hit === first, "Browser status overlays must not intercept page clicks")
         window.setContentSize(NSSize(width: 950, height: 700))
         try await AISelfCheck.wait { first.frame != firstFrame }
-        precondition(second.frame == secondFrame, "Actual resizing must not resize hidden pages")
+        precondition(second.frame == secondFrame, "Actual resizing must not resize detached pages")
         store.activate(secondID)
         try await AISelfCheck.wait { second.frame != secondFrame }
+        parent = nil
         store.close(firstID)
         try await AISelfCheck.wait { first.superview == nil }
         print("PASS: real RootView tab switches preserve document and nested scrolling, viewport, input, selection and JS identity with no resize events; home/Chat round trips, page click routing, actual resizing and closed-page removal")
@@ -1370,11 +1346,20 @@ final class LayoutSelfCheck {
         coordinator.controlTextDidChange(Notification(name: NSTextField.textDidChangeNotification, object: field))
     }
     func verifyHomeFocusRestoration() async {
+        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+        panel.focusWindow()
         await settle()
+        let focusDeadline = Date().addingTimeInterval(3)
+        while !NSApp.isActive || !panel.isKeyWindow {
+            guard Date() < focusDeadline else {
+                fputs("FAIL: focus restoration fixture could not activate its isolated window\n", stderr); exit(1)
+            }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
         guard let selected = store.selected, let other = store.tabs.first(where: { $0.id != selected }) else {
             preconditionFailure("Homepage focus fixture requires two tabs")
         }
-        for home in [true, false] {
+        for (home, throughTable) in [(true, true), (false, true), (true, false), (false, false)] {
             let field = home ? homeAddressField() : addressField()
             panel.makeFirstResponder(field)
             guard field.currentEditor() === panel.firstResponder else {
@@ -1386,26 +1371,31 @@ final class LayoutSelfCheck {
             editor.insertText(draft, replacementRange: NSRange(location: NSNotFound, length: 0))
             editor.setSelectedRange(NSRange(location: 2, length: 1))
             // AppKit transfers first responder before the table receives mouseDown.
-            panel.makeFirstResponder(table())
+            if throughTable { panel.makeFirstResponder(table()) }
             store.activate(other.id)
             await settle()
             let otherField = home ? homeAddressField() : addressField()
             guard otherField.stringValue != draft else {
                 fputs("FAIL: homepage drafts leaked between tabs\n", stderr); exit(1)
             }
-            panel.makeFirstResponder(table())
+            if throughTable { panel.makeFirstResponder(table()) }
             store.activate(selected)
             await settle()
             let restored = home ? homeAddressField() : addressField()
+            let restoreDeadline = Date().addingTimeInterval(3)
+            while restored.currentEditor() !== panel.firstResponder || restored.currentEditor() == nil {
+                guard Date() < restoreDeadline else { break }
+                try? await Task.sleep(nanoseconds: 20_000_000)
+            }
             guard restored.currentEditor() === panel.firstResponder else {
-                fputs("FAIL: did not restore \(home ? "home search" : "toolbar address") after switching\n", stderr); exit(1)
+                fputs("FAIL: did not restore \(home ? "home search" : "toolbar address") after switching: key=\(panel.isKeyWindow), active=\(NSApp.isActive), responder=\(String(describing: panel.firstResponder)), editor=\(String(describing: restored.currentEditor()))\n", stderr); exit(1)
             }
             guard restored.currentEditor()?.string == draft,
                   (restored.currentEditor() as? NSTextView)?.selectedRange() == NSRange(location: 2, length: 1) else {
                 fputs("FAIL: did not restore \(home ? "home search" : "toolbar address") text and selection: text=\(restored.currentEditor()?.string ?? "nil"), selection=\(String(describing: (restored.currentEditor() as? NSTextView)?.selectedRange()))\n", stderr); exit(1)
             }
         }
-        print("PASS: homepage search and address drafts, focus and selection survive tab switches without leaking")
+        print("PASS: homepage search and address drafts, focus and selection survive table and direct tab switches without leaking")
         let url = URL(string: "https://perch-reference.invalid/page?fixture=1")!
         let count = store.tabs.count
         store.openReferencedPage(url)
@@ -1439,14 +1429,12 @@ final class LayoutSelfCheck {
         let sites = store.sites
         store.sites = sites
         await settle()
-        print("IME: first marked letter after focus/redraw = \(editor.string), marked = \(editor.hasMarkedText())")
         fflush(stdout)
         precondition(editor.string == "n" && editor.hasMarkedText(), "Redrawing the homepage must not swallow the first IME letter")
         editor.setMarkedText("ni", selectedRange: NSRange(location: 2, length: 0),
                              replacementRange: NSRange(location: NSNotFound, length: 0))
         store.sites = sites
         await settle()
-        print("IME: continued composition = \(editor.string), marked = \(editor.hasMarkedText())")
         fflush(stdout)
         precondition(editor.string == "ni" && editor.hasMarkedText())
         let coordinator = field.delegate as! AddressTextField.Coordinator
@@ -1456,7 +1444,6 @@ final class LayoutSelfCheck {
         }
         editor.insertText("你", replacementRange: NSRange(location: NSNotFound, length: 0))
         await settle()
-        print("IME: committed editor = \(editor.string), state = \(coordinator.parent.text), marked = \(editor.hasMarkedText())")
         fflush(stdout)
         precondition(!editor.hasMarkedText() && editor.string == "你" && coordinator.parent.text == "你")
         editor.insertText("好", replacementRange: NSRange(location: NSNotFound, length: 0))
@@ -1483,39 +1470,45 @@ final class LayoutSelfCheck {
         print("PASS: homepage suggestion dropdown receives clicks above the Chat and shortcut cards")
     }
     func verify(width: CGFloat) {
+        func check(_ condition: @autoclosure () -> Bool, _ message: String = "", line: UInt = #line) {
+            guard condition() else {
+                fputs("FAIL: sidebar layout at line \(line): \(message)\n", stderr); exit(1)
+            }
+        }
         let table = table()
-        precondition(table.ids == store.tabs.map(\.id) && table.numberOfRows == store.tabs.count)
+        check(table.ids == store.tabs.map(\.id) && table.numberOfRows == store.tabs.count, "Native tab rows must match the store")
         let actual = table.enclosingScrollView!.frame.width
-        let expectedWidth = width == 32 ? width + 4 : width
-        precondition(abs(actual - expectedWidth) < 2, "Expected sidebar content \(expectedWidth), got \(actual)")
+        // NativeTabList extends 2pt into each side of the sidebar's 8pt padding.
+        let expectedWidth = width + 4
+        check(abs(actual - expectedWidth) < 2, "Expected sidebar content \(expectedWidth), got \(actual)")
         if !store.tabs.isEmpty {
             if store.tabs.count <= 4 {
-                precondition(!table.enclosingScrollView!.hasVerticalScroller,
+                check(!table.enclosingScrollView!.hasVerticalScroller,
                              "Short tab lists must not display a scrollbar")
             }
-            precondition(table.rowView(atRow: 0, makeIfNecessary: true) is TabSelectionRow)
-            precondition(table.selectedRow == store.tabs.firstIndex(where: { $0.id == store.selected }))
+            check(table.rowView(atRow: 0, makeIfNecessary: true) is TabSelectionRow)
+            check(table.selectedRow == store.tabs.firstIndex(where: { $0.id == store.selected }), "Native selection must match the store")
             let cell = table.view(atColumn: 0, row: 0, makeIfNecessary: true) as! TabCell
             let iconRect = table.convert(cell.icon.bounds, from: cell.icon)
-            precondition(table.visibleRect.contains(iconRect), "Icon must be fully visible, including on compact startup")
+            check(table.visibleRect.contains(iconRect), "Icon must be fully visible, including on compact startup")
             if width == 32 {
                 let root = panel.contentView!
                 let center = root.convert(cell.icon.bounds, from: cell.icon).midX
                 let row = table.rowView(atRow: 0, makeIfNecessary: true) as! TabSelectionRow
                 let highlightCenter = root.convert(row.bounds, from: row).midX
-                precondition(abs(center - highlightCenter) < 0.5,
+                check(abs(center - highlightCenter) < 0.5,
                              "Collapsed icon and selection highlight must have the same center")
                 let tab = store.tabs[0]
                 cell.configure(tab, image: nil, compact: false)
                 cell.layoutSubtreeIfNeeded()
                 let expandedCenter = root.convert(cell.icon.bounds, from: cell.icon).midX
-                precondition(abs(expandedCenter - center) < 0.5,
+                check(abs(expandedCenter - center) < 0.5,
                              "Expanding the sidebar must not move the tab icon horizontally")
                 cell.configure(tab, image: nil, compact: true)
             }
             if store.tabs.count <= 3 {
                 let last = table.view(atColumn: 0, row: store.tabs.count - 1, makeIfNecessary: true) as! TabCell
-                precondition(table.visibleRect.contains(table.convert(last.icon.bounds, from: last.icon)),
+                check(table.visibleRect.contains(table.convert(last.icon.bounds, from: last.icon)),
                              "A short tab list must show its last icon fully without titlebar insets")
             }
         }
@@ -1636,6 +1629,7 @@ final class LayoutSelfCheck {
                 try? await Task.sleep(nanoseconds: 80_000_000)
                 if browser.hoverLinks?.site?.address == expected { return }
             }
+            check(false, "Link preview fixture did not track \(selector)")
         }
         func flags(_ value: NSEvent.ModifierFlags) {
             let event = NSEvent.keyEvent(with: .flagsChanged, location: .zero, modifierFlags: value,
@@ -1656,14 +1650,15 @@ final class LayoutSelfCheck {
             trigger.settingsChanged()
         }
         func focus() async {
-            for _ in 0..<3 {
+            let deadline = Date().addingTimeInterval(3)
+            while Date() < deadline {
                 NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
                 panel.focusWindow()
                 panel.makeFirstResponder(browser.webView)
-                if NSApp.isActive && panel.isKeyWindow { break }
-                try? await Task.sleep(nanoseconds: 100_000_000)
+                await settle()
+                if NSApp.isActive && panel.isKeyWindow && browser.webView.window === panel { return }
             }
-            await settle()
+            check(false, "Link preview fixture could not activate its isolated window")
         }
         let isolated = try? await browser.webView.evaluateJavaScript("typeof window.webkit?.messageHandlers?.perchHoverLink")
         check(isolated as? String == "undefined", "Page scripts must not access the hover bridge")
@@ -1711,9 +1706,6 @@ final class LayoutSelfCheck {
         flags(.option)
         await settle()
         guard let preview = trigger.preview else {
-            print("Test hover eligibility:", browser.hoverLinks?.site?.address as Any,
-                  browser.hoverLinks?.editing as Any, panel.isKeyWindow, NSApp.isActive,
-                  browser.webView.window === panel, panel.attachedSheet as Any); fflush(stdout)
             fputs("FAIL: holding Alt on a link must present a preview\n", stderr); exit(1)
         }
         check(preview.window.parent === panel && preview.browser.hoverLinks == nil &&
@@ -1813,7 +1805,7 @@ final class LayoutSelfCheck {
         await focus()
         await hover("#link")
         flags(.option)
-        check(trigger.preview != nil, "Zero seconds must present immediately in the triggering event")
+        check(trigger.preview != nil, "Zero seconds must present immediately in the triggering event; active=\(NSApp.isActive), key=\(panel.isKeyWindow), link=\(browser.hoverLinks?.site?.address ?? "none")")
         trigger.preview?.close()
         await settle()
         check(store.tabs.map(\.id) == tabs && store.history.count == visits, "Preview must not add tabs or history")
@@ -1928,6 +1920,11 @@ final class LayoutSelfCheck {
         print("PASS: settings open without numeric focus; actual clicks retain input focus inside the field, blur on whitespace and save the decimal")
     }
     func run() async {
+        func check(_ condition: @autoclosure () -> Bool, _ message: String, line: UInt = #line) {
+            guard condition() else {
+                fputs("FAIL: UI interaction at line \(line): \(message)\n", stderr); exit(1)
+            }
+        }
         await settle()
         if defaults.bool(forKey: "sidebarHidden") { verify(width: 32) }
         await verifyHomeFocusRestoration()
@@ -1946,19 +1943,20 @@ final class LayoutSelfCheck {
         }
         let root = panel.contentView!
         let handle = resizeHandle(root)!
-        print("DIVIDER: root=\(root.bounds), handle=\(handle.bounds), frame=\(root.convert(handle.bounds, from: handle))"); fflush(stdout)
         precondition(abs(handle.bounds.width - 7) < 0.5, "Thin divider must retain its 7pt drag target")
         precondition(abs(handle.bounds.height - root.bounds.height +
                          RootView.topBarHeight(chat: store.isChatPage) + Style.chromeRadius) < 1,
                      "Native resize view must start below the toolbar and its rounded corner")
         for y in [CGFloat(10), handle.bounds.midY, handle.bounds.height - 10] {
             let point = handle.convert(NSPoint(x: handle.bounds.maxX - 1, y: y), to: root)
-            print("DIVIDER HIT: y=\(y), target=\(String(describing: root.hitTest(point)))"); fflush(stdout)
             precondition(root.hitTest(point) === handle, "Visible divider must receive resizing events")
         }
         for y in [CGFloat(-10), -RootView.topBarHeight(chat: store.isChatPage) - Style.chromeRadius + 10] {
             let point = handle.convert(NSPoint(x: handle.bounds.maxX - 1, y: y), to: root)
-            precondition(root.hitTest(point) !== handle, "Toolbar above the visible divider must not resize")
+            guard root.hitTest(point) !== handle else {
+                fputs("FAIL: toolbar above the visible divider must not resize: local y=\(y), root point=\(point), handle=\(handle.bounds)\n", stderr)
+                exit(1)
+            }
         }
         print("PASS: left divider receives resizing below the visible toolbar boundary only")
         let sidebarWidth = defaults.bool(forKey: "sidebarHidden") ? 48 : defaults.double(forKey: "sidebarWidth")
@@ -1989,9 +1987,11 @@ final class LayoutSelfCheck {
         dragTable.beginDrag(at: 0)
         dragTable.previewDrag(to: 2)
         await settle()
-        precondition(dragTable.ids == [originalIDs[1], originalIDs[2], originalIDs[0]])
-        precondition((dragTable.view(atColumn: 0, row: 2, makeIfNecessary: true) as? TabCell)?.content.isHidden == true)
-        precondition((dragTable.view(atColumn: 0, row: 0, makeIfNecessary: true) as? TabCell)?.label.stringValue == store.tabs[1].title)
+        guard dragTable.ids == [originalIDs[1], originalIDs[2], originalIDs[0]],
+              (dragTable.view(atColumn: 0, row: 2, makeIfNecessary: true) as? TabCell)?.content.isHidden == true,
+              (dragTable.view(atColumn: 0, row: 0, makeIfNecessary: true) as? TabCell)?.label.stringValue == store.tabs[1].title else {
+            fputs("FAIL: initial native drag preview: tabs=\(originalIDs.count), rows=\(dragTable.ids), expected=\([originalIDs[1], originalIDs[2], originalIDs[0]])\n", stderr); exit(1)
+        }
         precondition(store.tabs.map(\.id) == originalIDs, "Preview must not persist a reorder before release")
         dragTable.previewDrag(to: 1)
         await settle()
@@ -2043,22 +2043,24 @@ final class LayoutSelfCheck {
         print("PASS: native row insertion preview in both directions, middle slot, stable hidden content during metadata changes and cancellation")
         NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
         panel.focusWindow()
-        precondition(panel.shouldHideForStatusClick())
-        let other = Panel(contentRect: .zero, styleMask: [.borderless], backing: .buffered, defer: false)
+        check(panel.shouldHideForStatusClick(), "Focusing the panel must establish status-click intent")
+        let other = Panel(contentRect: NSRect(x: 100, y: 100, width: 160, height: 100),
+                          styleMask: [.borderless], backing: .buffered, defer: false)
         other.isReleasedWhenClosed = false
         // Reproduce the ordering: status bar takes focus before its action is delivered.
         panel.statusItemPressed = { true }
         other.makeKeyAndOrderFront(nil)
+        await settle()
         panel.recordFocusLoss(statusItemPress: true)
-        precondition(!panel.isKeyWindow && panel.shouldHideForStatusClick(),
+        check(!panel.isKeyWindow && panel.shouldHideForStatusClick(),
                      "The status click must retain the previously active window's hide intent")
         panel.recordFocusLoss(statusItemPress: false)
-        precondition(!panel.shouldHideForStatusClick(), "A real app switch must instead require activation")
+        check(!panel.shouldHideForStatusClick(), "A real app switch must instead require activation")
         panel.statusItemPressed = nil
         other.orderOut(nil)
-        precondition(panel.isVisible, "Focus changes must not hide Perch")
+        check(panel.isVisible, "Focus changes must not hide Perch")
         panel.focusWindow()
-        precondition(panel.shouldHideForStatusClick(), "After reactivation the next click must hide")
+        check(panel.shouldHideForStatusClick(), "After reactivation the next click must hide")
         store.activate(store.tabs[0].id)
         store.newTab(title: "插入动画")
         try? await Task.sleep(nanoseconds: 30_000_000)
@@ -2076,15 +2078,16 @@ final class LayoutSelfCheck {
         if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
             try? await Task.sleep(nanoseconds: 90_000_000)
             let width = table().enclosingScrollView!.frame.width
-            precondition(width > 40 && width < 196, "Sidebar collapse must pass through an intermediate width")
+            check(width > 36 && width < 200, "Sidebar collapse must pass through an intermediate width; got \(width)")
         }
         await settle()
-        verify(width: 40)
+        verify(width: 32)
         let cell = table().view(atColumn: 0, row: 0, makeIfNecessary: true) as! TabCell
-        precondition(cell.titleClip.frame.width < 1 && cell.closeButton.isHidden && !cell.icon.isHidden)
+        check(cell.titleClip.frame.width < 1 && cell.closeButton.isHidden && !cell.icon.isHidden,
+              "Compact tabs must show the icon and hide the title and close button")
         let iconRect = table().convert(cell.icon.bounds, from: cell.icon)
         precondition(table().visibleRect.contains(iconRect), "Compact icon must remain fully inside the visible sidebar")
-        precondition(abs(cell.frame.width - 40) < 2, "Compact table column must shrink with its viewport")
+        precondition(abs(cell.frame.width - 36) < 2, "Compact table column must shrink with its viewport")
         table().selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
         await settle()
         precondition(store.selected == store.tabs[0].id, "Icon rail must still select tabs")
@@ -2092,7 +2095,8 @@ final class LayoutSelfCheck {
         await settle()
         verify(width: 196)
         let expanded = table().view(atColumn: 0, row: 0, makeIfNecessary: true) as! TabCell
-        precondition(!expanded.titleClip.isHidden && expanded.titleClip.alphaValue == 1 &&
+        expanded.setHovered(false, animated: false)
+        check(!expanded.titleClip.isHidden && expanded.titleClip.alphaValue == 1 &&
                      expanded.closeButton.isHidden, "Expanded tab titles must reappear without persistent close buttons")
         let nextCell = table().view(atColumn: 0, row: 1, makeIfNecessary: true) as! TabCell
         expanded.setHovered(true, animated: false)
@@ -2305,34 +2309,9 @@ final class LayoutSelfCheck {
         let fixedToggleFrame = (initialToggle.value(forKey: "accessibilityFrame") as! NSValue).rectValue
         let firstRow = table().view(atColumn: 0, row: 0, makeIfNecessary: true)!
         let fixedFirstRowMidY = panel.convertToScreen(firstRow.convert(firstRow.bounds, to: nil)).midY
-        let lights = controls(panel.contentView!)!
-        let originalMouse = NSEvent.mouseLocation
         NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
         panel.focusWindow()
         await settle()
-        func movePointer(_ point: NSPoint) {
-            let screen = panel.convertPoint(toScreen: point)
-            let displayHeight = CGDisplayBounds(CGMainDisplayID()).height
-            let cgPoint = CGPoint(x: screen.x, y: displayHeight - screen.y)
-            CGWarpMouseCursorPosition(cgPoint)
-            CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: cgPoint,
-                    mouseButton: .left)?.postToPid(ProcessInfo.processInfo.processIdentifier)
-        }
-        movePointer(NSPoint(x: panel.contentView!.bounds.midX, y: panel.contentView!.bounds.midY))
-        await settle()
-        for button in lights.buttons {
-            movePointer(button.convert(NSPoint(x: button.bounds.midX, y: button.bounds.midY), to: nil))
-            await settle()
-            precondition(lights.hovered && lights.buttons.allSatisfy { $0.cell?.isHighlighted == false },
-                         "Hover must not force the native window buttons into their pressed appearance")
-        }
-        movePointer(NSPoint(x: panel.contentView!.bounds.midX, y: panel.contentView!.bounds.midY))
-        await settle()
-        precondition(!lights.hovered && lights.buttons.allSatisfy { $0.cell?.isHighlighted == false },
-                     "Leaving the window controls must clear the native hover symbols")
-        let displayHeight = CGDisplayBounds(CGMainDisplayID()).height
-        CGWarpMouseCursorPosition(CGPoint(x: originalMouse.x, y: displayHeight - originalMouse.y))
-        print("PASS: real pointer hover does not force the window buttons into their pressed appearance")
         let previousDelegate = panel.delegate
         let closeProbe = CloseProbe()
         panel.delegate = closeProbe

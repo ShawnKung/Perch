@@ -35,22 +35,28 @@ test: verify
 	@"$(BIN)" --self-test
 
 check: test
-	@python3 ai-self-check.py "$(BIN)"
-	@python3 ai-self-check.py "$(BIN)" --navigation
+	@"$(BIN)" --ai-typography-self-test
+	@python3 tests/ai-self-check.py "$(BIN)" --background-only
+	@python3 tests/ai-self-check.py "$(BIN)"
+	@python3 tests/ai-self-check.py "$(BIN)" --navigation
 	@"$(BIN)" --web-self-test
 	@"$(BIN)" --web-tabs-self-test
+	@"$(BIN)" --scroll-self-test
 	@"$(BIN)" --ui-self-test --compact
 	@"$(BIN)" --window-self-test
 
 test-web: verify
 	@"$(BIN)" --web-self-test
 	@"$(BIN)" --web-tabs-self-test
+	@"$(BIN)" --scroll-self-test
 
 test-ai: verify
-	@python3 ai-self-check.py "$(BIN)"
+	@"$(BIN)" --ai-typography-self-test
+	@python3 tests/ai-self-check.py "$(BIN)" --background-only
+	@python3 tests/ai-self-check.py "$(BIN)"
 
 test-navigation: verify
-	@python3 ai-self-check.py "$(BIN)" --navigation
+	@python3 tests/ai-self-check.py "$(BIN)" --navigation
 
 test-ui: verify
 	@"$(BIN)" --ui-self-test --compact
@@ -62,7 +68,7 @@ test-keychain: verify
 	@"$(BIN)" --keychain-self-test
 
 install: test
-	@bash install.sh
+	@bash scripts/install.sh
 
 reinstall: install
 

@@ -12,5 +12,6 @@ Artwork license notice: 2D/svg/LICENSE.
 The upstream README states that image resources use Apache 2.0; the root
 and fonts-directory SIL Open Font License applies to font software.
 
-Perch's make-icon.swift scales the bird and adds a pale sage rounded background
+Perch's scripts/make-icon.swift scales the bird and adds a pale sage rounded background
 when producing the macOS icon sizes. The original bird PNG is unchanged.
+The README logo uses this same original bird PNG under the license above.

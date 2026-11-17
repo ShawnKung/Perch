@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/noto-bird.png" alt="Perch Logo" width="128" height="128">
+</p>
+
 # Perch
 
 [![CI](https://github.com/ShawnKung/Perch/actions/workflows/ci.yml/badge.svg)](https://github.com/ShawnKung/Perch/actions/workflows/ci.yml)
@@ -9,9 +13,13 @@ Perch 是一款原生 macOS 菜单栏浏览器，让常用网页和 AI 对话随
 ## 功能
 
 - 菜单栏快捷打开，支持多标签、书签、浏览历史和快捷键。
+- 切换标签保留地址栏与首页搜索框的草稿、焦点和文字选区。
 - 从其他浏览器导入数据，支持密码保存和网页链接预览。
 - 接入兼容 OpenAI 或 Anthropic 协议的模型，支持网页引用、附件、联网搜索和对话历史。
+- AI 回车发送或加入队列后立即清空输入框；发送未受理时保留草稿。
+- Chat 支持后台执行：切换对话或关闭展示标签后继续生成，历史名称右侧显示运行转圈；空闲时悬停显示归档按钮。
 - 在对话中查看 Markdown、表格与图表，导出文本文件。
+- 在「设置 → 常规 → 外观」调整 Chat 正文字号，标题、历史列表、思考过程和其他文字按比例调整。
 
 ## 安装
 
@@ -27,7 +35,28 @@ cd Perch
 make install
 ```
 
-需要 Xcode 或 Apple Command Line Tools。源码构建使用本机签名，请保留 `~/Library/Application Support/Perch Signing/` 以便后续更新继续访问钥匙串。
+需要 macOS 13+、Xcode 或 Apple Command Line Tools，以及 Python 3。源码构建使用本机签名，请保留 `~/Library/Application Support/Perch Signing/` 以便后续更新继续访问钥匙串。
+
+## 开发
+
+```text
+src/
+  App/          应用入口、主界面、设置与管理页
+  Browser/      标签、导航、书签、导入、密码与网页预览
+  AI/           对话、历史、供应商协议与内容渲染
+  Helpers/      独立编译和签名的钥匙串组件
+tests/          隔离 Swift 自检与 Python 合成接口服务
+scripts/        安装、签名、图标生成与优化工具
+resources/      应用元数据（Info.plist）
+assets/         图标原图、本地 Markdown 库与第三方许可
+.github/        CI 与发布工作流
+build.sh        编译、资源打包与签名的唯一入口
+Makefile        常用开发命令
+```
+
+运行 `make test` 检查编译、签名和隔离数据自检，`make check` 运行完整回归，`make help` 查看专项检查和预览命令。GUI 回归需要可用的 macOS 桌面会话；检查只使用隔离配置和合成数据。
+
+源码仍通过 `swiftc` 构建，无需 Xcode 工程或 Swift Package。新增 Swift 文件时更新 `build.sh` 中对应的编译列表；Swift 自检随主程序编译，钥匙串组件单独构建。更多协作约定见 [AGENTS.md](AGENTS.md)，贡献说明见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 隐私
 

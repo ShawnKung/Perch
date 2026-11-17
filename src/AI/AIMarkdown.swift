@@ -12,11 +12,11 @@ private struct AICitationPreviewContent: View {
     let open: () -> Void
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(source.title).font(.system(size: 12, weight: .semibold)).lineLimit(3)
-            Text(source.url.host ?? "").font(.system(size: 10)).foregroundStyle(Style.muted)
-            Text(source.excerpt ?? "来源未提供摘要").font(.system(size: 12)).lineLimit(8).textSelection(.enabled)
+            Text(source.title).font(.system(size: theme.chatDetailFontSize, weight: .semibold)).lineLimit(3)
+            Text(source.url.host ?? "").font(.system(size: theme.chatFontSize(relativeTo: 10))).foregroundStyle(Style.muted)
+            Text(source.excerpt ?? "来源未提供摘要").font(.system(size: theme.chatDetailFontSize)).lineLimit(8).textSelection(.enabled)
             Button(action: open) {
-                Label("打开原链接", systemImage: "arrow.up.right.square").font(.system(size: 11))
+                Label("打开原链接", systemImage: "arrow.up.right.square").font(.system(size: theme.chatFontSize(relativeTo: 11)))
             }.buttonStyle(.plain).foregroundStyle(Style.accent).arrowCursor()
         }.foregroundStyle(Style.ink).padding(12).frame(width: 320, alignment: .leading)
             .fixedSize(horizontal: false, vertical: true).background(Style.paper)
@@ -121,6 +121,13 @@ final class AIMarkdownWebView: WKWebView {
     func forwardVerticalScroll(_ event: NSEvent, at point: NSPoint) -> Bool {
         guard !isHiddenOrHasHiddenAncestor, bounds.intersection(visibleRect).contains(point),
               abs(event.scrollingDeltaY) >= abs(event.scrollingDeltaX) else { return false }
+        // Local monitors must respect the window's hit testing, including overlays.
+        if let window, let content = window.contentView {
+            let windowPoint = convert(point, to: nil)
+            let parentPoint = content.superview?.convert(windowPoint, from: nil) ?? windowPoint
+            guard let hit = content.hitTest(parentPoint),
+                  hit === self || hit.isDescendant(of: self) else { return false }
+        }
         let pagePoint = NSPoint(x: point.x, y: isFlipped ? point.y : bounds.height - point.y)
         guard !diagramRects.contains(where: { $0.contains(pagePoint) }) else { return false }
         var parent = superview
@@ -195,18 +202,19 @@ struct AIMarkdownView: View {
         <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:;">
         <style>
         :root {color-scheme:light;--perch-accent:#216452;--perch-mint:#e0f0e6;--perch-sidebar:#f0f5ed;--perch-line:#dbe3db} *{box-sizing:border-box}
-        html,body{margin:0;padding:0;background:transparent;color:#28352e;font:13px/1.65 -apple-system,BlinkMacSystemFont,sans-serif;overflow:hidden}
+        html,body{margin:0;padding:0;background:transparent;color:#28352e;font:var(--perch-chat-font-size,13px)/1.65 -apple-system,BlinkMacSystemFont,sans-serif;overflow:hidden}
         #content{overflow-wrap:anywhere;padding-bottom:2px} #content>:first-child{margin-top:0} #content>:last-child{margin-bottom:0}
         h1,h2,h3{font-size:1.3em;line-height:1.4;margin:14px 0 8px} p,ul,ol{margin:8px 0}
         ul,ol{padding-left:22px} a{color:var(--perch-accent)} blockquote{margin:10px 0;padding:2px 12px;border-left:3px solid var(--perch-line);color:#68776d;background:var(--perch-sidebar)}
-        code{font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--perch-mint);border-radius:4px;padding:2px 4px}
-        pre{position:relative;overflow-x:auto;background:var(--perch-mint);padding:34px 12px 12px;border-radius:8px;margin:10px 0}
-        pre code{padding:0;white-space:pre;overflow-wrap:normal} pre button{position:absolute;right:8px;top:6px;border:1px solid var(--perch-line);border-radius:5px;background:white;color:var(--perch-accent);padding:2px 8px;font:11px -apple-system;cursor:pointer}
-        .table-wrap{overflow-x:auto} table{border-collapse:collapse;font-size:12px;min-width:100%;margin:8px 0}
-        .table-tools{display:flex;gap:6px;padding-top:5px} .table-tools button,th button{font:11px -apple-system;color:var(--perch-accent);border:1px solid var(--perch-line);border-radius:5px;background:white;padding:3px 7px;cursor:pointer}
-        th button{border:0;background:none;text-align:left;padding:0;width:100%;font-weight:600}
+        code{font:calc(var(--perch-chat-font-size,13px) * 12 / 13)/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--perch-mint);border-radius:4px;padding:2px 4px;box-decoration-break:clone;-webkit-box-decoration-break:clone}
+        pre{position:relative;overflow-x:auto;background:var(--perch-mint);padding:calc(34px + (var(--perch-chat-font-size,13px) - 13px) * 1.2) 12px 12px;border-radius:8px;margin:10px 0}
+        .code-tools{position:absolute;right:8px;top:6px;display:flex;flex-direction:row-reverse;gap:6px}
+        pre code{padding:0;white-space:pre;overflow-wrap:normal} pre button{border:1px solid var(--perch-line);border-radius:5px;background:white;color:var(--perch-accent);padding:2px 8px;font:calc(var(--perch-chat-font-size,13px) * 11 / 13) -apple-system;white-space:nowrap;cursor:pointer}
+        .table-wrap{overflow-x:auto} table{border-collapse:collapse;font-size:calc(var(--perch-chat-font-size,13px) * 12 / 13);min-width:100%;margin:8px 0}
+        .table-tools{display:flex;flex-wrap:wrap;gap:6px;padding-top:5px} .table-tools button,th button{font:calc(var(--perch-chat-font-size,13px) * 11 / 13) -apple-system;color:var(--perch-accent);border:1px solid var(--perch-line);border-radius:5px;background:white;padding:3px 7px;cursor:pointer}
+        th button{border:0;background:none;text-align:left;padding:0;width:100%;font:inherit;font-weight:600}
         th[aria-sort=ascending]::after{content:' ↑'} th[aria-sort=descending]::after{content:' ↓'}
-        .source-citation{font-size:11px;color:#68776d;text-decoration:underline dashed;text-underline-offset:3px}
+        .source-citation{font-size:calc(var(--perch-chat-font-size,13px) * 11 / 13);color:#68776d;text-decoration:underline dashed;text-underline-offset:3px}
         th,td{border:1px solid var(--perch-line);padding:6px 8px;text-align:left} th{background:var(--perch-mint)} hr{border:0;border-top:1px solid var(--perch-line)}
         input[type=checkbox]{accent-color:var(--perch-accent)} img{max-width:100%}
         \(AIDiagram.assets.style)
@@ -222,14 +230,15 @@ struct AIMarkdownView: View {
           window.updateDiagramBounds?.();
           root.querySelectorAll('pre').forEach(pre => {
             const code = pre.querySelector('code'), button = document.createElement('button');
+            const tools = document.createElement('div'); tools.className = 'code-tools';
             button.textContent = '复制代码';
             button.onclick = () => { window.webkit.messageHandlers.markdown.postMessage({copy:code?.textContent || ''}); button.textContent='已复制'; };
-            pre.prepend(button);
+            tools.append(button); pre.prepend(tools);
             if (code && !code.classList.contains('language-mermaid')) {
               const save = document.createElement('button');
-              save.textContent = '另存为'; save.style.right = '82px';
+              save.textContent = '另存为';
               save.onclick = () => window.webkit.messageHandlers.markdown.postMessage({saveCode:code.textContent, language:Array.from(code.classList).find(x=>x.startsWith('language-'))?.slice(9) || ''});
-              pre.append(save);
+              tools.append(save);
             }
           });
           root.querySelectorAll('table').forEach(enhanceTable);
