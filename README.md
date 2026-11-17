@@ -33,6 +33,8 @@ Perch 是一款原生 macOS 菜单栏浏览器，让常用网页和 AI 对话随
 
 本地构建的版本和构建号以 `resources/Info.plist` 为准；发布构建的构建号以其中的整数为基数，加上 GitHub Actions 的递增运行编号。发布时 CI 只修改运行器上的副本，不改仓库文件。发布新功能或修复时仍应按工程规范更新该文件的版本和构建号。
 
+也可以在 GitHub Actions 手动运行 CI，并在 `verify_release_tag` 中填入拟发布的标签，预演对应版本的构建和签名；预演不会创建标签或 Release。
+
 也可以在 Mac 上从源码构建并安装：
 
 ```sh
