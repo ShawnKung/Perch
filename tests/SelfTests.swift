@@ -2236,8 +2236,16 @@ final class LayoutSelfCheck {
         }
         precondition(command("r", code: 15), "Command-R must be handled while WebKit is active")
         precondition(command("r", code: 15, flags: [.command, .shift]))
-        precondition(command("=", code: 24) && store.browser!.webView.pageZoom > 1)
-        precondition(command("0", code: 29) && store.browser!.webView.pageZoom == 1)
+        let zoomBrowser = store.browser!
+        precondition(command("=", code: 24) && zoomBrowser.webView.pageZoom > 1)
+        precondition(zoomBrowser.zoomVisible && zoomBrowser.zoomPercent == 110)
+        precondition(command("-", code: 27) && zoomBrowser.zoomPercent == 100)
+        precondition(command("=", code: 24) && zoomBrowser.zoomPercent == 110)
+        precondition(command("0", code: 29) && zoomBrowser.webView.pageZoom == 1 && zoomBrowser.zoomPercent == 100)
+        zoomBrowser.changeZoom(-1)
+        precondition(zoomBrowser.zoomPercent == 91)
+        zoomBrowser.changeZoom(0)
+        precondition(zoomBrowser.zoomPercent == 100)
         precondition(command("f", code: 3) && store.browser!.finding)
         let previousID = store.selected
         precondition(command("\t", code: 48, flags: .control) && store.selected != previousID)
