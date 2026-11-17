@@ -6,9 +6,17 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      verify_release_tag:
+        description: 'Optional version tag to rehearse without publishing (e.g. v0.1.2)'
+        required: false
+        type: string
 
 permissions:
   contents: read
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.verify_release_tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || '' }}
 
 jobs:
   build:
@@ -20,9 +28,8 @@ jobs:
       - name: Test release version rules
         run: python3 tests/test-release-version.py
       - name: Set release version from tag
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        if: env.RELEASE_TAG != ''
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
           BUILD_RUN_NUMBER: ${{ github.run_number }}
         run: bash scripts/prepare-release.sh "$RELEASE_TAG" "$BUILD_RUN_NUMBER" resources/Info.plist
       - name: Restore fixed signing identity
@@ -49,8 +56,8 @@ jobs:
           for binary in Perch PerchVault PerchAIKeys; do
             test "$(lipo -archs "build/Perch.app/Contents/MacOS/$binary")" = arm64
           done
-          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
-            test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' build/Perch.app/Contents/Info.plist)" = "${GITHUB_REF_NAME#v}"
+          if [[ -n "$RELEASE_TAG" ]]; then
+            test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' build/Perch.app/Contents/Info.plist)" = "${RELEASE_TAG#v}"
           fi
       - name: Package app
         run: |
