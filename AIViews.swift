@@ -1656,7 +1656,7 @@ struct AIComposerInput: NSViewRepresentable {
         var focusRequest: UUID?
         init(_ parent: AIComposerInput) { self.parent = parent }
         func textDidChange(_ notification: Notification) {
-            guard let editor = notification.object as? NSTextView, !editor.hasMarkedText() else { return }
+            guard !updating, let editor = notification.object as? NSTextView, !editor.hasMarkedText() else { return }
             parent.text = editor.string
             updateMention(editor)
         }
@@ -1692,6 +1692,14 @@ struct AIComposerInput: NSViewRepresentable {
             if shouldSend {
                 parent.text = editor.string
                 parent.send()
+                // Clear before a late native notification can publish the submitted text again.
+                if parent.text.isEmpty, !editor.string.isEmpty {
+                    updating = true
+                    editor.string = ""
+                    editor.setSelectedRange(NSRange(location: 0, length: 0))
+                    editor.needsDisplay = true
+                    updating = false
+                }
             } else {
                 // Explicitly insert a newline so Cmd+Return cannot fall through to a window shortcut.
                 editor.insertText("\n", replacementRange: editor.selectedRange())
