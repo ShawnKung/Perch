@@ -103,6 +103,7 @@ struct AddressTextField: NSViewRepresentable {
     @Binding var focused: Bool
     let placeholder: String
     var focusShortcut = true
+    var ownerTab: UUID?
     var focusRequest: UUID?
     var canFocus: (UUID) -> Bool = { _ in true }
     var focusedRequest: () -> Void = {}
@@ -110,15 +111,20 @@ struct AddressTextField: NSViewRepresentable {
     let command: (String) -> Bool
     func makeCoordinator() -> Coordinator { Coordinator(self) }
     final class Field: NSTextField {
+        var ownerTab: UUID?
         var attached: (() -> Void)?
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             attached?()
-            (window as? Panel)?.restoreCurrentTabFocus()
+            DispatchQueue.main.async { [weak self] in
+                guard let self, let panel = self.window as? Panel else { return }
+                panel.restoreCurrentTabFocus()
+            }
         }
     }
     func makeNSView(context: Context) -> NSTextField {
         let field = Field()
+        field.ownerTab = ownerTab
         field.attached = { [weak coordinator = context.coordinator, weak field] in
             if let field { coordinator?.requestFocus(field) }
         }
@@ -141,6 +147,7 @@ struct AddressTextField: NSViewRepresentable {
     }
     func updateNSView(_ field: NSTextField, context: Context) {
         context.coordinator.parent = self
+        (field as? Field)?.ownerTab = ownerTab
         context.coordinator.requestFocus(field)
         // State redraws must not replace the input method's uncommitted text.
         guard (field.currentEditor() as? NSTextView)?.hasMarkedText() != true else { return }
@@ -196,6 +203,7 @@ struct AddressEntry: View {
     private var request: Request { Request(text: text, revision: store.suggestionRevision, active: focused && editing) }
     var body: some View {
         AddressTextField(text: $text, focused: $focused, placeholder: "输入网址或搜索", focusShortcut: focusShortcut,
+                         ownerTab: homeTab ?? store.selected,
                          focusRequest: focusShortcut ? store.pendingAddressFocus : nil,
                          canFocus: { id in store.pendingAddressFocus == id && store.selected == id && !store.isChatPage },
                          focusedRequest: { store.pendingAddressFocus = nil },
