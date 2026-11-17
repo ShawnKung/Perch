@@ -97,7 +97,7 @@ struct AIFollowupSuggestion: View {
         HStack(spacing: 6) {
             Button(action: send) {
                 HStack(spacing: 8) {
-                    Text(text).multilineTextAlignment(.leading)
+                    Text(text).multilineTextAlignment(.leading).fixedSize(horizontal: false, vertical: true)
                     Image(systemName: "arrow.right")
                         .font(.system(size: 10, weight: .semibold, design: .rounded))
                         .foregroundStyle(Color.gray)
@@ -114,7 +114,7 @@ struct AIFollowupSuggestion: View {
                 .accessibilityLabel("添加到对话：\(text)")
                 .padding(.trailing, 7)
         }
-        .font(.system(size: 12)).foregroundStyle(Style.accent)
+        .font(.system(size: theme.chatDetailFontSize)).foregroundStyle(Style.accent)
         .background(Style.mint, in: RoundedRectangle(cornerRadius: 8))
         .arrowCursor()
     }
@@ -130,24 +130,25 @@ struct AIClarificationCard: View {
         VStack(alignment: .leading, spacing: 10) {
             ForEach(clarification.questions.indices, id: \.self) { index in
                 VStack(alignment: .leading, spacing: 6) {
-                    Text(clarification.questions[index].label).font(.system(size: 12, weight: .medium))
+                    Text(clarification.questions[index].label).font(.system(size: theme.chatDetailFontSize, weight: .medium))
                     if let answers = clarification.answers, answers.indices.contains(index) {
-                        Text(answers[index]).font(.callout).textSelection(.enabled)
+                        Text(answers[index]).font(.system(size: theme.chatFontSize)).textSelection(.enabled)
                     } else {
                         ForEach(clarification.questions[index].options, id: \.self) { option in
                             Button { values[index] = option } label: {
                                 Label(option, systemImage: values[index] == option ? "largecircle.fill.circle" : "circle")
-                                    .font(.system(size: 12)).frame(maxWidth: .infinity, alignment: .leading)
+                                    .font(.system(size: theme.chatDetailFontSize)).fixedSize(horizontal: false, vertical: true).frame(maxWidth: .infinity, alignment: .leading)
                             }.buttonStyle(.plain).foregroundStyle(values[index] == option ? Style.accent : Style.ink)
                         }
                         TextField("选择上方选项，或输入你的回答", text: $values[index]).textFieldStyle(.roundedBorder)
+                            .font(.system(size: theme.chatFontSize))
                     }
                 }
             }
             if clarification.answers == nil {
                 Button("提交并继续") { submit(Array(values.prefix(clarification.questions.count))) }
                     .disabled(!enabled || clarification.response(Array(values.prefix(clarification.questions.count))) == nil)
-            } else { Text("已提交").font(.caption).foregroundStyle(Style.muted) }
+            } else { Text("已提交").font(.system(size: theme.chatFontSize(relativeTo: 10))).foregroundStyle(Style.muted) }
         }.padding(10).background(Style.mint, in: RoundedRectangle(cornerRadius: 8))
             .disabled(!enabled && clarification.answers == nil)
     }

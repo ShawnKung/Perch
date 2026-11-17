@@ -115,9 +115,9 @@ struct AIGeneratedFileCard: View {
             HStack(spacing: 8) {
                 Image(systemName: "doc.text").foregroundStyle(Style.accent)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(file.name).font(.system(size: 12, weight: .semibold)).lineLimit(2).textSelection(.enabled)
+                    Text(file.name).font(.system(size: theme.chatDetailFontSize, weight: .semibold)).lineLimit(2).textSelection(.enabled)
                     Text(ByteCountFormatter.string(fromByteCount: Int64(file.content.utf8.count), countStyle: .file))
-                        .font(.caption2).foregroundStyle(Style.muted)
+                        .font(.system(size: theme.chatFontSize(relativeTo: 10))).foregroundStyle(Style.muted)
                 }
                 Spacer(minLength: 0)
                 Button("下载") {
@@ -144,12 +144,12 @@ struct AIGeneratedFileCard: View {
                     }.frame(maxWidth: 170)
                     Toggle("显示变更", isOn: $showChanges).toggleStyle(.checkbox)
                         .disabled(file.id == versions.first?.id)
-                }.font(.caption)
+                }.font(.system(size: theme.chatFontSize(relativeTo: 10)))
             }
             if showChanges, let index = versions.firstIndex(where: { $0.id == file.id }), index > 0 {
                 ScrollView([.horizontal, .vertical]) {
                     Text(AIFileDifference.text(from: versions[index - 1].content, to: file.content))
-                        .font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
+                        .font(.system(size: theme.chatFontSize(relativeTo: 11), design: .monospaced)).textSelection(.enabled)
                         .fixedSize(horizontal: true, vertical: true).padding(8)
                 }.frame(height: 220)
             } else if AIFilePreview.supports(file.name) {
@@ -159,24 +159,24 @@ struct AIGeneratedFileCard: View {
                 }.pickerStyle(.segmented).frame(width: 150)
                 if showPreview {
                     AIFilePreview(content: file.content).frame(height: 300)
-                    Text("本地沙箱 · 不加载外部资源").font(.caption2).foregroundStyle(Style.muted)
+                    Text("本地沙箱 · 不加载外部资源").font(.system(size: theme.chatFontSize(relativeTo: 10))).foregroundStyle(Style.muted)
                 } else { source(file) }
             } else {
                 DisclosureGroup("查看源码", isExpanded: $expanded) { source(file) }
-                    .font(.caption).foregroundStyle(Style.muted)
+                    .font(.system(size: theme.chatFontSize(relativeTo: 10))).foregroundStyle(Style.muted)
             }
             if let savedURL {
                 Button("已保存 · 在 Finder 中显示") { NSWorkspace.shared.activateFileViewerSelecting([savedURL]) }
-                    .buttonStyle(.plain).font(.caption).foregroundStyle(Style.accent)
+                    .buttonStyle(.plain).font(.system(size: theme.chatFontSize(relativeTo: 10))).foregroundStyle(Style.accent)
             }
-            if let error { Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled) }
-        }.padding(10).background(Style.mint, in: RoundedRectangle(cornerRadius: 8))
+            if let error { Text(error).font(.system(size: theme.chatFontSize(relativeTo: 10))).foregroundStyle(.red).textSelection(.enabled) }
+        }.font(.system(size: theme.chatFontSize)).padding(10).background(Style.mint, in: RoundedRectangle(cornerRadius: 8))
             .overlay(RoundedRectangle(cornerRadius: 8).stroke(Style.line))
             .onChange(of: file.content) { _ in savedURL = nil; error = nil }
     }
     private func source(_ file: AIGeneratedFile) -> some View {
                 ScrollView([.horizontal, .vertical]) {
-                    Text(file.content).font(.system(size: 11, design: .monospaced))
+                    Text(file.content).font(.system(size: theme.chatFontSize(relativeTo: 11), design: .monospaced))
                         .textSelection(.enabled).fixedSize(horizontal: true, vertical: true).padding(8)
                 }.frame(height: 220)
     }

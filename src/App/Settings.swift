@@ -65,9 +65,21 @@ final class PerchTheme: ObservableObject {
     @Published var selection: ThemeColor = .blue {
         didSet {
             guard oldValue != selection else { return }
-            webViews.removeAll { $0.value == nil }
-            for entry in webViews { if let web = entry.value { update(web) } }
+            updateRegisteredWebViews()
         }
+    }
+    @Published var chatFontSize = BrowserSettings.defaultChatFontSize {
+        didSet {
+            guard oldValue != chatFontSize else { return }
+            updateRegisteredWebViews()
+        }
+    }
+    var chatScale: Double { chatFontSize / BrowserSettings.defaultChatFontSize }
+    func chatFontSize(relativeTo size: Double) -> Double { size * chatScale }
+    var chatDetailFontSize: Double { chatFontSize(relativeTo: 12) }
+    private func updateRegisteredWebViews() {
+        webViews.removeAll { $0.value == nil }
+        for entry in webViews { if let web = entry.value { update(web) } }
     }
     private final class WeakWeb {
         weak var value: WKWebView?
@@ -89,6 +101,7 @@ final class PerchTheme: ObservableObject {
         (() => {
           const root = document.documentElement;
           root.dataset.perchTheme = '\(selection.rawValue)';
+          root.style.setProperty('--perch-chat-font-size', '\(chatFontSize)px');
           \(colors.sorted { $0.key < $1.key }.map { "root.style.setProperty('--perch-\($0.key)', '\($0.value)');" }.joined())
         })();
         """
@@ -138,6 +151,9 @@ struct Shortcut: Codable, Equatable {
 }
 
 struct BrowserSettings: Codable, Equatable {
+    static let defaultChatFontSize = 13.0
+    static let chatFontSizeRange = 11.0...22.0
+    var chatFontSize = Self.defaultChatFontSize
     var uaMode = "safari"
     var customUA = ""
     var openKey: Shortcut? = Shortcut(code: 35, modifiers: UInt32(cmdKey | optionKey), label: "⌥⌘P")
@@ -159,7 +175,7 @@ struct BrowserSettings: Codable, Equatable {
     enum CodingKeys: String, CodingKey {
         case uaMode, customUA, openKey, closeKey, toggleKey, searchEngine, customSearchURL, savePasswords
         case linkPreviewEnabled, linkPreviewKey, linkPreviewDelay, aiSendWithCommand, theme, showWindowOnLaunch
-        case historyRecordingEnabled, shortcutDefaultsVersion
+        case historyRecordingEnabled, shortcutDefaultsVersion, chatFontSize
     }
     init(from decoder: Decoder) throws {
         self.init()
@@ -186,6 +202,10 @@ struct BrowserSettings: Codable, Equatable {
         theme = try c.decodeIfPresent(ThemeColor.self, forKey: .theme) ?? .green
         showWindowOnLaunch = try c.decodeIfPresent(Bool.self, forKey: .showWindowOnLaunch) ?? false
         historyRecordingEnabled = try c.decodeIfPresent(Bool.self, forKey: .historyRecordingEnabled) ?? true
+        chatFontSize = try c.decodeIfPresent(Double.self, forKey: .chatFontSize) ?? Self.defaultChatFontSize
+        guard chatFontSize.isFinite, Self.chatFontSizeRange.contains(chatFontSize) else {
+            throw DecodingError.dataCorruptedError(forKey: .chatFontSize, in: c, debugDescription: "Chat font size must be between 11 and 22.")
+        }
         if !linkPreviewDelay.isFinite || linkPreviewDelay < 0 { linkPreviewDelay = 1 }
         if linkPreviewKey.code > 127 || linkPreviewKey.code == 53 || linkPreviewKey.modifiers != 0 {
             linkPreviewKey = Shortcut(code: 58, modifiers: 0, label: "⌥ Alt")
@@ -221,6 +241,9 @@ struct BrowserSettings: Codable, Equatable {
     }
 
     func validate() throws {
+        guard chatFontSize.isFinite, Self.chatFontSizeRange.contains(chatFontSize) else {
+            throw PerchError("Chat 字体大小需在 11–22 pt 之间。")
+        }
         guard linkPreviewDelay.isFinite, linkPreviewDelay >= 0,
               linkPreviewKey.code <= 127, linkPreviewKey.code != 53, linkPreviewKey.modifiers == 0 else {
             throw PerchError("链接预览等待时间需为非负秒数（0 立即触发），触发键需为 Esc 以外的单个按键。")
@@ -475,6 +498,7 @@ struct SettingsPage: View {
                             .onHover { preview(color, entered: $0) }
                     }
                 }
+                chatFontSetting
             }
             Section("搜索引擎") {
                 Picker("默认搜索", selection: $draft.searchEngine) {
@@ -572,6 +596,21 @@ struct SettingsPage: View {
             theme.selection = store.settings.theme
             recorder.stop()
             apply(draft)
+        }
+    }
+
+    private var chatFontSetting: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 12) {
+                Text("Chat 正文字号")
+                Slider(value: $draft.chatFontSize, in: BrowserSettings.chatFontSizeRange, step: 1)
+                    .accessibilityLabel("Chat 正文字号")
+                    .accessibilityValue("\(Int(draft.chatFontSize)) pt")
+                Text("\(Int(draft.chatFontSize)) pt").monospacedDigit().frame(width: 42, alignment: .trailing)
+                Button("恢复默认") { draft.chatFontSize = BrowserSettings.defaultChatFontSize }
+                    .disabled(draft.chatFontSize == BrowserSettings.defaultChatFontSize)
+            }
+            Text("以正文字号为基准，标题、历史列表和其他 Chat 文字按比例调整。").font(.caption).foregroundStyle(.secondary)
         }
     }
 

@@ -30,7 +30,7 @@ private struct AIMessageAction: View {
         }
         .overlay(alignment: .topTrailing) {
             if showingHelp {
-                Text(label).font(.system(size: 12)).foregroundStyle(.primary)
+                Text(label).font(.system(size: theme.chatDetailFontSize)).foregroundStyle(.primary)
                     .fixedSize().padding(.horizontal, 8).padding(.vertical, 5)
                     .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
                     .overlay(RoundedRectangle(cornerRadius: 6).stroke(Style.line))
@@ -659,7 +659,7 @@ struct AIActivityHeader: View {
                     }
                 }
             }
-            .font(.system(size: 12, weight: .medium)).foregroundStyle(Style.muted)
+            .font(.system(size: theme.chatDetailFontSize, weight: .medium)).foregroundStyle(Style.muted)
             .frame(maxWidth: .infinity, minHeight: 24, alignment: .leading)
             .contentShape(Rectangle())
         }
@@ -689,7 +689,7 @@ struct AISearchEvidence: View {
                 VStack(alignment: .leading, spacing: 6) {
                 ForEach(message.searchSources ?? []) { source in
                     Link(destination: source.url) {
-                        Text(source.title).font(.system(size: 11)).foregroundStyle(Style.muted)
+                        Text(source.title).font(.system(size: theme.chatFontSize(relativeTo: 11))).foregroundStyle(Style.muted)
                             .underline(true, pattern: .dash, color: Style.muted.opacity(0.65))
                             .lineLimit(2).multilineTextAlignment(.leading)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -698,7 +698,7 @@ struct AISearchEvidence: View {
                     .help(source.url.host.map { $0 + "\n" + (source.excerpt ?? "来源未提供摘要") } ?? source.title)
                 }
                 if message.searchSources?.isEmpty != false {
-                    Text("暂无搜索来源").font(.system(size: 11)).foregroundStyle(Style.muted)
+                    Text("暂无搜索来源").font(.system(size: theme.chatFontSize(relativeTo: 11))).foregroundStyle(Style.muted)
                 }
                 }.transition(.opacity)
                 }
@@ -722,6 +722,7 @@ struct AIModelPicker: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             TextField("搜索模型…", text: $search).textFieldStyle(.roundedBorder).focused($searchFocused)
+                .font(.system(size: theme.chatFontSize))
                 .accessibilityLabel("搜索模型")
             ScrollViewReader { proxy in
                 ScrollView {
@@ -729,7 +730,7 @@ struct AIModelPicker: View {
                         Color.clear.frame(height: 0).id("top")
                         ForEach(ai.providers) { value in
                             if !models(value).isEmpty {
-                                Text(value.name).font(.caption.weight(.medium)).foregroundStyle(Style.muted)
+                                Text(value.name).font(.system(size: theme.chatFontSize(relativeTo: 10), weight: .medium)).foregroundStyle(Style.muted)
                                     .padding(.top, 8).padding(.horizontal, 8)
                                 ForEach(models(value), id: \.self) { model in
                                     let selected = ai.provider(for: tab).id == value.id && ai.model(for: tab) == model
@@ -740,7 +741,7 @@ struct AIModelPicker: View {
                                             Text(model).lineLimit(1).truncationMode(.middle)
                                             Spacer(minLength: 6)
                                             if selected { Image(systemName: "checkmark").foregroundStyle(Style.accent) }
-                                        }.font(.system(size: 13)).padding(9).frame(maxWidth: .infinity, alignment: .leading)
+                                        }.font(.system(size: theme.chatFontSize)).padding(9).frame(maxWidth: .infinity, alignment: .leading)
                                             .background(selected ? Style.mint : Color.clear, in: RoundedRectangle(cornerRadius: 8))
                                             .contentShape(Rectangle())
                                     }.buttonStyle(.plain).help("\(value.name) · \(model)")
@@ -749,7 +750,7 @@ struct AIModelPicker: View {
                         }
                         if ai.providers.allSatisfy({ models($0).isEmpty }) {
                             Text(query.isEmpty ? "请先在 AI 设置中添加模型。" : "没有匹配的模型")
-                                .font(.callout).foregroundStyle(Style.muted).padding(10)
+                                .font(.system(size: theme.chatDetailFontSize)).foregroundStyle(Style.muted).padding(10)
                         }
                     }
                 }.onChange(of: search) { _ in proxy.scrollTo("top", anchor: .top) }
@@ -922,6 +923,9 @@ struct AIReasoningText: NSViewRepresentable {
     }
     func makeNSView(context: Context) -> Container { Container(frame: .zero) }
     func updateNSView(_ view: Container, context: Context) {
+        if view.scroll.editor.font?.pointSize != CGFloat(theme.chatDetailFontSize) {
+            view.scroll.editor.font = .systemFont(ofSize: theme.chatDetailFontSize)
+        }
         view.scroll.update(text: text, active: active)
         view.needsLayout = true
     }
@@ -1036,7 +1040,7 @@ struct AIChatSidebar: View {
             }.clipped()
                 .transaction { if historyDragWidth != nil { $0.animation = nil; $0.disablesAnimations = true } }
             }.modifier(ContentTopChrome(enabled: fullPage))
-        }.clipped()
+        }.font(.system(size: theme.chatFontSize)).clipped()
             .animation(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil : .easeInOut(duration: 0.22), value: store.chatHistoryVisible)
     }
     static func historySize(_ width: Double, available: Double) -> Double {
@@ -1045,7 +1049,7 @@ struct AIChatSidebar: View {
     private var header: some View {
             HStack(spacing: 8) {
                 Image(systemName: "sparkles").foregroundStyle(Style.accent)
-                Text("AI 聊天").font(.system(size: 13, weight: .semibold))
+                Text("AI 聊天").font(.system(size: 13, weight: .semibold)).lineLimit(1)
                 Spacer(minLength: 0)
                 if fullPage {
                     HStack(spacing: 3) {
@@ -1079,7 +1083,7 @@ struct AIChatSidebar: View {
                     Button(action: close) { Image(systemName: "sidebar.right") }.help("收起 AI 侧栏")
                 }
             }.buttonStyle(.plain).padding(.horizontal, 12).padding(.leading, windowControlsInset)
-                .frame(height: fullPage ? 44 : 40).background(Style.paper)
+                .frame(minHeight: fullPage ? 44 : 40).background(Style.paper)
                 .background { if fullPage { WindowDragArea() } }.zIndex(10)
     }
     private var chatContent: some View {
@@ -1087,8 +1091,8 @@ struct AIChatSidebar: View {
             if !ai.ready(for: tab) {
                 VStack(spacing: 14) {
                     Image(systemName: "sparkles").font(.system(size: 28)).foregroundStyle(Style.accent)
-                    Text("连接你的 AI").font(.headline)
-                    Text("为此模型供应商配置模型和密钥后开始聊天。").font(.callout).foregroundStyle(Style.muted).multilineTextAlignment(.center)
+                    Text("连接你的 AI").font(.system(size: theme.chatFontSize, weight: .semibold))
+                    Text("为此模型供应商配置模型和密钥后开始聊天。").font(.system(size: theme.chatDetailFontSize)).foregroundStyle(Style.muted).multilineTextAlignment(.center)
                     Button("配置 AI") { ai.select(provider.id); store.library = .ai }
                 }.padding(20).frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -1097,13 +1101,13 @@ struct AIChatSidebar: View {
                         VStack(alignment: .leading, spacing: 16) {
                             if session.messages.isEmpty {
                                 Text("总结网页、引用选中文字，或添加文件一起提问。")
-                                    .font(.callout).foregroundStyle(Style.muted).padding(.top, 16)
+                                    .font(.system(size: theme.chatDetailFontSize)).foregroundStyle(Style.muted).padding(.top, 16)
                             }
                             ForEach(session.messages) { message in
                                 VStack(alignment: .leading, spacing: 8) {
                                     HStack {
                                         Text(message.role == "user" ? "你" : message.providerName ?? provider.name)
-                                            .font(.caption.weight(.semibold)).foregroundStyle(Style.muted).lineLimit(1)
+                                            .font(.system(size: theme.chatFontSize(relativeTo: 10), weight: .semibold)).foregroundStyle(Style.muted).lineLimit(1)
                                         Spacer()
                                         HStack(spacing: 2) {
                                             if message.role == "user" && session.isArchived != true {
@@ -1135,7 +1139,7 @@ struct AIChatSidebar: View {
                                             }.buttonStyle(.plain)
                                         } else { Label(reference.title, systemImage: "globe") }
                                     }
-                                    .font(.caption).lineLimit(1).foregroundStyle(Style.muted.opacity(0.8))
+                                    .font(.system(size: theme.chatFontSize(relativeTo: 10))).lineLimit(1).foregroundStyle(Style.muted.opacity(0.8))
                                     .padding(.horizontal, 6).padding(.vertical, 3)
                                     .background(Style.paper.opacity(0.6), in: RoundedRectangle(cornerRadius: 5))
                                     if message.references.isEmpty, let source = message.source {
@@ -1145,16 +1149,16 @@ struct AIChatSidebar: View {
                                         } else { Label(source, systemImage: "quote.bubble") }
                                     }
                                     ForEach(message.attachments) { file in
-                                        Label(file.name, systemImage: file.isImage ? "photo" : "doc.text").font(.caption).foregroundStyle(Style.accent)
+                                        Label(file.name, systemImage: file.isImage ? "photo" : "doc.text").font(.system(size: theme.chatFontSize(relativeTo: 10))).foregroundStyle(Style.accent)
                                     }
                                     AISearchEvidence(message: message)
                                     if message.role == "assistant" && (message.reasoning?.isEmpty == false || (busy && session.messages.last?.id == message.id)) {
                                         AIReasoningView(text: message.reasoning ?? "", phase: busy && session.messages.last?.id == message.id ? session.phase ?? .waiting : nil,
                                                         hasBody: !message.text.isEmpty)
                                     }
-                                    if !(busy && session.messages.last?.id == message.id) && message.text.isEmpty && message.reasoning?.isEmpty != false && (message.generatedFiles ?? []).isEmpty && message.clarification == nil { Text("已停止").font(.callout).foregroundStyle(Style.muted) }
+                                    if !(busy && session.messages.last?.id == message.id) && message.text.isEmpty && message.reasoning?.isEmpty != false && (message.generatedFiles ?? []).isEmpty && message.clarification == nil { Text("已停止").font(.system(size: theme.chatDetailFontSize)).foregroundStyle(Style.muted) }
                                     else if !message.text.isEmpty && message.role == "assistant" { AIMarkdownView(text: message.text, sources: message.searchSources ?? []) }
-                                    else if !message.text.isEmpty { Text(message.text).font(.system(size: 13)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
+                                    else if !message.text.isEmpty { Text(message.text).font(.system(size: theme.chatFontSize)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true).frame(maxWidth: .infinity, alignment: .leading) }
                                     ForEach(message.generatedFiles ?? []) { file in
                                         AIGeneratedFileCard(file: file, versions: session.fileVersions(name: file.name, through: message.id))
                                     }
@@ -1180,7 +1184,7 @@ struct AIChatSidebar: View {
                                     }
                                     if let timestamp = message.timestamp {
                                         Text(timestamp.formatted(date: .numeric, time: .standard))
-                                            .font(.system(size: 10)).foregroundStyle(Style.muted)
+                                            .font(.system(size: theme.chatFontSize(relativeTo: 10))).foregroundStyle(Style.muted)
                                             .frame(maxWidth: .infinity, alignment: message.role == "user" ? .trailing : .leading)
                                             .opacity(hoveredMessage == message.id ? 1 : 0)
                                             .accessibilityHidden(hoveredMessage != message.id)
@@ -1200,7 +1204,7 @@ struct AIChatSidebar: View {
                                             value: [message.id: geometry.frame(in: .named("chatMessages"))])
                                     })
                             }
-                            if let error = session.error { Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled) }
+                            if let error = session.error { Text(error).font(.system(size: theme.chatDetailFontSize)).foregroundStyle(.red).textSelection(.enabled) }
                             Color.clear.frame(height: 1).id("end")
                         }.coordinateSpace(name: "chatMessages")
                             .background(AIChatScrollPosition(ai: ai, conversation: session.id, frames: messageFrames,
@@ -1225,29 +1229,29 @@ struct AIChatSidebar: View {
                     .opacity(session.messages.isEmpty || readyConversation == session.id ? 1 : 0)
                     .overlay {
                         if !session.messages.isEmpty && readyConversation != session.id {
-                            ProgressView().controlSize(.small)
+                            ProgressView().controlSize(.small).accessibilityLabel("正在加载对话")
                         }
                     }
             }
                 VStack(alignment: .leading, spacing: 8) {
                     if session.isArchived == true {
                         HStack {
-                            Label("已归档", systemImage: "archivebox").font(.caption).foregroundStyle(Style.muted)
+                            Label("已归档", systemImage: "archivebox").font(.system(size: theme.chatFontSize(relativeTo: 10))).foregroundStyle(Style.muted)
                             Spacer()
-                            Button("恢复对话") { ai.restoreConversations([session.id]) }.buttonStyle(.plain).font(.caption)
+                            Button("恢复对话") { ai.restoreConversations([session.id]) }.buttonStyle(.plain).font(.system(size: theme.chatFontSize(relativeTo: 10)))
                         }
                     }
                     if editing {
                         HStack {
                             Text(ai.pendingEdits[tab]?.fork == true ? "Fork · 发送后创建新对话" : "重新编辑 · 发送后替换后续对话")
-                                .font(.caption).foregroundStyle(Style.muted)
+                                .font(.system(size: theme.chatFontSize(relativeTo: 10))).foregroundStyle(Style.muted)
                             Spacer()
-                            Button("取消") { cancelEdit() }.buttonStyle(.plain).font(.caption)
+                            Button("取消") { cancelEdit() }.buttonStyle(.plain).font(.system(size: theme.chatFontSize(relativeTo: 10)))
                         }
                     }
                     if mention != nil {
                         VStack(alignment: .leading, spacing: 3) {
-                            Text("引用打开的标签页").font(.caption).foregroundStyle(Style.muted).padding(.horizontal, 8)
+                            Text("引用打开的标签页").font(.system(size: theme.chatFontSize(relativeTo: 10))).foregroundStyle(Style.muted).padding(.horizontal, 8)
                             ScrollView {
                                 VStack(spacing: 2) {
                                     ForEach(Array(candidates.enumerated()), id: \.element.id) { index, page in
@@ -1255,14 +1259,14 @@ struct AIChatSidebar: View {
                                             HStack(spacing: 8) {
                                                 Image(systemName: "globe").foregroundStyle(Style.accent)
                                                 VStack(alignment: .leading, spacing: 2) {
-                                                    Text(page.title).font(.system(size: 12)).lineLimit(1)
-                                                    Text(URL(string: page.address)?.host ?? "").font(.caption2).foregroundStyle(Style.muted).lineLimit(1)
+                                                    Text(page.title).font(.system(size: theme.chatDetailFontSize)).lineLimit(1)
+                                                    Text(URL(string: page.address)?.host ?? "").font(.system(size: theme.chatFontSize(relativeTo: 10))).foregroundStyle(Style.muted).lineLimit(1)
                                                 }
                                                 Spacer(minLength: 0)
                                             }.padding(8).background(index == mentionSelection ? Style.mint : Color.clear, in: RoundedRectangle(cornerRadius: 8))
                                         }.buttonStyle(.plain)
                                     }
-                                    if candidates.isEmpty { Text("没有可引用的标签页").font(.caption).foregroundStyle(Style.muted).padding(10) }
+                                    if candidates.isEmpty { Text("没有可引用的标签页").font(.system(size: theme.chatFontSize(relativeTo: 10))).foregroundStyle(Style.muted).padding(10) }
                                 }
                             }.frame(height: CGFloat(min(max(candidates.count, 1), 4) * 44))
                         }.padding(6).background(.white, in: RoundedRectangle(cornerRadius: 12))
@@ -1279,14 +1283,14 @@ struct AIChatSidebar: View {
                             Button { ai.draftClosedReferences[tab]?.removeAll { $0.id == reference.id } } label: {
                                 Image(systemName: "xmark").font(.system(size: 9))
                             }.buttonStyle(.plain).arrowCursor().help("移除引用")
-                        }.font(.caption).padding(6).background(Style.mint, in: RoundedRectangle(cornerRadius: 7))
+                        }.font(.system(size: theme.chatFontSize(relativeTo: 10))).padding(6).background(Style.mint, in: RoundedRectangle(cornerRadius: 7))
                     }
                     if !referencedTabs.isEmpty {
                         HStack(spacing: 6) {
                             ForEach(Array(referencedTabs.prefix(2))) { page in referenceChip(page) }
                             if referencedTabs.count > 2 {
                                 Button("+\(referencedTabs.count - 2)") { showReferences.toggle() }.buttonStyle(.plain)
-                                    .font(.caption).padding(6).background(Style.mint, in: RoundedRectangle(cornerRadius: 7))
+                                    .font(.system(size: theme.chatFontSize(relativeTo: 10))).padding(6).background(Style.mint, in: RoundedRectangle(cornerRadius: 7))
                                     .popover(isPresented: $showReferences) {
                                         VStack(alignment: .leading, spacing: 8) { ForEach(referencedTabs) { page in referenceChip(page) } }
                                             .padding(12).frame(width: 280)
@@ -1300,7 +1304,7 @@ struct AIChatSidebar: View {
                                 Image(nsImage: image).resizable().scaledToFit().frame(width: 38, height: 38)
                                     .clipShape(RoundedRectangle(cornerRadius: 4))
                             }
-                            Label(file.name, systemImage: file.isImage ? "photo" : "doc.text").font(.caption).lineLimit(1)
+                            Label(file.name, systemImage: file.isImage ? "photo" : "doc.text").font(.system(size: theme.chatFontSize(relativeTo: 10))).lineLimit(1)
                             Spacer()
                             Button { ai.draftFiles[tab]?.removeAll { $0.id == file.id } } label: { Image(systemName: "xmark.circle.fill") }.buttonStyle(.plain).arrowCursor()
                         }.padding(6).background(Style.mint, in: RoundedRectangle(cornerRadius: 6))
@@ -1325,7 +1329,7 @@ struct AIChatSidebar: View {
                                 Text(ai.model(for: tab).isEmpty ? "选择模型" : ai.model(for: tab))
                                     .lineLimit(1).truncationMode(.middle)
                                 Image(systemName: "chevron.up").font(.system(size: 9, weight: .semibold))
-                            }.font(.system(size: 12)).foregroundStyle(Style.muted)
+                            }.font(.system(size: theme.chatDetailFontSize)).foregroundStyle(Style.muted)
                         }.buttonStyle(.plain).help("\(provider.name) · 选择模型").accessibilityLabel("选择模型")
                             .popover(isPresented: $showModelPicker, arrowEdge: .bottom) {
                                 AIModelPicker(ai: ai, tab: tab, dismiss: { showModelPicker = false })
@@ -1350,9 +1354,9 @@ struct AIChatSidebar: View {
                     }.padding(12).background(.white, in: RoundedRectangle(cornerRadius: 16))
                         .overlay(RoundedRectangle(cornerRadius: 16).stroke(Style.line))
                         .shadow(color: .black.opacity(0.025), radius: 6, y: 2)
-                    if let error = fileError { Text(error).font(.caption).foregroundStyle(.red) }
-                    if let error = ai.storageError { Text(error).font(.caption).foregroundStyle(.red) }
-                    if input.wrappedValue.count > 8000 { Text("问题最多 8,000 字。").font(.caption).foregroundStyle(.red) }
+                    if let error = fileError { Text(error).font(.system(size: theme.chatFontSize(relativeTo: 10))).foregroundStyle(.red) }
+                    if let error = ai.storageError { Text(error).font(.system(size: theme.chatFontSize(relativeTo: 10))).foregroundStyle(.red) }
+                    if input.wrappedValue.count > 8000 { Text("问题最多 8,000 字。").font(.system(size: theme.chatFontSize(relativeTo: 10))).foregroundStyle(.red) }
                 }.padding(fullPage ? 20 : 12).frame(maxWidth: fullPage ? 780 : .infinity).frame(maxWidth: .infinity)
         }.background(Style.paper)
         .onChange(of: tab) { _ in
@@ -1452,10 +1456,10 @@ struct AIChatSidebar: View {
             VStack(alignment: .leading, spacing: 5) {
                 HStack {
                     Text(ai.pausedQueues.contains(tab) ? "发送队列已暂停 · \(queue.count) 条" : "等待发送 · \(queue.count) 条")
-                        .font(.caption).foregroundStyle(Style.muted)
+                        .font(.system(size: theme.chatFontSize(relativeTo: 10))).foregroundStyle(Style.muted)
                     Spacer()
                     if !busy && !editing {
-                        Button("继续发送") { ai.resumeQueue(tab) }.font(.caption).buttonStyle(.plain)
+                        Button("继续发送") { ai.resumeQueue(tab) }.font(.system(size: theme.chatFontSize(relativeTo: 10))).buttonStyle(.plain)
                     }
                 }
                 ScrollView {
@@ -1472,11 +1476,11 @@ struct AIChatSidebar: View {
                                 Button { ai.removeQueuedMessage(message.id, tab: tab) } label: {
                                     Image(systemName: "xmark")
                                 }.buttonStyle(.plain).arrowCursor().help("移除待发送消息").accessibilityLabel("移除待发送消息")
-                            }.font(.caption).padding(.horizontal, 8).frame(height: 24)
+                            }.font(.system(size: theme.chatFontSize(relativeTo: 10))).padding(.horizontal, 8).frame(height: 24 * theme.chatScale)
                                 .background(Style.mint, in: RoundedRectangle(cornerRadius: 7))
                         }
                     }
-                }.frame(height: CGFloat(min(queue.count, 3) * 28 - 4))
+                }.frame(height: CGFloat(min(queue.count, 3)) * (24 * theme.chatScale + 4) - 4)
             }.frame(maxWidth: fullPage ? 620 : .infinity, alignment: .leading)
                 .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 6)
         }
@@ -1487,7 +1491,7 @@ struct AIChatSidebar: View {
             Text(page.title).lineLimit(1)
             Button { ai.draftReferences[tab]?.removeAll { $0 == page.id } } label: { Image(systemName: "xmark").font(.system(size: 9)) }.buttonStyle(.plain).arrowCursor()
                 .help("移除引用")
-        }.font(.caption).padding(6).background(Style.mint, in: RoundedRectangle(cornerRadius: 7))
+        }.font(.system(size: theme.chatFontSize(relativeTo: 10))).padding(6).background(Style.mint, in: RoundedRectangle(cornerRadius: 7))
     }
     private func addReference(_ page: Tab) {
         guard let range = mention else { return }
@@ -1520,7 +1524,7 @@ struct AIChatSidebar: View {
     private var history: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text(showArchived ? "已归档对话" : "历史对话").font(.headline)
+                Text(showArchived ? "已归档对话" : "历史对话").font(.system(size: theme.chatFontSize, weight: .semibold))
                 Spacer()
             }.padding(.bottom, 8)
             AIHistoryList(conversations: showArchived ? ai.archivedConversations : ai.activeConversations, active: ai.sessions[tab]?.id,
@@ -1532,14 +1536,14 @@ struct AIChatSidebar: View {
                 .id(showArchived)
             HStack {
                 Button(showArchived ? "返回历史对话" : "已归档对话") { showArchived.toggle() }
-                    .buttonStyle(.plain).font(.caption).accessibilityLabel(showArchived ? "返回历史对话" : "查看已归档对话")
+                    .buttonStyle(.plain).font(.system(size: theme.chatFontSize(relativeTo: 10))).accessibilityLabel(showArchived ? "返回历史对话" : "查看已归档对话")
                 Spacer()
                 if showArchived {
-                    Button("清空归档") { confirmClearArchive = true }.buttonStyle(.plain).font(.caption)
+                    Button("清空归档") { confirmClearArchive = true }.buttonStyle(.plain).font(.system(size: theme.chatFontSize(relativeTo: 10)))
                         .disabled(ai.archivedConversations.isEmpty)
                 }
                 historyToggle
-            }.frame(height: 24)
+            }.frame(minHeight: 24)
         }.padding(14).frame(maxHeight: .infinity)
             .alert("彻底删除全部已归档对话？", isPresented: $confirmClearArchive) {
                 Button("取消", role: .cancel) {}
@@ -1620,7 +1624,7 @@ struct AIComposerInput: NSViewRepresentable {
         let scroll = NSScrollView()
         let editor = AIComposerTextView()
         editor.isRichText = false; editor.drawsBackground = false
-        editor.font = .systemFont(ofSize: 13); editor.textColor = NSColor(Style.ink)
+        editor.font = .systemFont(ofSize: theme.chatFontSize); editor.textColor = NSColor(Style.ink)
         editor.textContainerInset = NSSize(width: 0, height: 8)
         editor.isVerticallyResizable = true; editor.isHorizontallyResizable = false
         editor.autoresizingMask = [.width]
@@ -1640,6 +1644,10 @@ struct AIComposerInput: NSViewRepresentable {
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         context.coordinator.parent = self
         guard let editor = scroll.documentView as? NSTextView else { return }
+        if editor.font?.pointSize != CGFloat(theme.chatFontSize) {
+            editor.font = .systemFont(ofSize: theme.chatFontSize)
+            editor.needsDisplay = true
+        }
         editor.isEditable = enabled
         editor.setFrameSize(NSSize(width: scroll.contentSize.width, height: max(scroll.contentSize.height, editor.frame.height)))
         if let focusRequest, context.coordinator.focusRequest != focusRequest {

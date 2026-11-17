@@ -188,6 +188,7 @@ struct AIHistoryList: NSViewRepresentable {
         var forkID: UUID?
         private var renderedRows: [String] = []
         private var renderedActive: UUID?
+        private var renderedFontSize = BrowserSettings.defaultChatFontSize
         init(_ parent: AIHistoryList) { self.parent = parent }
         func sourceTitle(_ session: AISession) -> String? {
             let references = (session.pageReferences ?? []) + session.messages.flatMap(\.references)
@@ -208,9 +209,13 @@ struct AIHistoryList: NSViewRepresentable {
                 "\($0.id)|\($0.title)|\(sourceTitle($0) ?? "")|\($0.updated.timeIntervalSince1970)|\($0.origin?.rawValue ?? "chat")"
             } +
                 AIConversationOrigin.allCases.filter { collapsed.contains($0) }.map(\.rawValue)
-            guard signature != renderedRows || renderedActive != parent.active else { return }
+            let fontSize = PerchTheme.shared.chatFontSize
+            let fontChanged = renderedFontSize != fontSize
+            guard signature != renderedRows || renderedActive != parent.active || fontChanged else { return }
+            let topRow = table.rows(in: table.visibleRect).location
+            let offset = topRow != NSNotFound && topRow < rows.count ? table.visibleRect.minY - table.rect(ofRow: topRow).minY : 0
             let activeChanged = renderedActive != parent.active
-            renderedRows = signature; renderedActive = parent.active
+            renderedRows = signature; renderedActive = parent.active; renderedFontSize = fontSize
             let selected = Set(table.selectedRowIndexes.compactMap { table.conversationIDs.indices.contains($0) ? table.conversationIDs[$0] : nil })
             let oldRows = rows
             rows = AIConversationOrigin.allCases.flatMap { origin in
@@ -241,6 +246,13 @@ struct AIHistoryList: NSViewRepresentable {
             } else {
                 table.reloadData()
             }
+            if fontChanged {
+                table.noteHeightOfRows(withIndexesChanged: IndexSet(rows.indices))
+                if !activeChanged, topRow != NSNotFound, topRow < rows.count, let scroll = table.enclosingScrollView {
+                    scroll.contentView.scroll(to: NSPoint(x: 0, y: table.rect(ofRow: topRow).minY + offset))
+                    scroll.reflectScrolledClipView(scroll.contentView)
+                }
+            }
             let followActive = activeChanged || selected.isEmpty
             let ids = followActive ? Set(parent.active.map { [$0] } ?? []) : selected
             table.selectRowIndexes(IndexSet(rows.indices.filter { rows[$0].session.map { ids.contains($0.id) } == true }), byExtendingSelection: false)
@@ -251,7 +263,9 @@ struct AIHistoryList: NSViewRepresentable {
         func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
         func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool { rows[row].session != nil }
         func tableView(_ tableView: NSTableView, isGroupRow row: Int) -> Bool { rows[row].session == nil }
-        func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat { rows[row].session == nil ? 32 : 40 }
+        func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+            CGFloat((rows[row].session == nil ? 32 : 40) * PerchTheme.shared.chatScale)
+        }
         func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
             let view = AIHistoryRow()
             view.theme = theme
@@ -265,7 +279,7 @@ struct AIHistoryList: NSViewRepresentable {
             let label = NSTextField(labelWithString: entry.session.map {
                 $0.title.isEmpty ? "附件对话" : $0.title
             } ?? entry.origin.title)
-            label.font = .systemFont(ofSize: 12, weight: entry.session == nil ? .semibold : .regular)
+            label.font = .systemFont(ofSize: PerchTheme.shared.chatFontSize(relativeTo: 13), weight: entry.session == nil ? .semibold : .regular)
             label.textColor = NSColor(Style.ink); label.maximumNumberOfLines = 2; label.lineBreakMode = .byTruncatingTail
             label.translatesAutoresizingMaskIntoConstraints = false
             cell.addSubview(label)
@@ -273,7 +287,7 @@ struct AIHistoryList: NSViewRepresentable {
             if source != nil { label.maximumNumberOfLines = 1 }
             let sourceLabel = source.map { text -> NSTextField in
                 let view = NSTextField(labelWithString: text)
-                view.font = .systemFont(ofSize: 9.5)
+                view.font = .systemFont(ofSize: PerchTheme.shared.chatFontSize(relativeTo: 9.5))
                 view.textColor = .secondaryLabelColor
                 view.lineBreakMode = .byTruncatingTail
                 view.translatesAutoresizingMaskIntoConstraints = false
@@ -326,8 +340,14 @@ struct AIHistoryList: NSViewRepresentable {
                 label.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: parent.archived ? -8 : -38)
             ])
             if let sourceLabel {
+                let textGroup = NSLayoutGuide()
+                cell.addLayoutGuide(textGroup)
                 NSLayoutConstraint.activate([
-                    label.topAnchor.constraint(equalTo: cell.topAnchor, constant: 5),
+                    textGroup.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+                    textGroup.topAnchor.constraint(equalTo: label.topAnchor),
+                    textGroup.bottomAnchor.constraint(equalTo: sourceLabel.bottomAnchor),
+                    textGroup.leadingAnchor.constraint(equalTo: label.leadingAnchor),
+                    textGroup.trailingAnchor.constraint(equalTo: label.trailingAnchor),
                     sourceLabel.leadingAnchor.constraint(equalTo: label.leadingAnchor),
                     sourceLabel.trailingAnchor.constraint(equalTo: label.trailingAnchor),
                     sourceLabel.topAnchor.constraint(equalTo: label.bottomAnchor)

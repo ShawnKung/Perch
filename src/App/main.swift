@@ -460,6 +460,7 @@ final class Store: ObservableObject {
             catch { protectedKeys.insert("settings"); notice = "设置数据无法读取，已保留原数据。" }
         }
         PerchTheme.shared.selection = settings.theme
+        PerchTheme.shared.chatFontSize = settings.chatFontSize
         if let data = defaults.data(forKey: "sites") {
             do { sites = try JSONDecoder().decode([Site].self, from: data) }
             catch { notice = "收藏数据无法读取，原始数据已保留。请先备份再添加网站。" }
@@ -757,6 +758,7 @@ final class Store: ObservableObject {
         let changed = settings.userAgent != value.userAgent
         settings = value
         PerchTheme.shared.selection = value.theme
+        PerchTheme.shared.chatFontSize = value.chatFontSize
         linkPreview.settingsChanged()
         persist(value, key: "settings")
         if changed {
@@ -2219,6 +2221,16 @@ if CommandLine.arguments.contains("--scroll-self-test") {
     app.setActivationPolicy(.accessory)
     Task { @MainActor in
         do { try await NavigationSelfCheck.run(baseURL: CommandLine.arguments[index + 1]); exit(0) }
+        catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
+    }
+    app.run()
+} else if CommandLine.arguments.contains("--ai-typography-self-test") {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.regular)
+    Task { @MainActor in
+        setbuf(stdout, nil)
+        app.activate(ignoringOtherApps: true)
+        do { try await AISelfCheck.typographyUI(); exit(0) }
         catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
     }
     app.run()
