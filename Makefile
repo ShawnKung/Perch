@@ -36,6 +36,7 @@ test: verify
 
 check: test
 	@"$(BIN)" --ai-typography-self-test
+	@python3 tests/ai-self-check.py "$(BIN)" --background-only
 	@python3 tests/ai-self-check.py "$(BIN)"
 	@python3 tests/ai-self-check.py "$(BIN)" --navigation
 	@"$(BIN)" --web-self-test
@@ -51,6 +52,7 @@ test-web: verify
 
 test-ai: verify
 	@"$(BIN)" --ai-typography-self-test
+	@python3 tests/ai-self-check.py "$(BIN)" --background-only
 	@python3 tests/ai-self-check.py "$(BIN)"
 
 test-navigation: verify

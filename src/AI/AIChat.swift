@@ -741,7 +741,11 @@ final class AIController: ObservableObject {
             }
         }
     }
-    var recentConversations: [AISession] { conversations.values.sorted { $0.updated > $1.updated } }
+    var recentConversations: [AISession] {
+        var records = conversations
+        for session in sessions.values where !session.messages.isEmpty { records[session.id] = session }
+        return records.values.sorted { $0.updated > $1.updated }
+    }
     var activeConversations: [AISession] { recentConversations.filter { $0.isArchived != true } }
     var archivedConversations: [AISession] { recentConversations.filter { $0.isArchived == true } }
     static func pageURL(_ url: URL) -> URL? {
@@ -810,13 +814,15 @@ final class AIController: ObservableObject {
         readingPositions[id] = position
         scheduleConversationSave()
     }
-    func resumeConversation(_ id: UUID, tab: UUID) {
-        guard let session = conversations[id] else { return }
-        queuedMessages.removeValue(forKey: tab); pausedQueues.remove(tab)
-        tasks.removeValue(forKey: tab)?.cancel(); cancelEditing(tab)
-        if let prior = sessions[tab], !prior.messages.isEmpty { conversations[prior.id] = prior }
-        sessions[tab] = session
+    @discardableResult
+    func resumeConversation(_ id: UUID, tab: UUID) -> UUID {
+        // A view binds to the existing owner; it must never replace a live session with a snapshot.
+        if let owner = sessions.first(where: { $0.value.id == id })?.key { return owner }
+        guard let session = conversations[id] else { return tab }
+        let owner = sessions[tab] == nil ? tab : UUID()
+        sessions[owner] = session
         scheduleConversationSave()
+        return owner
     }
     var ready: Bool { !damaged && configuration.endpoint != nil && configuration.models.contains(configuration.model) && hasKey }
     var needsReset: Bool { damaged }
@@ -1163,14 +1169,15 @@ final class AIController: ObservableObject {
         ] { conversations[session.id] = session }
     }
     func retainTabs(_ ids: Set<UUID>) {
-        for tab in Array(sessions.keys) where !ids.contains(tab) { clear(tab) }
-        selections = selections.filter { ids.contains($0.key) }
-        selectedModels = selectedModels.filter { ids.contains($0.key) }
-        drafts = drafts.filter { ids.contains($0.key) }
-        draftFiles = draftFiles.filter { ids.contains($0.key) }
-        draftReferences = draftReferences.filter { ids.contains($0.key) }.mapValues { $0.filter { ids.contains($0) } }
-        draftClosedReferences = draftClosedReferences.filter { ids.contains($0.key) }
-        pendingEdits = pendingEdits.filter { ids.contains($0.key) }
+        // Session owners outlive their views, including completed chats with drafts or paused queues.
+        let owners = ids.union(sessions.keys)
+        selections = selections.filter { owners.contains($0.key) }
+        selectedModels = selectedModels.filter { owners.contains($0.key) }
+        drafts = drafts.filter { owners.contains($0.key) }
+        draftFiles = draftFiles.filter { owners.contains($0.key) }
+        draftReferences = draftReferences.filter { owners.contains($0.key) }.mapValues { $0.filter { ids.contains($0) } }
+        draftClosedReferences = draftClosedReferences.filter { owners.contains($0.key) }
+        pendingEdits = pendingEdits.filter { owners.contains($0.key) }
     }
     func models(for value: AIConfiguration, key supplied: String) async throws -> [String] {
         guard let url = value.modelsURL, let account = value.account else { throw PerchError("请先填写有效的 API 地址。") }

@@ -368,6 +368,176 @@ extension AISelfCheck {
         }
         print("PASS: all three protocols finish generating while native Chat is off-window and preserve its draft")
     }
+    static func backgroundChatChecks(baseURL: String) async throws {
+        guard URL(string: baseURL)?.host == "127.0.0.1" else { throw PerchError("Background self-check requires loopback") }
+        for api in AIProtocol.allCases {
+            let suite = "dev.perch.background.\(UUID())"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let store = Store(defaults: defaults), ai = store.ai
+            var config = AIConfiguration(provider: .custom, baseURL: baseURL + "/streaming", model: "fixture")
+            config.apiProtocol = api
+            precondition(ai.save(config, key: "synthetic-key"))
+            store.openChat(owner: UUID())
+            let host = NSHostingView(rootView: RootView(store: store).defaultAppStorage(defaults))
+            let window = NSWindow(contentRect: NSRect(x: 120, y: 160, width: 1050, height: 720),
+                                  styleMask: [.titled], backing: .buffered, defer: false)
+            window.contentView = host; window.orderFront(nil)
+            defer { window.orderOut(nil); window.contentView = nil }
+            func snapshot(_ name: String) throws {
+                guard let path = ProcessInfo.processInfo.environment["PERCH_LAYOUT_EVIDENCE"] else { return }
+                host.layoutSubtreeIfNeeded()
+                guard let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { return }
+                host.cacheDisplay(in: host.bounds, to: bitmap)
+                try bitmap.representation(using: .png, properties: [:])?.write(
+                    to: URL(fileURLWithPath: path).appendingPathComponent("\(api.rawValue)-\(name).png"))
+            }
+            func find<T: NSView>(_ root: NSView, _ type: T.Type) -> T? {
+                (root as? T) ?? root.subviews.lazy.compactMap { find($0, type) }.first
+            }
+            func cell(_ id: UUID) -> AIHistoryCell? {
+                host.layoutSubtreeIfNeeded()
+                guard let table = find(host, AIHistoryTable.self),
+                      let row = table.conversationIDs.firstIndex(of: id) else { return nil }
+                return table.view(atColumn: 0, row: row, makeIfNecessary: true) as? AIHistoryCell
+            }
+            func choose(_ id: UUID) async throws {
+                try await wait { cell(id) != nil }
+                let table = find(host, AIHistoryTable.self)!
+                let row = table.conversationIDs.firstIndex(of: id)!
+                table.scrollRowToVisible(row); host.layoutSubtreeIfNeeded()
+                let rect = table.rect(ofRow: row)
+                let point = table.convert(NSPoint(x: rect.midX, y: rect.midY), to: nil)
+                let hit = host.hitTest(host.convert(point, from: nil))
+                precondition(hit === table || hit?.isDescendant(of: table) == true)
+                let event = NSEvent.mouseEvent(with: .leftMouseDown, location: point, modifierFlags: [],
+                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                    context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!
+                table.mouseDown(with: event)
+                try await wait { ai.sessions[store.chatOwner]?.id == id }
+            }
+            func release(_ run: String, _ phase: String, expectRequest: Bool = true) async throws {
+                let (data, _) = try await URLSession.shared.data(from: URL(string: baseURL + "/background-release/\(run)/\(phase)")!)
+                let state = try JSONSerialization.jsonObject(with: data) as! [String: Int]
+                if expectRequest { precondition(state["requests"] == 1, "Switching views must not issue another model request") }
+            }
+            func finish(_ run: String, _ owner: UUID) async throws {
+                for phase in ["waiting", "thinking", "answering"] { try await release(run, phase, expectRequest: false) }
+                try await wait { ai.sessions[owner]?.requestID == nil }
+                precondition(ai.sessions[owner]?.error == nil)
+                precondition(ai.sessions[owner]?.messages.last?.text == "第一段 \(run) 完成 \(run)")
+                try await release(run, "done")
+            }
+            let ownerA = store.chatOwner, runA = UUID().uuidString
+            precondition(ownerA != AIController.homeID)
+            precondition(ai.send("Background fixture " + runA, tab: ownerA, browser: nil, usePage: false))
+            let a = ai.sessions[ownerA]!.id, requestA = ai.sessions[ownerA]!.requestID!
+            ai.drafts[ownerA] = "A unfinished draft"
+            let queued = UUID().uuidString
+            precondition(ai.send("Background fixture " + queued, tab: ownerA, browser: nil, usePage: false))
+            try await wait { cell(a)?.progress?.window === window }
+            precondition(cell(a)?.archiveButton?.isEnabled == false && cell(a)?.titleTrailing?.constant == -38)
+
+            store.newChat()
+            let ownerB = store.chatOwner, runB = UUID().uuidString
+            precondition(ownerB != ownerA && ai.sessions[ownerA]?.requestID == requestA)
+            precondition(ai.send("Background fixture " + runB, tab: ownerB, browser: nil, usePage: false))
+            let b = ai.sessions[ownerB]!.id, requestB = ai.sessions[ownerB]!.requestID!
+            ai.drafts[ownerB] = "B unfinished draft"
+            // Exercise history's real mouse handler in each phase, including returning before completion.
+            for (phase, expected) in [("waiting", AIResponsePhase.thinking), ("thinking", .answering)] {
+                try await choose(a)
+                precondition(store.chatOwner == ownerA && ai.sessions[ownerA]?.requestID == requestA)
+                precondition(ai.resumeConversation(a, tab: ownerB) == ownerA)
+                precondition(ai.sessions[ownerB]?.requestID == requestB)
+                try await choose(b)
+                try await release(runA, phase, expectRequest: phase != "waiting")
+                try await wait { ai.sessions[ownerA]?.phase == expected }
+                try await choose(a)
+                precondition(ai.sessions[ownerA]?.requestID == requestA && ai.drafts[ownerA] == "A unfinished draft")
+                if phase == "thinking" {
+                    precondition(ai.sessions[ownerA]?.messages.last?.text == "第一段 " + runA)
+                    precondition(ai.resumeConversation(a, tab: ownerA) == ownerA)
+                    precondition(ai.sessions[ownerA]?.messages.last?.text == "第一段 " + runA)
+                }
+                try await choose(b)
+            }
+            let table = find(host, AIHistoryTable.self)!
+            let row = table.conversationIDs.firstIndex(of: a)!
+            let rowView = table.rowView(atRow: row, makeIfNecessary: true) as! AIHistoryRow
+            rowView.setHovered(true, animated: false)
+            precondition(cell(a)?.progress != nil && cell(a)?.archiveButton?.isEnabled == false)
+            precondition(cell(a)?.archiveButton?.isHidden == true)
+            try snapshot("running")
+            let spinner = cell(a)!.progress!
+            precondition(spinner.hitTest(.zero) == nil, "The progress indicator must not steal row selection")
+            try await release(runA, "answering")
+            try await wait { ai.sessions[ownerA]?.messages.count == 4 }
+            precondition(ai.sessions[ownerA]?.messages[1].text == "第一段 \(runA) 完成 \(runA)")
+            precondition(ai.sessions[ownerB]?.requestID == requestB && ai.drafts[ownerB] == "B unfinished draft")
+            try await finish(queued, ownerA)
+            try await wait { cell(a)?.progress == nil }
+            let idle = cell(a)!
+            idle.setHovered(false, animated: false); idle.layoutSubtreeIfNeeded()
+            let fullWidth = idle.textField!.superview!.bounds.width
+            precondition(idle.archiveButton?.isHidden == true && idle.titleTrailing?.constant == -8)
+            try snapshot("idle")
+            idle.setHovered(true, animated: false); idle.layoutSubtreeIfNeeded()
+            precondition(fullWidth - idle.textField!.superview!.bounds.width == 30)
+            let archive = idle.archiveButton!
+            let point = archive.convert(NSPoint(x: archive.bounds.midX, y: archive.bounds.midY), to: idle.superview)
+            precondition(idle.hitTest(point) === archive && archive.isEnabled)
+            try snapshot("hover")
+            idle.setHovered(false, animated: false)
+            precondition(idle.hitTest(point) !== archive && !archive.isEnabled)
+
+            // Browser tab selection, sidebar binding, closing Chat, and reopening all retain B.
+            let chatID = store.selected!
+            store.newTab(address: baseURL + "/nav/background")
+            let pageID = store.selected!
+            store.aiVisible = true
+            store.openSidebarConversation(b)
+            precondition(store.chatOwner == ownerB)
+            store.activate(chatID); store.activate(pageID)
+            precondition(ai.sessions[ownerB]?.requestID == requestB)
+            store.close(chatID)
+            precondition(ai.sessions[ownerB]?.requestID == requestB)
+            store.aiVisible = false; store.aiVisible = true
+            store.openChat(conversation: b)
+            precondition(store.chatOwner == ownerB && ai.sessions[ownerB]?.requestID == requestB)
+            precondition(store.tabs.filter { $0.chatOwner != nil }.count == 1)
+            try await release(runB, "waiting", expectRequest: false)
+            try await wait { ai.sessions[ownerB]?.phase == .thinking }
+            precondition(ai.send("Background fixture " + UUID().uuidString, tab: ownerB, browser: nil, usePage: false))
+            ai.stop(ownerB)
+            precondition(ai.sessions[ownerB]?.requestID == nil && ai.pausedQueues.contains(ownerB))
+            try await wait { cell(b)?.progress == nil }
+            for phase in ["thinking", "answering"] { try await release(runB, phase) }
+            precondition(ai.sessions[ownerA]?.messages.count == 4 && ai.sessions[ownerB]?.messages.count == 2)
+            ai.archiveConversations([b]); ai.deleteConversations([b])
+            precondition(ai.sessions[ownerB] == nil && ai.conversations[b] == nil && ai.queuedMessages[ownerB] == nil)
+            ai.saveConversations()
+            precondition(ai.conversations[b] == nil, "Late callbacks must not resurrect a deleted conversation")
+
+            config.baseURL = baseURL + "/v1"; precondition(ai.save(config))
+            store.newChat()
+            let toolOwner = store.chatOwner
+            precondition(ai.send("File phase fixture", tab: toolOwner, browser: nil, usePage: false))
+            let toolID = ai.sessions[toolOwner]!.id, toolRequest = ai.sessions[toolOwner]!.requestID
+            try await wait { ai.sessions[toolOwner]?.phase == .creatingFile }
+            store.openChat(conversation: a)
+            try await wait { ai.sessions[toolOwner]?.phase == .fileReady }
+            store.openChat(conversation: toolID)
+            precondition(store.chatOwner == toolOwner && ai.sessions[toolOwner]?.requestID == toolRequest)
+            store.close(store.selected!)
+            try await wait { ai.sessions[toolOwner]?.requestID == nil }
+            precondition(ai.sessions[toolOwner]?.error == nil && ai.sessions[toolOwner]?.messages.last?.text == "Before toolAfter tool")
+            precondition(ai.sessions[toolOwner]?.messages.last?.generatedFiles?.count == 1)
+            store.openChat(conversation: toolID)
+            try await wait { cell(toolID)?.progress == nil }
+            print("PASS: \(api.rawValue) independent Chat owners, native history switching in waiting/thinking/body, background FIFO, sidebar/tab close/reopen, explicit stop/delete, tool continuation and history progress/hover hit targets")
+        }
+    }
     static func experienceChecks(baseURL: String) async throws {
         try await followupControlsChecks()
         let suite = "dev.perch.experience.selftest.\(UUID())", tab = UUID()

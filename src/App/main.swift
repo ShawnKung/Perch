@@ -387,7 +387,7 @@ final class Store: ObservableObject {
             parts?.user = nil; parts?.password = nil; parts?.query = nil; parts?.fragment = nil
             ai.referenceClosed(page.id, reference: AIPageReference(title: page.title, url: parts?.url))
         }
-        ai.retainTabs(Set(tabs.map(\.id) + tabs.compactMap(\.chatOwner) + [AIController.homeID]))
+        ai.retainTabs(Set(tabs.map(\.id) + tabs.compactMap(\.chatOwner) + tabs.compactMap(\.aiOwner) + [AIController.homeID]))
     } }
     @Published var history: [Visit] = [] { didSet { suggestionRevision &+= 1 } }
     @Published var importedBookmarks: [String: [BookmarkNode]] = [:] { didSet { suggestionRevision &+= 1 } }
@@ -470,7 +470,7 @@ final class Store: ObservableObject {
         let chatTab = restoredTabs.first { $0.chatOwner != nil && $0.id == restoredSelection } ??
             restoredTabs.first { $0.chatOwner != nil }
         tabs = restoredTabs.filter { $0.chatOwner == nil || $0.id == chatTab?.id }
-        ai.classifyWebConversations(owners: Set(tabs.filter { !$0.address.isEmpty && $0.chatOwner == nil }.map(\.id)))
+        ai.classifyWebConversations(owners: Set(tabs.filter { !$0.address.isEmpty && $0.chatOwner == nil }.map { $0.aiOwner ?? $0.id }))
         for tab in tabs { icons[tab.id] = FaviconCache.image(for: tab.address, defaults: defaults) }
         history = restore([Visit].self, key: "history") ?? []
         importedBookmarks = restore([String: [BookmarkNode]].self, key: "importedBookmarks") ?? [:]
@@ -590,7 +590,10 @@ final class Store: ObservableObject {
     }
 
     @Published var chatHistoryVisible = true
-    var chatOwner: UUID { tabs.first(where: { $0.id == selected })?.chatOwner ?? selected ?? AIController.homeID }
+    var chatOwner: UUID {
+        let page = tabs.first(where: { $0.id == selected })
+        return page?.chatOwner ?? page?.aiOwner ?? selected ?? AIController.homeID
+    }
     var isChatPage: Bool { tabs.first(where: { $0.id == selected })?.chatOwner != nil }
     var currentPageURL: URL? {
         guard !isChatPage, let page = tabs.first(where: { $0.id == selected }),
@@ -605,15 +608,27 @@ final class Store: ObservableObject {
         }
     }
     func newChat() {
-        let owner = chatOwner
-        ai.clear(owner)
+        let previous = chatOwner
+        let owner = ai.sessions[previous] == nil ? previous : UUID()
+        ai.selections[owner] = ai.selections[previous]
+        ai.selectedModels[owner] = ai.selectedModels[previous]
+        if let index = tabs.firstIndex(where: { $0.id == selected }) {
+            if isChatPage { tabs[index].chatOwner = owner }
+            else { tabs[index].aiOwner = owner }
+            persistTabs()
+        }
         ai.drafts[owner] = ""; ai.draftFiles[owner] = []
         ai.draftReferences[owner] = []; ai.draftClosedReferences[owner] = []
         if aiVisible { referenceCurrentPage() }
         if !isChatPage && browser == nil { openChat(owner: owner) }
     }
+    func openSidebarConversation(_ conversation: UUID) {
+        guard let index = tabs.firstIndex(where: { $0.id == selected }), !isChatPage else { return }
+        tabs[index].aiOwner = ai.resumeConversation(conversation, tab: chatOwner)
+        persistTabs()
+    }
     func openChat(owner: UUID? = nil, conversation: UUID? = nil) {
-        let owner = conversation.map { id in ai.sessions.first(where: { $0.value.id == id })?.key ?? UUID() } ?? owner ?? chatOwner
+        let owner = conversation.map { ai.resumeConversation($0, tab: UUID()) } ?? owner ?? chatOwner
         if let index = tabs.firstIndex(where: { $0.chatOwner != nil }) {
             let chatID = tabs[index].id
             tabs[index].chatOwner = owner
@@ -628,7 +643,6 @@ final class Store: ObservableObject {
             let tab = Tab(title: "Chat", address: "", chatOwner: owner)
             tabs.append(tab); activate(tab.id)
         }
-        if let conversation, ai.sessions[owner]?.id != conversation { ai.resumeConversation(conversation, tab: owner) }
         chatHistoryVisible = true
         aiVisible = false
     }
@@ -653,7 +667,10 @@ final class Store: ObservableObject {
     func close(_ id: UUID) {
         guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
         homeAddressDrafts[id] = nil
-        recentlyClosed.append(tabs.remove(at: index))
+        var closed = tabs[index]
+        if closed.chatOwner == nil { closed.aiOwner = closed.aiOwner ?? closed.id }
+        tabs.remove(at: index)
+        recentlyClosed.append(closed)
         recentlyClosed = Array(recentlyClosed.suffix(20))
         if let browser = browsers.removeValue(forKey: id) {
             browser.passwordBridge.dismiss(); browser.favicon.reset(); browser.webView.stopLoading()
@@ -2241,6 +2258,15 @@ if CommandLine.arguments.contains("--scroll-self-test") {
         setbuf(stdout, nil)
         app.activate(ignoringOtherApps: true)
         do { try await AISelfCheck.markdown(); exit(0) }
+        catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
+    }
+    app.run()
+} else if let index = CommandLine.arguments.firstIndex(of: "--ai-background-self-test"), CommandLine.arguments.count > index + 1 {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    Task { @MainActor in
+        setbuf(stdout, nil)
+        do { try await AISelfCheck.backgroundChatChecks(baseURL: CommandLine.arguments[index + 1]); exit(0) }
         catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
     }
     app.run()

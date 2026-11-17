@@ -31,10 +31,36 @@ final class AIHistoryArchiveButton: NSButton {
     }
 }
 
+final class AIHistoryProgress: NSProgressIndicator {
+    private var displayObserver: NSObjectProtocol?
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        style = .spinning; controlSize = .small
+        isIndeterminate = true; isDisplayedWhenStopped = true
+        setAccessibilityLabel("正在生成")
+        displayObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.updateAnimation() }
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); updateAnimation() }
+    private func updateAnimation() {
+        if window != nil && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion { startAnimation(nil) }
+        else { stopAnimation(nil) }
+    }
+    deinit {
+        if let displayObserver { NSWorkspace.shared.notificationCenter.removeObserver(displayObserver) }
+    }
+}
+
 final class AIHistoryCell: NSTableCellView {
     var archive: (() -> Void)?
     var archiveButton: NSButton?
     var disclosure: AIHistoryChevron?
+    var progress: AIHistoryProgress?
+    var titleTrailing: NSLayoutConstraint?
+    private var hoverRevision = 0
     func rotateDisclosure(expanded: Bool, animated: Bool) {
         guard let layer = disclosure?.shape else { return }
         let angle = expanded ? -CGFloat.pi / 2 : 0
@@ -52,10 +78,27 @@ final class AIHistoryCell: NSTableCellView {
         }
     }
     func setHovered(_ hovered: Bool, animated: Bool) {
-        archiveButton?.isEnabled = hovered
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = animated && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0.16 : 0
-            archiveButton?.animator().alphaValue = hovered ? 1 : 0
+        let showArchive = hovered && progress == nil && archiveButton != nil
+        hoverRevision += 1
+        let revision = hoverRevision
+        layoutSubtreeIfNeeded()
+        titleTrailing?.constant = progress != nil || showArchive ? -38 : -8
+        if showArchive { archiveButton?.isHidden = false }
+        archiveButton?.isEnabled = showArchive
+        let changes = {
+            self.archiveButton?.alphaValue = showArchive ? 1 : 0
+            self.layoutSubtreeIfNeeded()
+        }
+        if animated && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.16; context.allowsImplicitAnimation = true
+                changes()
+            } completionHandler: { [weak self] in
+                guard let self, self.hoverRevision == revision else { return }
+                self.archiveButton?.isHidden = !showArchive
+            }
+        } else {
+            changes(); archiveButton?.isHidden = !showArchive
         }
     }
     @objc func archiveConversation() { archive?() }
@@ -206,7 +249,7 @@ struct AIHistoryList: NSViewRepresentable {
         func refresh(animatedOrigin: AIConversationOrigin? = nil) {
             guard let table else { return }
             let signature = parent.conversations.map {
-                "\($0.id)|\($0.title)|\(sourceTitle($0) ?? "")|\($0.updated.timeIntervalSince1970)|\($0.origin?.rawValue ?? "chat")"
+                "\($0.id)|\($0.title)|\(sourceTitle($0) ?? "")|\($0.updated.timeIntervalSince1970)|\($0.origin?.rawValue ?? "chat")|\($0.requestID != nil)"
             } +
                 AIConversationOrigin.allCases.filter { collapsed.contains($0) }.map(\.rawValue)
             let fontSize = PerchTheme.shared.chatFontSize
@@ -276,13 +319,28 @@ struct AIHistoryList: NSViewRepresentable {
         func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
             let entry = rows[row]
             let cell = AIHistoryCell()
+            let textContainer: NSView
+            if entry.session != nil {
+                let clip = TabTitleClipView()
+                clip.translatesAutoresizingMaskIntoConstraints = false
+                cell.addSubview(clip)
+                cell.titleTrailing = clip.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -8)
+                NSLayoutConstraint.activate([
+                    clip.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 10),
+                    cell.titleTrailing!,
+                    clip.topAnchor.constraint(equalTo: cell.topAnchor),
+                    clip.bottomAnchor.constraint(equalTo: cell.bottomAnchor)
+                ])
+                textContainer = clip
+            } else { textContainer = cell }
             let label = NSTextField(labelWithString: entry.session.map {
                 $0.title.isEmpty ? "附件对话" : $0.title
             } ?? entry.origin.title)
             label.font = .systemFont(ofSize: PerchTheme.shared.chatFontSize(relativeTo: 13), weight: entry.session == nil ? .semibold : .regular)
             label.textColor = NSColor(Style.ink); label.maximumNumberOfLines = 2; label.lineBreakMode = .byTruncatingTail
             label.translatesAutoresizingMaskIntoConstraints = false
-            cell.addSubview(label)
+            textContainer.addSubview(label)
+            cell.textField = label
             let source = entry.session.flatMap(sourceTitle)
             if source != nil { label.maximumNumberOfLines = 1 }
             let sourceLabel = source.map { text -> NSTextField in
@@ -291,7 +349,7 @@ struct AIHistoryList: NSViewRepresentable {
                 view.textColor = .secondaryLabelColor
                 view.lineBreakMode = .byTruncatingTail
                 view.translatesAutoresizingMaskIntoConstraints = false
-                cell.addSubview(view)
+                textContainer.addSubview(view)
                 return view
             }
             if entry.session == nil {
@@ -323,7 +381,7 @@ struct AIHistoryList: NSViewRepresentable {
                 let button = AIHistoryArchiveButton(image: NSImage(systemSymbolName: "archivebox", accessibilityDescription: "归档对话")!,
                                       target: cell, action: #selector(AIHistoryCell.archiveConversation))
                 button.isBordered = false; button.imagePosition = .imageOnly
-                button.alphaValue = 0; button.isEnabled = false
+                button.alphaValue = 0; button.isEnabled = false; button.isHidden = true
                 button.toolTip = "归档对话"; button.setAccessibilityLabel("归档对话")
                 button.translatesAutoresizingMaskIntoConstraints = false
                 cell.archive = { [weak self] in self?.parent.delete([session.id]) }
@@ -335,9 +393,20 @@ struct AIHistoryList: NSViewRepresentable {
                     button.heightAnchor.constraint(equalToConstant: 22)
                 ])
             }
+            if entry.session?.requestID != nil {
+                let progress = AIHistoryProgress()
+                progress.translatesAutoresizingMaskIntoConstraints = false
+                cell.progress = progress; cell.addSubview(progress)
+                NSLayoutConstraint.activate([
+                    progress.centerXAnchor.constraint(equalTo: cell.trailingAnchor, constant: -21),
+                    progress.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+                    progress.widthAnchor.constraint(equalToConstant: 16),
+                    progress.heightAnchor.constraint(equalToConstant: 16)
+                ])
+            }
             NSLayoutConstraint.activate([
                 label.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: entry.session == nil ? 20 : 10),
-                label.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: parent.archived ? -8 : -38)
+                label.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: entry.session == nil && !parent.archived ? -38 : -8)
             ])
             if let sourceLabel {
                 let textGroup = NSLayoutGuide()
@@ -356,6 +425,7 @@ struct AIHistoryList: NSViewRepresentable {
                 label.centerYAnchor.constraint(equalTo: cell.centerYAnchor).isActive = true
             }
             cell.toolTip = [entry.session?.title, source].compactMap { $0 }.joined(separator: "\n")
+            cell.setHovered(false, animated: false)
             return cell
         }
         func activate(_ row: Int) {

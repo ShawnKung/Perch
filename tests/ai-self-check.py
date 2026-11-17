@@ -11,6 +11,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 failures = []
 titles = set()
 title_counts = {}
+background_gates = {}
+background_requests = {}
 
 
 class Provider(BaseHTTPRequestHandler):
@@ -18,6 +20,16 @@ class Provider(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if self.path.startswith("/background-release/"):
+            _, _, run, phase = self.path.split("/")
+            background_gates.setdefault((run, phase), threading.Event()).set()
+            data = json.dumps({"requests": background_requests.get(run, 0)}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if self.path == "/nav/auth-icon.png":
             if "fixture_icon=allowed" not in self.headers.get("Cookie", ""):
                 self.send_error(401)
@@ -385,6 +397,38 @@ class Provider(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json" if self.path.startswith("/json") else "text/event-stream")
             self.end_headers()
             if self.path.startswith("/streaming"):
+                if content.startswith("Background fixture "):
+                    run = content.split()[-1]
+                    background_requests[run] = background_requests.get(run, 0) + 1
+
+                    def gate(phase):
+                        assert background_gates.setdefault((run, phase), threading.Event()).wait(25), phase
+
+                    gate("waiting")
+                    if responses:
+                        self.sse({"type": "response.reasoning_summary_text.delta", "output_index": 0, "delta": "思考 " + run})
+                    elif anthropic:
+                        self.sse({"type": "content_block_delta", "index": 1, "delta": {"type": "thinking_delta", "thinking": "思考 " + run}})
+                    else:
+                        self.sse({"choices": [{"delta": {"reasoning_content": "思考 " + run}}]})
+                    gate("thinking")
+                    for phase, text in [("answering", "第一段 " + run), ("done", " 完成 " + run)]:
+                        if responses:
+                            self.sse({"type": "response.output_text.delta", "delta": text})
+                        elif anthropic:
+                            self.sse({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}})
+                        else:
+                            self.event(text)
+                        if phase != "done":
+                            gate(phase)
+                    if responses:
+                        self.sse({"type": "response.completed", "response": {"status": "completed"}})
+                    elif anthropic:
+                        self.sse({"type": "message_stop"})
+                    else:
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                    return
                 if content == "History streaming fixture":
                     self.event(("# 历史回答\n\n" + "历史正文与阅读位置。\n\n" * 150))
                     self.wfile.write(b"data: [DONE]\n\n")
@@ -661,10 +705,11 @@ composer_only = "--composer-only" in sys.argv
 files_only = "--files-only" in sys.argv
 experience_only = "--experience-only" in sys.argv
 streaming_only = "--streaming-only" in sys.argv
-arguments = ["--navigation-self-test" if navigation else "--ai-streaming-self-test" if streaming_only else "--ai-experience-self-test" if experience_only else "--ai-files-self-test" if files_only else "--ai-search-self-test" if search_only else "--ai-composer-self-test" if composer_only else "--ai-self-test", f"http://127.0.0.1:{server.server_port}"]
+background_only = "--background-only" in sys.argv
+arguments = ["--navigation-self-test" if navigation else "--ai-background-self-test" if background_only else "--ai-streaming-self-test" if streaming_only else "--ai-experience-self-test" if experience_only else "--ai-files-self-test" if files_only else "--ai-search-self-test" if search_only else "--ai-composer-self-test" if composer_only else "--ai-self-test", f"http://127.0.0.1:{server.server_port}"]
 result = subprocess.run([sys.argv[1]] + arguments, timeout=120)
 server.shutdown()
-if not navigation and not search_only and not composer_only and not files_only and not experience_only and not streaming_only and (title_counts.get("hello fixture") != 1 or "Remember attachment fixture" in titles or "Replacement attachment fixture" in titles):
+if not navigation and not search_only and not composer_only and not files_only and not experience_only and not streaming_only and not background_only and (title_counts.get("hello fixture") != 1 or "Remember attachment fixture" in titles or "Replacement attachment fixture" in titles):
     failures.append("Conversation title was not generated exactly once")
 if failures:
     print("FAIL: synthetic provider:", failures, file=sys.stderr)

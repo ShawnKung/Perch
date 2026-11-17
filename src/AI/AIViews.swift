@@ -1068,7 +1068,7 @@ struct AIChatSidebar: View {
                             Button {
                                 guard record.id != session.id else { return }
                                 fileTask?.cancel(); fileTask = nil; fileError = nil; mention = nil
-                                ai.saveConversations(); ai.resumeConversation(record.id, tab: tab)
+                                store.openSidebarConversation(record.id)
                             } label: {
                                 if record.id == session.id { Label(record.title, systemImage: "checkmark") }
                                 else { Text(record.title) }
@@ -1365,7 +1365,7 @@ struct AIChatSidebar: View {
             fileError = nil; showModelPicker = false; showReferences = false; mention = nil
         }
         .onAppear {
-            ai.classifyWebConversations(owners: Set(store.tabs.filter { !$0.address.isEmpty && $0.chatOwner == nil }.map(\.id)))
+            ai.classifyWebConversations(owners: Set(store.tabs.filter { !$0.address.isEmpty && $0.chatOwner == nil }.map { $0.aiOwner ?? $0.id }))
             if CommandLine.arguments.contains("--preview-model-picker") { showModelPicker = true }
         }
         .onDisappear { fileTask?.cancel() }
@@ -1411,7 +1411,7 @@ struct AIChatSidebar: View {
                 defer { fileTask = nil }
                 do {
                     let added = try await Task.detached { try urls.map(AIAttachment.read) }.value
-                    guard !Task.isCancelled, id == AIController.homeID || store.tabs.contains(where: { $0.id == id || $0.chatOwner == id }) else { return }
+                    guard !Task.isCancelled, id == AIController.homeID || store.tabs.contains(where: { $0.id == id || $0.chatOwner == id || $0.aiOwner == id }) else { return }
                     try addFiles(added, owner: id)
                 } catch { if !Task.isCancelled { fileError = (error as? PerchError)?.message ?? "无法读取文件。" } }
             }

@@ -708,7 +708,7 @@ enum AISelfCheck {
         try "Synthetic attachment: the verification code is FILE-4729.".write(to: fileURL, atomically: true, encoding: .utf8)
         defer { try? FileManager.default.removeItem(at: fileURL) }
         let file = try AIAttachment.read(fileURL)
-        let attached = UUID()
+        var attached = UUID()
         ai.send("Read attachment fixture", tab: attached, browser: nil, usePage: false, attachments: [file])
         try await wait { ai.sessions[attached]?.requestID == nil }
         precondition(ai.sessions[attached]?.error == nil && ai.sessions[attached]?.messages.first?.attachments.count == 1)
@@ -954,7 +954,7 @@ enum AISelfCheck {
         let forkReload = AIController(defaults: defaults, conversationDirectory: directory)
         precondition(forkReload.conversations[attachmentConversation]!.messages.map(\.id) == originalIDs)
         precondition(forkReload.conversations[pendingForkID]?.messages[2].text == "Pending fork fixture")
-        ai.resumeConversation(attachmentConversation, tab: attached)
+        attached = ai.resumeConversation(attachmentConversation, tab: attached)
         ai.archiveConversations([pendingForkID]); ai.deleteConversations([pendingForkID])
         ai.drafts[attached] = "Prior unsent draft"; ai.draftReferences[attached] = [second]
         print("PASS: pending Fork leaves original unchanged until accepted send, cancel restores draft, independent branch persists original history")
@@ -1118,7 +1118,7 @@ enum AISelfCheck {
         ai.send("never sent fixture", tab: clearedTab, browser: nil, usePage: false)
         ai.clear(clearedTab)
         precondition(ai.queuedMessages[clearedTab] == nil && ai.sessions[clearedTab] == nil)
-        print("PASS: queued sends preserve FIFO and completed context; stop pauses, resume retains attachments, removal and new conversation clear pending work")
+        print("PASS: queued sends preserve FIFO and completed context; stop pauses, resume retains attachments, removal and explicit session clear discard pending work")
         let editingStream = UUID()
         ai.send("edit streaming fixture", tab: editingStream, browser: nil, usePage: false)
         try await wait { ai.sessions[editingStream]?.messages.last?.text.isEmpty == false }
@@ -1155,8 +1155,9 @@ enum AISelfCheck {
             precondition(ai.sessions[id]?.error?.contains(expected) == true)
             precondition(ai.sessions[id]?.error?.contains("synthetic-key") == false)
         }
+        let retainedIDs = ai.sessions.mapValues(\.id)
         ai.retainTabs([first])
-        precondition(ai.sessions.count == 1 && ai.sessions[first] != nil)
+        precondition(ai.sessions.mapValues(\.id) == retainedIDs, "Removing views must preserve conversation owners")
         ai.removeKey(); precondition(!ai.ready)
         let damaged = Data("damaged".utf8)
         defaults.set(damaged, forKey: "aiProviders")
@@ -1596,7 +1597,7 @@ enum AISelfCheck {
         let store = Store(defaults: defaults)
         var config = AIConfiguration(provider: .custom, baseURL: baseURL + "/v1", model: "fixture")
         precondition(store.ai.save(config, key: "synthetic-key"))
-        let owner = AIController.homeID
+        var owner = AIController.homeID
         precondition(store.ai.send("Previous conversation fixture", tab: owner, browser: nil, usePage: false))
         try await wait { store.ai.sessions[owner]?.requestID == nil }
         let previous = store.ai.sessions[owner]!
@@ -1641,6 +1642,7 @@ enum AISelfCheck {
         }
         precondition(selected() == [previous.id])
         store.newChat()
+        owner = store.chatOwner
         try await wait { selected().isEmpty }
         try await Task.sleep(nanoseconds: 100_000_000)
         precondition(selected().isEmpty, "An empty new conversation must not highlight the old row")
@@ -1656,9 +1658,9 @@ enum AISelfCheck {
         precondition(store.ai.send("Followup conversation fixture", tab: owner, browser: nil, usePage: false))
         try await wait { store.ai.sessions[owner]?.requestID == nil }
         precondition(selected() == [previous.id, current.id], "Refreshing the current conversation must preserve manual multi-selection")
-        store.ai.resumeConversation(previous.id, tab: owner)
+        store.openChat(conversation: previous.id)
         try await wait { selected() == [previous.id] }
-        store.ai.resumeConversation(current.id, tab: owner)
+        store.openChat(conversation: current.id)
         try await wait { selected() == [current.id] }
         print("PASS: new/empty/first-message selection, title refresh, manual multi-selection and conversation switching")
 
@@ -2326,8 +2328,9 @@ enum AISelfCheck {
         let tabBeforeNew = store.selected
         plus.performClick(nil)
         try await wait { store.ai.sessions[store.chatOwner] == nil }
-        precondition(store.chatOwner == forkOwner && store.tabs.count == tabCountBeforeNew && store.selected == tabBeforeNew)
-        precondition(store.ai.drafts[forkOwner] == "" && store.ai.pendingEdits[forkOwner] == nil)
+        let newOwner = store.chatOwner
+        precondition(newOwner != forkOwner && store.tabs.count == tabCountBeforeNew && store.selected == tabBeforeNew)
+        precondition(store.ai.drafts[newOwner] == "" && store.ai.pendingEdits[newOwner] == nil)
         precondition(store.ai.sessions[editOwner]!.messages.map(\.id) == preservedIDs)
         let hoverRow = table.conversationIDs.firstIndex { $0 == store.ai.sessions[editOwner]?.id }!
         let hoverCell = table.view(atColumn: 0, row: hoverRow, makeIfNecessary: true) as! AIHistoryCell
@@ -2350,7 +2353,7 @@ enum AISelfCheck {
         precondition(archiveHit === archiveButton)
         hoverCell.archiveButton!.performClick(nil)
         try await wait { store.ai.conversations[hoveredID]?.isArchived == true }
-        precondition(store.selected == tabBeforeNew && store.chatOwner == forkOwner, "Hover archive must not activate a conversation")
+        precondition(store.selected == tabBeforeNew && store.chatOwner == newOwner, "Hover archive must not activate a conversation")
         store.ai.restoreConversations([hoveredID])
         store.openChat(owner: editOwner)
         store.chatHistoryVisible = false
@@ -2544,9 +2547,11 @@ enum AISelfCheck {
         }
         try await Task.sleep(nanoseconds: 400_000_000)
         precondition(restored(), "Delayed Markdown layout must retain the saved viewport")
-        reloaded.resumeConversation(other.id, tab: AIController.homeID)
+        let otherOwner = reloaded.resumeConversation(other.id, tab: AIController.homeID)
+        window.contentView = NSHostingView(rootView: AIChatSidebar(store: store, ai: reloaded, fullPage: true, owner: otherOwner, close: {}).defaultAppStorage(defaults))
         try await wait { answers(in: window.contentView!).isEmpty }
-        reloaded.resumeConversation(record.id, tab: AIController.homeID)
+        let recordOwner = reloaded.resumeConversation(record.id, tab: AIController.homeID)
+        window.contentView = NSHostingView(rootView: AIChatSidebar(store: store, ai: reloaded, fullPage: true, owner: recordOwner, close: {}).defaultAppStorage(defaults))
         try await wait(timeout: 20, restored)
         // Match the previous 350pt chat viewport after collapsing the 240pt history sidebar.
         store.chatHistoryVisible = false
@@ -2601,7 +2606,7 @@ enum AISelfCheck {
         let fork = reloaded.forkConversation(record.id)!
         precondition(reloaded.readingPosition(for: fork) == nil)
         precondition(reloaded.readingPosition(for: record.id) == saved)
-        print("PASS: conversation viewport persisted and restored after restart, same-owner history switch, delayed Markdown and sidebar width; Fork has an independent bookmark")
+        print("PASS: conversation viewport persisted and restored after restart, history view rebinding, delayed Markdown and sidebar width; Fork has an independent bookmark")
     }
 
     static func keychain() throws {
