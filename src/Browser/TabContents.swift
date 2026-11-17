@@ -79,6 +79,13 @@ struct TabContentView: View {
                         } else { HomeScreen(store: store) }
                     }.modifier(ContentTopChrome(enabled: true))
                 }
+                .overlayPreferenceValue(BookmarkButtonAnchor.self) { anchor in
+                    GeometryReader { geometry in
+                        if let anchor, let browser = store.cachedBrowser(for: tabID) {
+                            BrowserZoomOverlay(browser: browser, bookmark: geometry[anchor])
+                        }
+                    }
+                }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
