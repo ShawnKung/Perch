@@ -1614,7 +1614,50 @@ enum AISelfCheck {
         window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
         return window
     }
+    static func composerReturnChecks() {
+        var draft = ""
+        var acceptsSend = true
+        var sent = 0
+        for command in [false, true] {
+            let composer = AIComposerInput(text: Binding(get: { draft }, set: { draft = $0 }),
+                enabled: true, mentionChanged: { _, _ in }, mentionCommand: { _ in false },
+                sendWithCommand: command, send: {
+                    guard acceptsSend else { return }
+                    sent += 1
+                    draft = ""
+                })
+            let coordinator = AIComposerInput.Coordinator(composer)
+            let editor = AIComposerTextView()
+            editor.delegate = coordinator
+            let event = NSEvent.keyEvent(with: .keyDown, location: .zero,
+                modifierFlags: command ? [.command] : [], timestamp: 0, windowNumber: 0, context: nil,
+                characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36)!
+            acceptsSend = true
+            editor.string = "快速中文提交"
+            precondition(coordinator.handleReturn(event, editor: editor))
+            precondition(draft.isEmpty && editor.string.isEmpty && editor.showsPlaceholder,
+                         "Accepted Return must clear both draft and native text synchronously")
+            editor.didChangeText()
+            precondition(draft.isEmpty && editor.string.isEmpty,
+                         "A late text-change notification must not restore submitted text")
+
+            acceptsSend = false
+            let acceptedCount = sent
+            editor.string = "拒绝发送保留草稿"
+            precondition(coordinator.handleReturn(event, editor: editor))
+            precondition(draft == editor.string && draft == "拒绝发送保留草稿" && sent == acceptedCount)
+            editor.setMarkedText("ni", selectedRange: NSRange(location: 2, length: 0),
+                                 replacementRange: NSRange(location: 0, length: editor.string.utf16.count))
+            precondition(!coordinator.handleReturn(event, editor: editor))
+            precondition(editor.hasMarkedText() && editor.string == "ni" &&
+                         draft == "拒绝发送保留草稿" && sent == acceptedCount)
+            editor.unmarkText()
+        }
+        precondition(sent == 2)
+        print("PASS: Return/Cmd+Return clear native text before late notifications; rejected sends and IME retain drafts")
+    }
     static func composerUI(baseURL: String) async throws {
+        composerReturnChecks()
         // SwiftUI otherwise leaves its accessibility tree empty without an external screen reader.
         NSApp.accessibilitySetValue(true, forAttribute: NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface"))
         let suite = "dev.perch.ai.composer-ui.\(UUID())"
@@ -2384,7 +2427,9 @@ enum AISelfCheck {
             timestamp: 0, windowNumber: window.windowNumber, context: nil,
             characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36)!
         precondition(fullInput.returnKey?(returnEvent) == true)
-        guard store.ai.queuedMessages[queueOwner]?.count == 1 && store.ai.drafts[queueOwner]?.isEmpty == true else {
+        fullInput.didChangeText()
+        guard store.ai.queuedMessages[queueOwner]?.count == 1 && store.ai.drafts[queueOwner]?.isEmpty == true &&
+              fullInput.string.isEmpty else {
             throw PerchError("Native Return did not queue and clear the busy composer")
         }
         if let directory = ProcessInfo.processInfo.environment["PERCH_LAYOUT_EVIDENCE"] {
