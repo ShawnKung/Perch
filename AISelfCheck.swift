@@ -1654,6 +1654,31 @@ enum AISelfCheck {
             editor.unmarkText()
         }
         precondition(sent == 2)
+        var coordinator: AIComposerInput.Coordinator!
+        let submitted = "同步发送触发界面更新"
+        draft = ""
+        let snapshot = AIComposerInput(text: Binding(get: { submitted }, set: { draft = $0 }),
+            enabled: true, mentionChanged: { _, _ in }, mentionCommand: { _ in false })
+        let composer = AIComposerInput(text: Binding(get: { draft }, set: { draft = $0 }),
+            enabled: true, mentionChanged: { _, _ in }, mentionCommand: { _ in false }, send: {
+                // Model a SwiftUI update while the synchronous Keychain helper waits.
+                coordinator.parent = snapshot
+                draft = ""
+            })
+        coordinator = AIComposerInput.Coordinator(composer)
+        let editor = AIComposerTextView()
+        editor.delegate = coordinator
+        editor.string = submitted
+        let event = NSEvent.keyEvent(with: .keyDown, location: .zero,
+            modifierFlags: NSEvent.ModifierFlags(rawValue: 256), timestamp: 0, windowNumber: 0, context: nil,
+            characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36)!
+        precondition(coordinator.handleReturn(event, editor: editor))
+        precondition(draft.isEmpty && editor.string.isEmpty,
+                     "A reentrant view update must not replace the active send callback or binding")
+        editor.didChangeText()
+        precondition(draft.isEmpty)
+        coordinator.parent = snapshot
+        print("PASS: Return preserves its original callback and binding across synchronous view updates")
         print("PASS: Return/Cmd+Return clear native text before late notifications; rejected sends and IME retain drafts")
     }
     static func composerUI(baseURL: String) async throws {
