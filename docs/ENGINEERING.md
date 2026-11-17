@@ -73,7 +73,8 @@
 - 图表平移和缩放不改变消息高度，源码切换保留状态；PNG 从完整净化 SVG 导出，不保存平移后的截屏。
 - 图表窗口独立于 Markdown 生命周期，关闭移除桥和引用。HTML/SVG 文件预览使用 nonPersistent WebKit 和 sandbox=allow-scripts，不允许 same-origin、网络、文件系统、弹窗、下载或宿主桥。
 - 主题通过 PerchTheme 同步原生 UI 与应用自身 Markdown/图表，原生标签显式刷新；不重建网页或聊天、不改变阅读位置和图表状态，不向真实网页注入主题。
+- Chat 正文字号由 BrowserSettings 持久化，默认 13 pt，历史标题默认 13 pt；PerchTheme 同步原生文本和 Markdown CSS 变量，其他文字相对正文等比例缩放，行高随文字调整。顶部「AI 聊天」文案固定 13 pt，不随正文字号调整。带来源的历史标题和来源整体垂直居中。更新字号重新排版，不重建内容或清空草稿与选区；图表视口保持独立。
 - 主程序体积优化使用既有编译与符号裁剪方案；Markdown 资源采用 LZMA 无损压缩并缓存解压结果。每次构建重建包内资源目录，避免旧资源残留。
 - ICNS 只无损重压缩 PNG 并验证像素及其他 chunks 不变；不能通过删除自检、图标尺寸、语言或图类型缩小体积。
 
-验证入口：`build/Perch.app/Contents/MacOS/Perch --ai-markdown-self-test`，文件专项为 Python 服务的 `--files-only`。通过 `open -W` 启动时，必须核对应用自检完成断言和 FAIL，不能把 open 的退出码或焦点超时视为成功。
+验证入口：`build/Perch.app/Contents/MacOS/Perch --ai-markdown-self-test`，字号专项为 `--ai-typography-self-test`，文件专项为 Python 服务的 `--files-only`。通过 `open -W` 启动时，必须核对应用自检完成断言和 FAIL，不能把 open 的退出码或焦点超时视为成功。

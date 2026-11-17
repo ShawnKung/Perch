@@ -9,6 +9,218 @@ private struct AIStreamingProbe: View {
 }
 
 extension AISelfCheck {
+    static func typographyUI() async throws {
+        NSApp.accessibilitySetValue(true, forAttribute: NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface"))
+        let originalSize = PerchTheme.shared.chatFontSize
+        let originalTheme = PerchTheme.shared.selection
+        let suite = "dev.perch.typography.\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("perch-typography-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer {
+            defaults.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: directory)
+            PerchTheme.shared.chatFontSize = originalSize
+            PerchTheme.shared.selection = originalTheme
+        }
+        var user = AIMessage(role: "user", text: "检查字体与高亮：中文 English 🙂，调整字号时，文字应在气泡内换行。")
+        user.references = [AIPageReference(title: "中文 English 参考网页", url: URL(string: "https://example.invalid"))]
+        let markdown = """
+        ## 字体与布局
+        中文 English 🙂，内联 `highlighted_code` 与 **粗体文字**。
+
+        > 引用内容应在高亮背景内换行，不越过窗口边缘。
+
+        ```swift
+        let longLine = "ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        ```
+
+        | 名称 | 内容 |
+        | --- | --- |
+        | 中文 | English 🙂 |
+        | 地址 | https://example.invalid/abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz |
+        """
+        var answer = AIMessage(role: "assistant", text: markdown)
+        answer.reasoning = "思考内容：字号变化后重新换行，并保留原生文字选择。\nEnglish reasoning 🙂."
+        answer.followups = ["继续查看较大字号下的文字换行与按钮边界"]
+        let session = AISession(messages: [user, answer])
+        var records = [session.id: session]
+        for index in 0..<12 {
+            var message = AIMessage(role: "user", text: "网页历史 \(index) · 中文 English 长标题换行检查")
+            message.references = [AIPageReference(title: "中文 English 参考网页", url: URL(string: "https://example.invalid"))]
+            let record = AISession(updated: Date().addingTimeInterval(Double(-index - 1)), messages: [message], origin: .web)
+            records[record.id] = record
+        }
+        try JSONEncoder().encode(AIConversationArchive(conversations: records, tabs: [AIController.homeID: session.id]))
+            .write(to: directory.appendingPathComponent("conversations.json"))
+        let store = Store(defaults: defaults)
+        let ai = AIController(defaults: defaults, conversationDirectory: directory)
+        precondition(ai.save(AIConfiguration(provider: .custom, baseURL: "http://127.0.0.1:1", model: "fixture"), key: "synthetic-key"))
+        let window = NSWindow(contentRect: NSRect(x: 120, y: 160, width: 850, height: 720),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)
+        defer { window.orderOut(nil); window.contentView = nil }
+        func views<T: NSView>(_ view: NSView, of type: T.Type) -> [T] {
+            (view as? T).map { [$0] } ?? view.subviews.flatMap { views($0, of: type) }
+        }
+        func element(_ node: Any, _ label: String) -> NSObject? {
+            guard let node = node as? NSObject else { return nil }
+            for key in ["accessibilityLabel", "accessibilityTitle"] where node.responds(to: NSSelectorFromString(key)) {
+                if node.value(forKey: key) as? String == label {
+                    if label != "Chat 正文字号" ||
+                        (node.responds(to: NSSelectorFromString("accessibilityRole")) &&
+                         node.value(forKey: "accessibilityRole") as? String == NSAccessibility.Role.slider.rawValue) {
+                        return node
+                    }
+                }
+            }
+            guard node.responds(to: NSSelectorFromString("accessibilityChildren")) else { return nil }
+            return (node.value(forKey: "accessibilityChildren") as? [Any] ?? []).lazy.compactMap { element($0, label) }.first
+        }
+        func frame(_ host: NSView, _ label: String) throws -> NSRect {
+            guard let value = element(host, label)?.value(forKey: "accessibilityFrame") as? NSValue else {
+                throw PerchError("Missing typography control: \(label)")
+            }
+            return value.rectValue
+        }
+        func click(_ point: NSPoint) {
+            for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                NSApp.sendEvent(NSEvent.mouseEvent(with: type, location: window.convertPoint(fromScreen: point),
+                    modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                    windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!)
+            }
+        }
+        func snapshot(_ host: NSView, _ name: String) throws {
+            guard let path = ProcessInfo.processInfo.environment["PERCH_LAYOUT_EVIDENCE"],
+                  let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { return }
+            host.cacheDisplay(in: host.bounds, to: bitmap)
+            try bitmap.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path).appendingPathComponent(name + ".png"))
+        }
+        let settingsHost = NSHostingView(rootView: SettingsPage(store: store).defaultAppStorage(defaults))
+        window.contentView = settingsHost; window.makeKeyAndOrderFront(nil)
+        try await wait { element(settingsHost, "Chat 正文字号") != nil }
+        try snapshot(settingsHost, "settings-font-default")
+        let slider = try frame(settingsHost, "Chat 正文字号")
+        click(NSPoint(x: slider.maxX - 8, y: slider.midY))
+        try await wait { store.settings.chatFontSize > 13 }
+        try await Task.sleep(nanoseconds: 150_000_000)
+        let saved = try JSONDecoder().decode(BrowserSettings.self, from: defaults.data(forKey: "settings")!)
+        precondition(saved.chatFontSize == store.settings.chatFontSize)
+        try snapshot(settingsHost, "settings-font-size")
+        let reset = try frame(settingsHost, "恢复默认")
+        click(NSPoint(x: reset.midX, y: reset.midY))
+        try await wait { store.settings.chatFontSize == 13 && PerchTheme.shared.chatFontSize == 13 }
+        let legacy = try JSONDecoder().decode(BrowserSettings.self, from: Data("{}".utf8))
+        precondition(legacy.chatFontSize == 13)
+        for invalid in [0, 23] {
+            precondition((try? JSONDecoder().decode(BrowserSettings.self, from: Data("{\"chatFontSize\":\(invalid)}".utf8))) == nil)
+        }
+        print("PASS: native slider click persists Chat font size, reset restores 13 pt, legacy and invalid settings are handled")
+        for fullPage in [true, false] {
+            let host = NSHostingView(rootView: AIChatSidebar(store: store, ai: ai, fullPage: fullPage, owner: AIController.homeID, close: {}).defaultAppStorage(defaults))
+            window.contentView = host
+            window.setContentSize(NSSize(width: fullPage ? 850 : 360, height: 720))
+            ai.drafts[AIController.homeID] = "输入草稿 English 中文 🙂\n字号变化后保留选区。"
+            window.makeKeyAndOrderFront(nil)
+            try await wait { !views(host, of: AIMarkdownWebView.self).isEmpty && !views(host, of: AIComposerTextView.self).isEmpty }
+            let web = views(host, of: AIMarkdownWebView.self)[0]
+            let editor = views(host, of: AIComposerTextView.self)[0]
+            try await wait { (web.navigationDelegate as? AIMarkdownView.Coordinator)?.loaded == true }
+            try await wait { element(host, "正在加载对话") == nil }
+            _ = try await web.evaluateJavaScript("""
+            window.typographyNode = document.querySelector('#content p');
+            const r = document.createRange(); r.selectNodeContents(typographyNode);
+            window.getSelection().removeAllRanges(); window.getSelection().addRange(r);
+            window.typographySelection = window.getSelection().toString();
+            """)
+            editor.setSelectedRange(NSRange(location: 2, length: 4))
+            var heights: [Double] = []
+            for size in [11.0, 13.0, 22.0, 13.0] {
+                var settings = store.settings; settings.chatFontSize = size
+                try store.saveSettings(settings)
+                try await wait { editor.font?.pointSize == CGFloat(size) }
+                try await Task.sleep(nanoseconds: 200_000_000)
+                host.layoutSubtreeIfNeeded()
+                if let table = views(host, of: AIHistoryTable.self).first {
+                    let selectedIDs = table.selectedRowIndexes.compactMap { table.conversationIDs[$0] }
+                    precondition(selectedIDs == [session.id], "Font changes must preserve the active history row")
+                    table.layoutSubtreeIfNeeded()
+                    for row in 0..<table.numberOfRows {
+                        guard let cell = table.view(atColumn: 0, row: row, makeIfNecessary: true) as? AIHistoryCell else { continue }
+                        cell.layoutSubtreeIfNeeded()
+                        let fields = views(cell, of: NSTextField.self)
+                        for field in fields {
+                            let baseline = field.stringValue.hasPrefix("@ ") ? 9.5 : 13.0
+                            precondition(abs((field.font?.pointSize ?? 0) - CGFloat(size * baseline / 13)) < 0.01)
+                            precondition(field.frame.minY >= 0 && field.frame.maxY <= cell.bounds.height,
+                                         "History text must fit inside its row highlight")
+                        }
+                        if fields.contains(where: { $0.stringValue.hasPrefix("@ ") }) {
+                            let textRect = fields.reduce(NSRect.null) { $0.union($1.frame) }
+                            precondition(abs(textRect.midY - cell.bounds.midY) < 0.5,
+                                         "History title and source must be vertically centered together")
+                        }
+                    }
+                }
+                let metrics = try await web.callAsyncJavaScript("""
+                const content = document.getElementById('content');
+                return {size:parseFloat(getComputedStyle(document.body).fontSize),
+                  height:content.getBoundingClientRect().height,
+                  bounded:content.scrollWidth <= window.innerWidth + 1,
+                  preserved:typographyNode === document.querySelector('#content p') &&
+                    window.getSelection().toString() === typographySelection,
+                  code:parseFloat(getComputedStyle(content.querySelector('code')).fontSize),
+                  button:parseFloat(getComputedStyle(content.querySelector('pre button')).fontSize),
+                  toolbarBounded:[...content.querySelectorAll('pre button')].every(b => {
+                    const p=b.closest('pre').getBoundingClientRect(), r=b.getBoundingClientRect();
+                    return r.top >= p.top && r.bottom <= p.bottom && r.right <= p.right &&
+                      r.left >= p.left &&
+                      [...b.closest('pre').querySelectorAll('button')].every(other => {
+                        if (b === other) return true;
+                        const q = other.getBoundingClientRect();
+                        return r.right <= q.left || q.right <= r.left || r.bottom <= q.top || q.bottom <= r.top;
+                      });
+                  })};
+                """, arguments: [:], in: nil, contentWorld: .page) as! [String: Any]
+                guard abs((metrics["size"] as! Double) - size) < 0.01,
+                      abs((metrics["code"] as! Double) - size * 12 / 13) < 0.01,
+                      abs((metrics["button"] as! Double) - size * 11 / 13) < 0.01,
+                      metrics["toolbarBounded"] as? Bool == true,
+                      metrics["bounded"] as? Bool == true, metrics["preserved"] as? Bool == true else {
+                    throw PerchError("Chat typography layout failed: fullPage=\(fullPage), \(metrics)")
+                }
+                heights.append(metrics["height"] as! Double)
+                precondition(editor.selectedRange() == NSRange(location: 2, length: 4) && editor.string == ai.drafts[AIController.homeID])
+                let send = try frame(host, "发送")
+                let input = try frame(host, "向 AI 提问，输入 @ 引用标签页")
+                precondition(!input.intersects(send) && send.width >= 33 && send.height >= 33)
+                let contentFrame = window.convertToScreen(window.contentView!.bounds)
+                precondition(contentFrame.insetBy(dx: -1, dy: -1).contains(send))
+                try snapshot(host, "\(fullPage ? "full" : "sidebar")-font-\(Int(size))")
+            }
+            precondition(heights[2] > heights[1] && heights[1] > heights[0] && abs(heights[3] - heights[1]) < 1)
+            _ = ai.editMessage(user.id, tab: AIController.homeID)
+            var settings = store.settings; settings.chatFontSize = 22; try store.saveSettings(settings)
+            try await Task.sleep(nanoseconds: 200_000_000)
+            try snapshot(host, "\(fullPage ? "full" : "sidebar")-font-22-edit")
+            ai.cancelEditing(AIController.homeID)
+            print("PASS: \(fullPage ? "full Chat" : "360 pt sidebar") proportional text/history sizing, 11/13/22 pt reflow, centered history sources, Markdown/control bounds and DOM/selection/draft preservation")
+        }
+        let reasoningHost = NSHostingView(rootView: AIReasoningText(text: answer.reasoning!, active: false).frame(height: 150))
+        window.contentView = reasoningHost; window.setContentSize(NSSize(width: 320, height: 150))
+        try await wait { !views(reasoningHost, of: AIReasoningScrollView.self).isEmpty }
+        let reasoning = views(reasoningHost, of: AIReasoningScrollView.self)[0]
+        reasoning.editor.setSelectedRange(NSRange(location: 0, length: 4))
+        PerchTheme.shared.chatFontSize = 11
+        try await wait { abs((reasoning.editor.font?.pointSize ?? 0) - 11 * 12 / 13) < 0.01 }
+        let smallHeight = reasoning.textHeight(width: 320)
+        PerchTheme.shared.chatFontSize = 22
+        try await wait { abs((reasoning.editor.font?.pointSize ?? 0) - 22 * 12 / 13) < 0.01 }
+        precondition(reasoning.textHeight(width: 320) > smallHeight && reasoning.editor.selectedRange().length == 4)
+        try snapshot(reasoningHost, "reasoning-font-22")
+        print("PASS: reasoning text reflows with font size and preserves its native selection")
+    }
+
     static func streamingChecks(baseURL: String) async throws {
         let suite = "dev.perch.streaming.selftest.\(UUID())"
         let defaults = UserDefaults(suiteName: suite)!

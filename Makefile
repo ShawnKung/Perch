@@ -35,6 +35,7 @@ test: verify
 	@"$(BIN)" --self-test
 
 check: test
+	@"$(BIN)" --ai-typography-self-test
 	@python3 tests/ai-self-check.py "$(BIN)"
 	@python3 tests/ai-self-check.py "$(BIN)" --navigation
 	@"$(BIN)" --web-self-test
@@ -49,6 +50,7 @@ test-web: verify
 	@"$(BIN)" --scroll-self-test
 
 test-ai: verify
+	@"$(BIN)" --ai-typography-self-test
 	@python3 tests/ai-self-check.py "$(BIN)"
 
 test-navigation: verify
