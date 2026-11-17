@@ -39,12 +39,14 @@ check: test
 	@python3 tests/ai-self-check.py "$(BIN)" --navigation
 	@"$(BIN)" --web-self-test
 	@"$(BIN)" --web-tabs-self-test
+	@"$(BIN)" --scroll-self-test
 	@"$(BIN)" --ui-self-test --compact
 	@"$(BIN)" --window-self-test
 
 test-web: verify
 	@"$(BIN)" --web-self-test
 	@"$(BIN)" --web-tabs-self-test
+	@"$(BIN)" --scroll-self-test
 
 test-ai: verify
 	@python3 tests/ai-self-check.py "$(BIN)"

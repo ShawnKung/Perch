@@ -133,6 +133,28 @@ extension AISelfCheck {
         precondition(live.sessions[AIController.homeID]?.requestID == nil && live.sessions[AIController.homeID]?.error == nil)
         precondition(live.sessions[AIController.homeID]?.messages.last?.text == String(repeating: "正文增量片段。\n", count: 700))
         print("PASS: buffered SSE renders an intermediate body in the actual root Chat")
+        let chatID = store.selected!
+        store.newTab(address: baseURL + "/background-page")
+        let pageID = store.selected!, page = store.browser!.webView
+        page.loadHTMLString("<!doctype html><p>Background generation fixture</p>", baseURL: URL(string: baseURL))
+        for api in AIProtocol.allCases {
+            var configuration = config
+            configuration.apiProtocol = api
+            precondition(live.save(configuration, key: "synthetic-key"))
+            store.activate(chatID)
+            live.drafts[AIController.homeID] = "Retained draft"
+            precondition(live.send("Streaming fixture", tab: AIController.homeID, browser: nil, usePage: false))
+            try await wait { live.sessions[AIController.homeID]?.messages.last?.text == "第一段" }
+            store.activate(pageID)
+            try await wait { page.window === window }
+            try await wait { live.sessions[AIController.homeID]?.requestID == nil }
+            precondition(live.sessions[AIController.homeID]?.error == nil &&
+                         live.sessions[AIController.homeID]?.messages.last?.text == "第一段\n\n第二段\n\n第三段")
+            precondition(live.drafts[AIController.homeID] == "Retained draft")
+            store.activate(chatID)
+            try await wait { page.window == nil }
+        }
+        print("PASS: all three protocols finish generating while native Chat is off-window and preserve its draft")
     }
     static func experienceChecks(baseURL: String) async throws {
         try await followupControlsChecks()

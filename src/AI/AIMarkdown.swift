@@ -121,6 +121,13 @@ final class AIMarkdownWebView: WKWebView {
     func forwardVerticalScroll(_ event: NSEvent, at point: NSPoint) -> Bool {
         guard !isHiddenOrHasHiddenAncestor, bounds.intersection(visibleRect).contains(point),
               abs(event.scrollingDeltaY) >= abs(event.scrollingDeltaX) else { return false }
+        // Local monitors must respect the window's hit testing, including overlays.
+        if let window, let content = window.contentView {
+            let windowPoint = convert(point, to: nil)
+            let parentPoint = content.superview?.convert(windowPoint, from: nil) ?? windowPoint
+            guard let hit = content.hitTest(parentPoint),
+                  hit === self || hit.isDescendant(of: self) else { return false }
+        }
         let pagePoint = NSPoint(x: point.x, y: isFlipped ? point.y : bounds.height - point.y)
         guard !diagramRects.contains(where: { $0.contains(pagePoint) }) else { return false }
         var parent = superview

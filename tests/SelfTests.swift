@@ -811,7 +811,8 @@ enum WebTabSelfCheck {
         _ = try await second.evaluateJavaScript("scrollTo(0,3100)")
         store.activate(firstID)
         try await Task.sleep(nanoseconds: 200_000_000)
-        let parent = first.superview, firstFrame = first.frame, secondFrame = second.frame
+        var parent = first.superview
+        let firstFrame = first.frame, secondFrame = second.frame
         func state() async throws -> String {
             try await first.evaluateJavaScript("""
                 JSON.stringify([innerWidth,innerHeight,document.getElementById('outer').scrollTop,
@@ -837,7 +838,7 @@ enum WebTabSelfCheck {
         for _ in 0..<6 {
             store.activate(secondID)
             try await Task.sleep(nanoseconds: 80_000_000)
-            precondition(first.isHidden && !second.isHidden && first.window === window && first.superview === parent)
+            precondition(first.window == nil && second.window === window && first.superview === parent)
             precondition(first.frame == firstFrame && second.frame == secondFrame)
             let documentScroll = try await second.evaluateJavaScript("scrollY")
             precondition(documentScroll as? Double == 3100)
@@ -849,7 +850,7 @@ enum WebTabSelfCheck {
         store.newTab()
         let homeID = store.selected!
         try await Task.sleep(nanoseconds: 100_000_000)
-        precondition(first.isHidden && second.isHidden && first.window === window && first.frame == firstFrame)
+        precondition(first.window == nil && second.window == nil && first.frame == firstFrame)
         store.close(homeID)
         store.activate(firstID)
         try await Task.sleep(nanoseconds: 100_000_000)
@@ -857,20 +858,21 @@ enum WebTabSelfCheck {
         precondition(afterHome == before)
         store.openChat(owner: UUID())
         try await Task.sleep(nanoseconds: 200_000_000)
-        precondition(first.isHidden && first.window === window && first.superview === parent && first.frame == firstFrame)
+        precondition(first.window == nil && first.superview === parent && first.frame == firstFrame)
         store.activate(firstID)
         try await Task.sleep(nanoseconds: 200_000_000)
         let afterChat = try await state()
-        precondition(afterChat == before, "Opening Chat must leave hidden webpage state intact")
+        precondition(afterChat == before, "Opening Chat must leave detached webpage state intact")
         let root = window.contentView!
         var hit = root.hitTest(root.convert(NSPoint(x: first.bounds.midX, y: first.bounds.midY), from: first))
         while hit != nil && hit !== first { hit = hit?.superview }
         precondition(hit === first, "Browser status overlays must not intercept page clicks")
         window.setContentSize(NSSize(width: 950, height: 700))
         try await AISelfCheck.wait { first.frame != firstFrame }
-        precondition(second.frame == secondFrame, "Actual resizing must not resize hidden pages")
+        precondition(second.frame == secondFrame, "Actual resizing must not resize detached pages")
         store.activate(secondID)
         try await AISelfCheck.wait { second.frame != secondFrame }
+        parent = nil
         store.close(firstID)
         try await AISelfCheck.wait { first.superview == nil }
         print("PASS: real RootView tab switches preserve document and nested scrolling, viewport, input, selection and JS identity with no resize events; home/Chat round trips, page click routing, actual resizing and closed-page removal")

@@ -1127,11 +1127,11 @@ final class AIController: ObservableObject {
         conversations[copy.id] = copy; saveConversations()
         return copy.id
     }
-    func seedPreview() {
+    func seedPreview(answer: String? = nil) {
         guard defaults !== UserDefaults.standard else { return }
         sessions[Self.homeID] = AISession(messages: [
             AIMessage(role: "user", text: "请结合这份笔记，整理一下重点。", source: "选中文字", sourceURL: URL(string: "https://example.com/notes"), timestamp: Date().addingTimeInterval(-60)),
-            AIMessage(role: "assistant", text: """
+            AIMessage(role: "assistant", text: answer ?? """
             ## 三个重点
             1. **模型供应商**：分别维护自己的接口和模型。
             2. **引用和附件**：网页、PDF、代码和图片都可以作为参考。

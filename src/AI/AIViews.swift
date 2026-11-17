@@ -88,7 +88,9 @@ struct AIChatScrollPosition: NSViewRepresentable {
             restoring = position != nil
         }
         func connect() {
-            guard scroll == nil, let probe, probe.window != nil else { return }
+            guard let probe else { return }
+            guard probe.window != nil else { stop(); return }
+            guard scroll == nil else { return }
             var ancestor = probe.superview
             while ancestor != nil && !(ancestor is NSScrollView) { ancestor = ancestor?.superview }
             guard let scroll = ancestor as? NSScrollView else { return }
@@ -800,8 +802,13 @@ final class AIReasoningScrollView: NSScrollView {
             let number = NSWindow.windowNumber(at: screenPoint, belowWindowWithWindowNumber: 0)
             guard number == window.windowNumber else { return event }
             let point = window.convertPoint(fromScreen: screenPoint)
+            guard let content = window.contentView,
+                  let hit = content.hitTest(content.superview?.convert(point, from: nil) ?? point) else {
+                return event
+            }
             let hitRect = self.bounds.intersection(self.visibleRect)
-            if hitRect.contains(self.convert(point, from: nil)) {
+            if hitRect.contains(self.convert(point, from: nil)),
+               hit === self || hit.isDescendant(of: self) {
                 self.scrollWheel(with: event)
                 return nil
             }
@@ -813,14 +820,15 @@ final class AIReasoningScrollView: NSScrollView {
             var parent = self.superview
             while let view = parent {
                 if let scroll = view as? NSScrollView,
+                   hit === scroll || hit.isDescendant(of: scroll),
                    scroll.bounds.intersection(scroll.visibleRect).contains(scroll.convert(point, from: nil)) {
                     NotificationCenter.default.post(name: .aiChatUserScroll, object: scroll)
                     scroll.scrollAIWheelContents(with: event)
-                    break
+                    return nil
                 }
                 parent = view.superview
             }
-            return nil
+            return event
         }
     }
 
@@ -1327,9 +1335,12 @@ struct AIChatSidebar: View {
                                 .buttonStyle(.plain).help("停止生成").accessibilityLabel("停止生成")
                         }
                         if canEdit && (!busy || !input.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !(ai.draftFiles[tab] ?? []).isEmpty) {
-                            Button(action: send) { Image(systemName: "arrow.up").font(.system(size: 13, weight: .semibold)).frame(width: 28, height: 28) }
-                                .buttonStyle(.plain).foregroundStyle(.white).background(Style.accent, in: Circle())
-                                .frame(width: 34, height: 34)
+                            Button(action: send) {
+                                Image(systemName: "arrow.up").font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(.white).frame(width: 28, height: 28)
+                                    .background(Style.accent, in: Circle())
+                                    .frame(width: 34, height: 34).contentShape(Rectangle())
+                            }.buttonStyle(.plain)
                                 .disabled((input.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && (ai.draftFiles[tab] ?? []).isEmpty) ||
                                           input.wrappedValue.count > 8000 || fileTask != nil || !ai.ready(for: tab))
                                 .accessibilityLabel(busy && !editing ? "加入发送队列" : "发送")

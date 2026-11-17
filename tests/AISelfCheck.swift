@@ -1689,6 +1689,35 @@ enum AISelfCheck {
             }
             let prefix = fullPage ? "full" : "sidebar"
             try snapshot(prefix + "-idle")
+            for offset in [NSPoint.zero, NSPoint(x: 8, y: -9),
+                           NSPoint(x: -15, y: 0), NSPoint(x: 15, y: 0),
+                           NSPoint(x: 0, y: -15), NSPoint(x: 0, y: 15),
+                           NSPoint(x: -15, y: -15), NSPoint(x: 15, y: -15),
+                           NSPoint(x: -15, y: 15), NSPoint(x: 15, y: 15)] {
+                store.ai.drafts[owner] = "button hit fixture"
+                try await wait { element(in: host, label: "发送") != nil }
+                host.layoutSubtreeIfNeeded()
+                let rect = try frame("发送")
+                precondition(abs(rect.width - 34) < 1 && abs(rect.height - 34) < 1,
+                             "Send accessibility frame must cover the complete button label")
+                let count = store.ai.sessions[owner]?.messages.count ?? 0
+                let point = window.convertPoint(fromScreen: NSPoint(x: rect.midX + offset.x, y: rect.midY + offset.y))
+                for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                    NSApp.sendEvent(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
+                        timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                        context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!)
+                }
+                do {
+                    try await wait {
+                        (store.ai.sessions[owner]?.messages.count ?? 0) > count && store.ai.drafts[owner] == ""
+                    }
+                } catch {
+                    throw PerchError("\(prefix) send click missed at \(offset): \(error.localizedDescription)")
+                }
+                try await wait { store.ai.sessions[owner]?.requestID == nil }
+            }
+            print("PASS: \(prefix) send button accepts center, arrow edge, four sides and four corners")
+            store.ai.drafts[owner] = "native queue start fixture"
             precondition(store.ai.send(store.ai.drafts[owner]!, tab: owner, browser: nil, usePage: false))
             store.ai.drafts[owner] = ""
             try await wait { element(in: host, label: "停止生成") != nil && element(in: host, label: "发送") == nil }
@@ -1857,11 +1886,13 @@ enum AISelfCheck {
         window.setContentSize(NSSize(width: 1000, height: 650))
         let root = NSHostingView(rootView: RootView(store: store).defaultAppStorage(defaults))
         window.contentView = root
+        try await Task.sleep(nanoseconds: 100_000_000)
+        precondition(editor(in: root) == nil, "Closed AI sidebar must not construct a hidden composer")
+        root.layoutSubtreeIfNeeded()
+        let closedX = root.bounds.maxX
+        store.aiVisible = true
         try await wait { editor(in: root) != nil }
         let sideInput = editor(in: root)!
-        root.layoutSubtreeIfNeeded()
-        let closedX = sideInput.convert(sideInput.bounds, to: root).minX
-        store.aiVisible = true
         var samples: [CGFloat] = []
         for _ in 0..<18 {
             try await Task.sleep(nanoseconds: 20_000_000)
@@ -1874,8 +1905,8 @@ enum AISelfCheck {
             precondition(samples.contains { $0 > openedX + 5 && $0 < closedX - 5 }, "AI sidebar must pass through intermediate positions")
         }
         store.aiVisible = false
-        try await wait { sideInput.convert(sideInput.bounds, to: root).minX > closedX - 2 }
-        print("PASS: native right sidebar animated intermediate positions and closing layout")
+        try await wait { editor(in: root) == nil && sideInput.window == nil }
+        print("PASS: native right sidebar animates open and removes its composer when closed")
         store.ai.drafts[AIController.homeID] = "Continue here"
         store.openChat(owner: AIController.homeID)
         window.contentView = NSHostingView(rootView: RootView(store: store).defaultAppStorage(defaults))
@@ -2336,17 +2367,36 @@ enum AISelfCheck {
         precondition(store.restoreReference(AIPageReference(title: "invalid", url: URL(string: "file:///tmp"))) == nil)
         precondition(forkOwner != editOwner)
         print("PASS: rewind/Fork preview and native Esc, Ctrl/Shift selection, same-tab new conversation, contained plus, hover archive and reference recovery")
-        try await wait { markdownViews(in: historyRoot).contains { $0.visibleRect.width > 20 && $0.visibleRect.height > 20 && $0.bounds.height > 300 } }
-        let answer = markdownViews(in: historyRoot).first { $0.visibleRect.width > 20 && $0.visibleRect.height > 20 && $0.bounds.height > 300 }!
+        func scrollableText() -> (AIMarkdownWebView, NSPoint)? {
+            for answer in markdownViews(in: historyRoot) where answer.bounds.height > 300 {
+                let viewport = answer.bounds.intersection(answer.visibleRect)
+                guard viewport.width > 20, viewport.height > 20 else { continue }
+                for fraction in [0.1, 0.5, 0.9] {
+                    let point = NSPoint(x: viewport.midX, y: viewport.minY + viewport.height * fraction)
+                    let pagePoint = NSPoint(x: point.x, y: answer.isFlipped ? point.y : answer.bounds.height - point.y)
+                    guard !answer.diagramRects.contains(where: { $0.contains(pagePoint) }) else { continue }
+                    let windowPoint = answer.convert(point, to: nil)
+                    let hit = historyRoot.hitTest(historyRoot.superview?.convert(windowPoint, from: nil) ?? windowPoint)
+                    if hit === answer || hit?.isDescendant(of: answer) == true { return (answer, point) }
+                }
+            }
+            return nil
+        }
+        try await wait { scrollableText() != nil }
+        let (answer, textPoint) = scrollableText()!
         var ancestor = answer.superview
         while ancestor != nil && !(ancestor is NSScrollView) { ancestor = ancestor?.superview }
         let conversationScroll = ancestor as! NSScrollView
         let offset = conversationScroll.contentView.bounds.origin.y
         let scrollEvent = NSEvent(cgEvent: CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1,
             wheel1: offset > 50 ? 90 : -90, wheel2: 0, wheel3: 0)!)!
-        answer.scrollWheel(with: scrollEvent)
+        guard answer.forwardVerticalScroll(scrollEvent, at: textPoint) else {
+            throw PerchError("Full Chat must forward wheels over visible answer text")
+        }
         try await Task.sleep(nanoseconds: 150_000_000)
-        precondition(abs(conversationScroll.contentView.bounds.origin.y - offset) > 10, "The actual full Chat view must scroll when the wheel is over an answer")
+        guard abs(conversationScroll.contentView.bounds.origin.y - offset) > 10 else {
+            throw PerchError("Full Chat wheel did not move its conversation: before=\(offset), after=\(conversationScroll.contentView.bounds.origin.y)")
+        }
         print("PASS: real full Chat hierarchy scrolls over rendered answer text")
         var queueConfig = config
         queueConfig.baseURL = config.baseURL.replacingOccurrences(of: "/v1", with: "/slow")

@@ -33,6 +33,10 @@ struct Site: Identifiable, Codable {
 
 final class PageWebView: WKWebView {
     var extendMenu: ((NSMenu) -> Void)?
+    private let scrollRouting = ScrollRouting()
+    override func scrollWheel(with event: NSEvent) {
+        for routed in scrollRouting.events(for: event) { super.scrollWheel(with: routed) }
+    }
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         window?.acceptsMouseMovedEvents = true
@@ -111,6 +115,8 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         configuration.userContentController.add(bridge, contentWorld: .defaultClient, name: "perchPassword")
         configuration.userContentController.addUserScript(WKUserScript(source: PasswordBridge.script,
             injectionTime: .atDocumentStart, forMainFrameOnly: true, in: .defaultClient))
+        configuration.userContentController.addUserScript(WKUserScript(source: ScrollRouting.script,
+            injectionTime: .atDocumentStart, forMainFrameOnly: false, in: .defaultClient))
         if let tracker {
             configuration.userContentController.add(tracker, contentWorld: .defaultClient, name: "perchHoverLink")
             configuration.userContentController.addUserScript(WKUserScript(source: HoverLinkTracker.script,
@@ -429,7 +435,7 @@ final class Store: ObservableObject {
     @Published var settings: BrowserSettings
     @Published var icons: [UUID: NSImage] = [:]
     private var browsers: [UUID: Browser] = [:]
-    private let defaults: UserDefaults
+    let defaults: UserDefaults
     func cachedFavicon(_ address: String) -> NSImage? { FaviconCache.image(for: address, defaults: defaults) }
     func openBookmarks(history: Bool = false) {
         libraryShowsHistory = history
@@ -479,6 +485,7 @@ final class Store: ObservableObject {
         guard let selected else { return nil }
         return browsers[selected]
     }
+    func cachedBrowser(for id: UUID) -> Browser? { browsers[id] }
 
     func open(_ site: Site) {
         newTab(address: site.address, title: site.title)
@@ -649,6 +656,7 @@ final class Store: ObservableObject {
         recentlyClosed = Array(recentlyClosed.suffix(20))
         if let browser = browsers.removeValue(forKey: id) {
             browser.passwordBridge.dismiss(); browser.favicon.reset(); browser.webView.stopLoading()
+            browser.webView.removeFromSuperview()
         }
         icons.removeValue(forKey: id)
         if selected == id {
@@ -1127,38 +1135,30 @@ struct WebContent: NSViewRepresentable {
     let browser: Browser
     func makeNSView(context: Context) -> WebPageContainer { WebPageContainer() }
     func updateNSView(_ view: WebPageContainer, context: Context) {
-        view.show(pages: [browser.webView], selected: browser.webView)
+        view.show(browser.webView)
     }
 }
 
 final class WebPageContainer: NSView {
-    private var selected: WKWebView?
+    private var page: WKWebView?
 
-    func show(pages: [WKWebView], selected: WKWebView?) {
-        for view in subviews where !pages.contains(where: { $0 === view }) { view.removeFromSuperview() }
-        for page in pages where page.superview !== self {
-            page.isHidden = true
-            addSubview(page)
-        }
-        self.selected = selected
-        for page in pages { page.isHidden = page !== selected }
+    func show(_ page: WKWebView) {
+        for view in subviews where view !== page { view.removeFromSuperview() }
+        if page.superview !== self { addSubview(page) }
+        self.page = page
         needsLayout = true
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window != nil { needsLayout = true }
     }
 
     override func layout() {
         super.layout()
-        // Hidden pages keep their viewport; only the visible page follows actual container resizing.
-        guard let selected, bounds.width > 0, bounds.height > 0 else { return }
-        if selected.frame != bounds { selected.frame = bounds }
-    }
-}
-
-struct WebTabsContent: NSViewRepresentable {
-    @ObservedObject var store: Store
-    func makeNSView(context: Context) -> WebPageContainer { WebPageContainer() }
-    func updateNSView(_ view: WebPageContainer, context: Context) {
-        view.show(pages: store.loadedReferencePages.map(\.webView),
-                  selected: store.browser?.webView)
+        // The native tab controller owns visibility; detached pages keep their viewport.
+        guard window != nil, let page, bounds.width > 0, bounds.height > 0 else { return }
+        if page.frame != bounds { page.frame = bounds }
     }
 }
 
@@ -1601,33 +1601,9 @@ struct RootView: View {
                                 sidebarCollapsed = false; sidebarWidth = 145
                             } else if !sidebarCollapsed { sidebarWidth = width }
                         }
-                    VStack(spacing: 0) {
-                        if !store.isChatPage { HStack(spacing: 6) {
-                            if let browser = store.browser {
-                                BrowserAddressBar(browser: browser, store: store).id(ObjectIdentifier(browser))
-                            } else { HomeAddressBar(store: store) }
-                            WindowTools(store: store)
-                        }.frame(height: 28).padding(.horizontal, 8).padding(.leading, controlsInset)
-                            .padding(.vertical, 8).background(Style.paper).background(WindowDragArea()).zIndex(10) }
-                        ZStack {
-                            WebTabsContent(store: store)
-                            if let chatTab = store.tabs.first(where: { $0.chatOwner != nil }), let owner = chatTab.chatOwner {
-                                AIChatSidebar(store: store, ai: store.ai, fullPage: true,
-                                              owner: owner,
-                                              windowControlsInset: controlsInset) { if let id = store.selected { store.close(id) } }
-                                    .opacity(store.isChatPage ? 1 : 0)
-                                    .allowsHitTesting(store.isChatPage)
-                                    .disabled(!store.isChatPage)
-                                    .accessibilityHidden(!store.isChatPage)
-                            }
-                            if !store.isChatPage, let browser = store.browser {
-                                BrowserScreen(browser: browser)
-                            } else if !store.isChatPage {
-                                HomeScreen(store: store)
-                            }
-                        }.modifier(ContentTopChrome(enabled: !store.isChatPage))
-                    }.frame(maxWidth: .infinity, maxHeight: .infinity)
-                    if !store.isChatPage { HStack(spacing: 0) {
+                    TabContents(store: store, controlsInset: controlsInset)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    if store.aiVisible && !store.isChatPage { HStack(spacing: 0) {
                         SidebarResizeHandle(changed: { translation in
                             if aiDragWidth == nil { aiDragWidth = aiSize(geometry.size.width) }
                             aiWidth = min(max(aiDragWidth! - translation, 260), 480)
@@ -1639,10 +1615,9 @@ struct RootView: View {
                         AIChatSidebar(store: store, ai: store.ai) { store.aiVisible = false }
                             .id(store.chatOwner)
                             .frame(width: aiSize(geometry.size.width))
-                    }.frame(width: store.aiVisible && !store.isChatPage ? aiSize(geometry.size.width) + 1 : 0, alignment: .leading)
-                        .clipped().allowsHitTesting(store.aiVisible && !store.isChatPage)
-                        .disabled(!store.aiVisible || store.isChatPage)
-                        .accessibilityHidden(!store.aiVisible || store.isChatPage)
+                    }.frame(width: aiSize(geometry.size.width) + 1, alignment: .leading)
+                        .clipped()
+                        .transition(.move(edge: .trailing))
                     }
                 }.overlay(alignment: .topLeading) {
                     ZStack(alignment: .topLeading) {
@@ -2221,7 +2196,16 @@ static func main() throws {
 var appearanceDefaults = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
 appearanceDefaults["AppleShowScrollBars"] = "WhenScrolling"
 UserDefaults.standard.setVolatileDomain(appearanceDefaults, forName: UserDefaults.argumentDomain)
-if CommandLine.arguments.contains("--web-tabs-self-test") {
+if CommandLine.arguments.contains("--scroll-self-test") {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.regular)
+    Task { @MainActor in
+        setbuf(stdout, nil)
+        do { try await ScrollSelfCheck.run(); exit(0) }
+        catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
+    }
+    app.run()
+} else if CommandLine.arguments.contains("--web-tabs-self-test") {
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)
     Task { @MainActor in
