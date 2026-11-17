@@ -1418,6 +1418,7 @@ struct AIChatSidebar: View {
         return true
     }
     private func send() {
+        let tab = tab
         guard canEdit, ai.ready(for: tab), fileTask == nil,
               !input.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !(ai.draftFiles[tab] ?? []).isEmpty,
               input.wrappedValue.count <= 8000 else { return }
@@ -1686,14 +1687,18 @@ struct AIComposerInput: NSViewRepresentable {
         }
         func handleReturn(_ event: NSEvent, editor: NSTextView) -> Bool {
             guard !editor.hasMarkedText() else { return false }
+            // Keychain waits can run SwiftUI updates that replace parent during this callback.
+            let composer = parent
+            defer { withExtendedLifetime(composer) {} }
             let flags = event.modifierFlags.intersection([.command, .shift, .control, .option])
-            if flags.isEmpty, parent.mentionCommand(NSSelectorFromString("insertNewline:")) { return true }
-            let shouldSend = flags == (parent.sendWithCommand ? [.command] : [])
+            if flags.isEmpty, composer.mentionCommand(NSSelectorFromString("insertNewline:")) { return true }
+            let shouldSend = flags == (composer.sendWithCommand ? [.command] : [])
             if shouldSend {
-                parent.text = editor.string
-                parent.send()
+                let submitted = editor.string
+                composer.text = submitted
+                composer.send()
                 // Clear before a late native notification can publish the submitted text again.
-                if parent.text.isEmpty, !editor.string.isEmpty {
+                if composer.text.isEmpty, editor.string == submitted, !editor.string.isEmpty {
                     updating = true
                     editor.string = ""
                     editor.setSelectedRange(NSRange(location: 0, length: 0))
