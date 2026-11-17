@@ -114,6 +114,7 @@ struct Tab: Identifiable, Codable {
     var address: String
     var pinned = false
     var chatOwner: UUID?
+    var aiOwner: UUID?
     var aiSidebarOpen: Bool?
 }
 
