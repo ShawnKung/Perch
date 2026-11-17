@@ -86,6 +86,34 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     @Published var httpAlternative: URL?
     @Published var finding = false
     @Published var findQuery = ""
+    @Published private(set) var zoomVisible = false
+    @Published private(set) var zoomPercent = 100
+    private var zoomDismissal: Task<Void, Never>?
+    private var zoomHovered = false
+
+    func changeZoom(_ change: Int) {
+        let current = webView.pageZoom
+        let value = change == 0 ? 1 : (change > 0 ? min(3, current * 1.1) : max(0.3, current / 1.1))
+        webView.pageZoom = value
+        zoomPercent = Int((value * 100).rounded())
+        zoomVisible = true
+        scheduleZoomDismissal()
+    }
+
+    func setZoomHovered(_ hovered: Bool) {
+        zoomHovered = hovered
+        scheduleZoomDismissal()
+    }
+
+    private func scheduleZoomDismissal() {
+        zoomDismissal?.cancel()
+        guard !zoomHovered else { return }
+        zoomDismissal = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard !Task.isCancelled else { return }
+            self?.zoomVisible = false
+        }
+    }
     func find(backward: Bool = false) {
         guard !findQuery.isEmpty else { return }
         let configuration = WKFindConfiguration()
@@ -1181,6 +1209,13 @@ final class WebPageContainer: NSView {
     }
 }
 
+struct BookmarkButtonAnchor: PreferenceKey {
+    static var defaultValue: Anchor<CGRect>?
+    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) {
+        value = nextValue() ?? value
+    }
+}
+
 struct BrowserAddressBar: View {
     @ObservedObject private var theme = PerchTheme.shared
     @ObservedObject var browser: Browser
@@ -1205,6 +1240,7 @@ struct BrowserAddressBar: View {
                     }
                     .disabled(URLInput.parse(browser.address, search: false) == nil)
                     .accessibilityValue(saved ? "已收藏" : "未收藏")
+                    .anchorPreference(key: BookmarkButtonAnchor.self, value: .bounds) { $0 }
                     .padding(.trailing, 3)
                 }.background(Style.paper, in: RoundedRectangle(cornerRadius: 8))
                     .overlay(RoundedRectangle(cornerRadius: 8).stroke(Style.line, lineWidth: 1).allowsHitTesting(false))
@@ -1255,6 +1291,60 @@ struct BrowserScreen: View {
                 Spacer(minLength: 0)
             }
         }
+    }
+}
+
+struct BrowserZoomOverlay: View {
+    @ObservedObject var browser: Browser
+    let bookmark: CGRect
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        GeometryReader { _ in
+            if browser.zoomVisible {
+                BrowserZoomControls(browser: browser)
+                    .fixedSize()
+                    .position(x: bookmark.midX, y: bookmark.maxY + 8 + 22)
+                    .transition(.opacity)
+            }
+        }
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.18), value: browser.zoomVisible)
+    }
+}
+
+struct BrowserZoomControls: View {
+    @ObservedObject private var theme = PerchTheme.shared
+    @ObservedObject var browser: Browser
+
+    var body: some View {
+        HStack(spacing: 4) {
+            GlyphButton(symbol: "minus", label: "缩小", size: 32) { browser.changeZoom(-1) }
+                .disabled(browser.webView.pageZoom <= 0.3)
+            Text("\(browser.zoomPercent)%")
+                .font(.system(size: 13, weight: .medium).monospacedDigit())
+                .frame(width: 48)
+                .accessibilityLabel("网页缩放比例")
+            GlyphButton(symbol: "plus", label: "放大", size: 32) { browser.changeZoom(1) }
+                .disabled(browser.webView.pageZoom >= 3)
+            Button { browser.changeZoom(0) } label: {
+                Text("重置")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(browser.webView.pageZoom == 1 ? Style.muted : Style.accent)
+                    .frame(width: 54, height: 30)
+                    .background(Style.sidebar, in: RoundedRectangle(cornerRadius: 7))
+                    .overlay(RoundedRectangle(cornerRadius: 7).stroke(Style.line, lineWidth: 1).allowsHitTesting(false))
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(browser.webView.pageZoom == 1)
+            .help("重置缩放比例")
+        }
+        .padding(6)
+        .background(Style.paper, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Style.line, lineWidth: 1).allowsHitTesting(false))
+        .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
+        .onHover { browser.setZoomHovered($0) }
+        .onDisappear { browser.setZoomHovered(false) }
     }
 }
 
@@ -2081,9 +2171,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc func findPage() { activeBrowser?.finding = true }
     @objc func findNext() { activeBrowser?.find() }
     @objc func findPrevious() { activeBrowser?.find(backward: true) }
-    @objc func zoomIn() { if let view = activeBrowser?.webView { view.pageZoom = min(3, view.pageZoom * 1.1) } }
-    @objc func zoomOut() { if let view = activeBrowser?.webView { view.pageZoom = max(0.3, view.pageZoom / 1.1) } }
-    @objc func resetZoom() { activeBrowser?.webView.pageZoom = 1 }
+    @objc func zoomIn() { activeBrowser?.changeZoom(1) }
+    @objc func zoomOut() { activeBrowser?.changeZoom(-1) }
+    @objc func resetZoom() { activeBrowser?.changeZoom(0) }
     @objc func nextTab() { switchTab(by: 1) }
     @objc func previousTab() { switchTab(by: -1) }
     private func switchTab(by offset: Int) {
