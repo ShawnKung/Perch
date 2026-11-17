@@ -59,6 +59,83 @@ extension AISelfCheck {
             precondition(oldMessage.timestamp == nil)
             print("PASS: \(api.rawValue) publishes and renders every text prefix before stream completion")
         }
+        let store = Store(defaults: defaults)
+        for api in AIProtocol.allCases {
+            for fullPage in [true, false] {
+                var config = AIConfiguration(provider: .custom, baseURL: baseURL + "/streaming", model: "fixture")
+                config.apiProtocol = api
+                precondition(ai.save(config, key: "synthetic-key"))
+                let tab = UUID()
+                let host = NSHostingView(rootView: AIChatSidebar(store: store, ai: ai, fullPage: fullPage, owner: tab, close: {})
+                    .defaultAppStorage(defaults))
+                let window = NSWindow(contentRect: NSRect(x: 120, y: 160, width: fullPage ? 850 : 360, height: 650),
+                                      styleMask: [.titled], backing: .buffered, defer: false)
+                window.contentView = host; window.orderFront(nil)
+                defer { window.orderOut(nil); window.contentView = nil }
+                func renderer(_ view: NSView) -> WKWebView? {
+                    (view as? WKWebView) ?? view.subviews.lazy.compactMap { renderer($0) }.first
+                }
+                precondition(ai.send("Thinking streaming fixture", tab: tab, browser: nil, usePage: false))
+                try await wait { ai.sessions[tab]?.messages.last?.reasoning?.count ?? 0 > 1000 }
+                guard renderer(host) == nil else { throw PerchError("Body renderer was created before the first text delta") }
+                for prefix in ["第一段", "第一段\n\n第二段", "第一段\n\n第二段\n\n第三段"] {
+                    try await wait { ai.sessions[tab]?.messages.last?.text == prefix }
+                    let received = Date()
+                    let expected = prefix.components(separatedBy: .whitespacesAndNewlines).joined()
+                    let deadline = Date().addingTimeInterval(2)
+                    var rendered = ""
+                    while rendered != expected && Date() < deadline {
+                        if let web = renderer(host) {
+                            rendered = (try? await web.evaluateJavaScript("document.getElementById('content').textContent.replace(/\\s/g,'')")) as? String ?? ""
+                        }
+                        if rendered != expected { try await Task.sleep(nanoseconds: 20_000_000) }
+                    }
+                    guard rendered == expected, ai.sessions[tab]?.requestID != nil else {
+                        throw PerchError("Chat body failed to stream after thinking: \(api.rawValue), fullPage=\(fullPage), rendered=\(rendered)")
+                    }
+                    print("STREAM: \(api.rawValue), fullPage=\(fullPage), visible=\(rendered), delay=\(Date().timeIntervalSince(received))")
+                }
+                try await wait { ai.sessions[tab]?.requestID == nil }
+                precondition(ai.sessions[tab]?.error == nil)
+            }
+        }
+        print("PASS: full Chat and sidebar render each body prefix after long thinking, before completion")
+        let config = AIConfiguration(provider: .custom, baseURL: baseURL + "/streaming", model: "fixture")
+        precondition(store.ai.save(config, key: "synthetic-key"))
+        store.openChat(owner: AIController.homeID)
+        for _ in 0..<23 {
+            precondition(store.ai.send("History streaming fixture", tab: AIController.homeID, browser: nil, usePage: false))
+            try await wait { store.ai.sessions[AIController.homeID]?.requestID == nil }
+        }
+        let host = NSHostingView(rootView: RootView(store: store).defaultAppStorage(defaults))
+        let window = NSWindow(contentRect: NSRect(x: 120, y: 160, width: 1000, height: 720),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.contentView = host; window.orderFront(nil)
+        defer { window.orderOut(nil); window.contentView = nil }
+        let live = store.ai
+        precondition(live.send("Burst streaming fixture", tab: AIController.homeID, browser: nil, usePage: false))
+        var lengths: [Int] = []
+        let deadline = Date().addingTimeInterval(12)
+        func answer(_ view: NSView) -> WKWebView? {
+            if let web = view as? AIMarkdownWebView,
+               (web.navigationDelegate as? AIMarkdownView.Coordinator)?.text.hasPrefix("正文增量片段") == true { return web }
+            return view.subviews.lazy.compactMap { answer($0) }.first
+        }
+        while Date() < deadline, live.sessions[AIController.homeID]?.requestID != nil {
+            if let web = answer(host),
+               let count = try? await web.evaluateJavaScript("document.getElementById('content').textContent.length") as? Int,
+               count > 0, lengths.last != count {
+                lengths.append(count)
+                print("BURST: rendered=\(count), model=\(live.sessions[AIController.homeID]?.messages.last?.text.count ?? 0)")
+            }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        guard lengths.contains(where: { $0 > 0 && $0 < 2800 }) else {
+            throw PerchError("Buffered SSE only rendered the completed body: \(lengths)")
+        }
+        precondition(live.sessions[AIController.homeID]?.requestID == nil && live.sessions[AIController.homeID]?.error == nil)
+        precondition(live.sessions[AIController.homeID]?.messages.last?.text == String(repeating: "正文增量片段。\n", count: 700))
+        print("PASS: buffered SSE renders an intermediate body in the actual root Chat")
     }
     static func experienceChecks(baseURL: String) async throws {
         try await followupControlsChecks()

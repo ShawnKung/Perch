@@ -385,6 +385,33 @@ class Provider(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json" if self.path.startswith("/json") else "text/event-stream")
             self.end_headers()
             if self.path.startswith("/streaming"):
+                if content == "History streaming fixture":
+                    self.event(("# 历史回答\n\n" + "历史正文与阅读位置。\n\n" * 150))
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                    return
+                if content == "Burst streaming fixture":
+                    self.sse({"choices": [{"delta": {"reasoning_content": "长思考。\n" * 600}}]})
+                    time.sleep(0.6)
+                    # A buffered network read must not starve the UI while consuming many events.
+                    data = "".join("data: " + json.dumps({"choices": [{"delta": {"content": "正文增量片段。\n"}}]},
+                                                        ensure_ascii=False) + "\n\n" for _ in range(700))
+                    self.wfile.write(data.encode())
+                    self.wfile.flush()
+                    time.sleep(0.6)
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                    return
+                thinking = content == "Thinking streaming fixture"
+                if thinking:
+                    for text in ["思考中的逐段内容。\n" * 150, "继续检查正文显示。\n" * 150]:
+                        if responses:
+                            self.sse({"type": "response.reasoning_summary_text.delta", "output_index": 0, "delta": text})
+                        elif anthropic:
+                            self.sse({"type": "content_block_delta", "index": 1, "delta": {"type": "thinking_delta", "thinking": text}})
+                        else:
+                            self.sse({"choices": [{"delta": {"reasoning_content": text}}]})
+                        time.sleep(0.6)
                 for text in ["第一段", "\n\n第二段", "\n\n第三段"]:
                     if responses:
                         self.sse({"type": "response.output_text.delta", "delta": text})
