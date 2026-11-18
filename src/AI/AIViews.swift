@@ -982,7 +982,7 @@ struct AIChatSidebar: View {
     @State private var hoveredMessage: UUID?
     @State private var messageFrames: [UUID: CGRect] = [:]
     @State private var readyConversation: UUID?
-    @AppStorage("chatHistoryWidth") private var historyWidth = 240.0
+    @AppStorage(LayoutPreference.chatHistoryWidth.rawValue) private var historyWidth = 240.0
     @State private var historyDragWidth: Double?
     @State private var liveHistoryWidth: Double?
     private var tab: UUID { owner ?? store.chatOwner }

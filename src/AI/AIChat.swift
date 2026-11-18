@@ -827,6 +827,16 @@ final class AIController: ObservableObject {
     }
     var ready: Bool { !damaged && configuration.endpoint != nil && configuration.models.contains(configuration.model) && hasKey }
     var needsReset: Bool { damaged }
+    var canRestoreSettings: Bool { !damaged && !damagedSearch }
+    func restoreSettings(_ backup: SettingsBackup) {
+        providers = backup.providers
+        configuration = providers.first(where: { $0.id == backup.selectedProvider }) ?? providers[0]
+        searchConfiguration = backup.search
+        keyedProviders = []; hasKey = false; searchHasKey = false
+        settingsError = nil; searchSettingsError = nil
+        // Live requests retain their captured configuration; drafts and conversations stay intact.
+        selections.removeAll(); selectedModels.removeAll()
+    }
     private func refreshKey() {
         do {
             keyedProviders = Set(try providers.filter { value in try value.account.flatMap { try keys.read($0) } != nil }.map(\.id))

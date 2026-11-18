@@ -126,7 +126,7 @@ struct Visit: Identifiable, Codable {
 }
 
 enum LibraryPage: String, Identifiable, CaseIterable {
-    case settings = "常规", ai = "AI", bookmarks = "书签与历史", passwords = "密码", importer = "导入"
+    case settings = "常规", ai = "AI", bookmarks = "书签与历史", passwords = "密码", importer = "导入导出"
     var id: String { rawValue }
 }
 
@@ -470,13 +470,13 @@ struct SettingsPage: View {
     var body: some View {
         Form {
             Section("启动") {
-                Toggle("启动 Perch 时打开主窗口", isOn: $draft.showWindowOnLaunch)
                 Toggle("登录 Mac 时启动 Perch", isOn: Binding(get: { login }, set: { enabled in
                     do {
-                        if enabled { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+                        try LaunchAtLogin.set(enabled)
                     } catch { message = error.localizedDescription }
                     refreshLogin()
                 }))
+                Toggle("启动 Perch 时打开主窗口", isOn: $draft.showWindowOnLaunch)
                 if !loginStatus.isEmpty {
                     Text(loginStatus).font(.caption).foregroundStyle(.secondary)
                 }
@@ -610,15 +610,14 @@ struct SettingsPage: View {
     private var chatFontSetting: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 12) {
-                Text("Chat 正文字号")
+                Text("Chat字号")
                 Slider(value: $draft.chatFontSize, in: BrowserSettings.chatFontSizeRange, step: 1)
-                    .accessibilityLabel("Chat 正文字号")
+                    .accessibilityLabel("Chat字号")
                     .accessibilityValue("\(Int(draft.chatFontSize)) pt")
                 Text("\(Int(draft.chatFontSize)) pt").monospacedDigit().frame(width: 42, alignment: .trailing)
                 Button("恢复默认") { draft.chatFontSize = BrowserSettings.defaultChatFontSize }
                     .disabled(draft.chatFontSize == BrowserSettings.defaultChatFontSize)
             }
-            Text("以正文字号为基准，标题、历史列表和其他 Chat 文字按比例调整。").font(.caption).foregroundStyle(.secondary)
         }
     }
 

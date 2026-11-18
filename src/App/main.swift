@@ -471,6 +471,7 @@ final class Store: ObservableObject {
     }
     private var protectedKeys = Set<String>()
     var changeWindow: (() -> Void)?
+    var restoreWindowPlacement: (() -> Void)?
     var hideWindow: (() -> Void)?
     var applyHotkeys: ((BrowserSettings) throws -> Void)?
     var shortcutRecording: ((Bool) -> Void)?
@@ -491,7 +492,7 @@ final class Store: ObservableObject {
         PerchTheme.shared.chatFontSize = settings.chatFontSize
         if let data = defaults.data(forKey: "sites") {
             do { sites = try JSONDecoder().decode([Site].self, from: data) }
-            catch { notice = "收藏数据无法读取，原始数据已保留。请先备份再添加网站。" }
+            catch { protectedKeys.insert("sites"); notice = "收藏数据无法读取，原始数据已保留。请先备份再添加网站。" }
         } else { sites = Site.defaults }
         let restoredTabs = restore([Tab].self, key: "tabs") ?? []
         let restoredSelection = defaults.string(forKey: "selectedTab").flatMap(UUID.init(uuidString:))
@@ -800,6 +801,10 @@ final class Store: ObservableObject {
         }
         try value.validate()
         try applyHotkeys?(value)
+        applySettings(value)
+    }
+
+    private func applySettings(_ value: BrowserSettings) {
         let changed = settings.userAgent != value.userAgent
         settings = value
         PerchTheme.shared.selection = value.theme
@@ -809,6 +814,61 @@ final class Store: ObservableObject {
         if changed {
             for browser in browsers.values { browser.webView.customUserAgent = value.userAgent; browser.webView.reload() }
         }
+    }
+
+    private func checkBackupAccess() throws {
+        guard protectedKeys.isDisjoint(with: ["settings", "sites", "bookmarkFolders", "importedBookmarks"]),
+              ai.canRestoreSettings else {
+            throw PerchError("当前设置或书签数据损坏，已保留原数据。请先备份并修复原始数据。")
+        }
+    }
+
+    func settingsBackup(launchAtLogin: Bool) throws -> SettingsBackup {
+        try checkBackupAccess()
+        var providers = ai.providers
+        for index in providers.indices { providers[index].legacyAccount = nil }
+        let backup = SettingsBackup(settings: settings, launchAtLogin: launchAtLogin,
+            layout: LayoutPreference.capture(defaults), providers: providers,
+            selectedProvider: ai.configuration.id, search: ai.searchConfiguration,
+            sites: sites, folders: bookmarkFolders, imported: importedBookmarks)
+        try backup.validate()
+        return backup
+    }
+
+    func restoreSettingsBackup(_ backup: SettingsBackup,
+                               setLaunchAtLogin: (Bool) throws -> Void = LaunchAtLogin.set) throws {
+        try checkBackupAccess()
+        try backup.validate()
+        // Imported UUIDs must never resolve to credentials already trusted on this Mac.
+        let backup = backup.withFreshCredentialIDs()
+        let encoder = JSONEncoder()
+        let encoded = try [
+            "settings": encoder.encode(backup.settings),
+            "sites": encoder.encode(backup.sites),
+            "bookmarkFolders": encoder.encode(backup.folders),
+            "importedBookmarks": encoder.encode(backup.imported),
+            "aiProviders": encoder.encode(backup.providers)
+        ]
+        let search = try backup.search.map { try encoder.encode($0) }
+        try applyHotkeys?(backup.settings)
+        do { try setLaunchAtLogin(backup.launchAtLogin) }
+        catch {
+            let loginError = error
+            do { try applyHotkeys?(settings) }
+            catch { throw PerchError("登录项导入失败，旧快捷键无法恢复，请重新设置。\(loginError.localizedDescription)") }
+            throw loginError
+        }
+        // All fallible validation/encoding/system operations finish before changing stored data.
+        for (key, data) in encoded { defaults.set(data, forKey: key) }
+        if let search { defaults.set(search, forKey: "aiSearchProvider") }
+        else { defaults.removeObject(forKey: "aiSearchProvider") }
+        defaults.set(backup.selectedProvider.uuidString, forKey: "aiSelectedProvider")
+        defaults.removeObject(forKey: "aiConfiguration")
+        LayoutPreference.restore(backup.layout, to: defaults)
+        sites = backup.sites; bookmarkFolders = backup.folders; importedBookmarks = backup.imported
+        ai.restoreSettings(backup)
+        applySettings(backup.settings)
+        restoreWindowPlacement?()
     }
 
     func navigate(_ text: String) {
@@ -1654,11 +1714,11 @@ final class RootHostingView<Content: View>: NSHostingView<Content> {
 struct RootView: View {
     @ObservedObject private var theme = PerchTheme.shared
     @ObservedObject var store: Store
-    @AppStorage("sidebarHidden") private var sidebarCollapsed = false
-    @AppStorage("sidebarWidth") private var sidebarWidth = 199.0
+    @AppStorage(LayoutPreference.sidebarHidden.rawValue) private var sidebarCollapsed = false
+    @AppStorage(LayoutPreference.sidebarWidth.rawValue) private var sidebarWidth = 199.0
     @State private var dragWidth: Double?
     @State private var liveSidebarWidth: Double?
-    @AppStorage("aiSidebarWidth") private var aiWidth = 320.0
+    @AppStorage(LayoutPreference.aiSidebarWidth.rawValue) private var aiWidth = 320.0
     @State private var aiDragWidth: Double?
     var body: some View {
         VStack(spacing: 0) {
@@ -1935,7 +1995,7 @@ final class Panel: NSPanel {
 
     func restorePlacement(from defaults: UserDefaults = .standard) -> Bool {
         // AppKit frame autosave can relocate to the current main screen; retain global coordinates.
-        guard let raw = defaults.string(forKey: "windowFrame") else { return false }
+        guard let raw = defaults.string(forKey: LayoutPreference.windowFrame.rawValue) else { return false }
         let frame = NSRectFromString(raw)
         guard [frame.minX, frame.minY, frame.width, frame.height].allSatisfy(\.isFinite),
               frame.width > 0, frame.height > 0 else { return false }
@@ -1945,7 +2005,7 @@ final class Panel: NSPanel {
 
     func savePlacement(to defaults: UserDefaults = .standard) {
         guard !styleMask.contains(.fullScreen) else { return }
-        defaults.set(NSStringFromRect(frame), forKey: "windowFrame")
+        defaults.set(NSStringFromRect(frame), forKey: LayoutPreference.windowFrame.rawValue)
     }
 
     override func becomeKey() {
@@ -2016,6 +2076,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var hasWindowPlacement = false
     private var fittingScreen = false
     private var menuScreen: NSScreen?
+    private var pendingPlacementRestore = false
 
     private static func statusImage() -> NSImage? {
         guard let symbol = NSImage(systemSymbolName: "rectangle.topthird.inset.filled",
@@ -2068,6 +2129,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                                name: NSApplication.didChangeScreenParametersNotification, object: nil)
         panel.statusItemPressed = { [weak self] in self?.isPressingStatusItem() ?? false }
         store.changeWindow = { [weak self] in self?.updateWindowLevel() }
+        store.restoreWindowPlacement = { [weak self] in self?.restoreImportedPlacement() }
         store.hideWindow = { [weak self] in self?.panel.hideAnimated() }
         store.applyHotkeys = { [weak self] settings in try self?.hotkeys.apply(settings) }
         store.shortcutRecording = { [weak self] recording in
@@ -2251,6 +2313,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func present(on target: NSScreen?) {
+        applyPendingPlacement()
         let followMouse = store.settings.followMouseOnShow
         if !followMouse && !hasWindowPlacement, let button = statusItem.button, let window = button.window {
             let rect = window.convertToScreen(button.convert(button.bounds, to: nil))
@@ -2258,7 +2321,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         clampToScreen(on: followMouse ? mouseScreen() : target, near: followMouse ? NSEvent.mouseLocation : nil)
         hasWindowPlacement = true
-        panel.savePlacement(to: store.defaults)
+        saveWindowPlacement()
         NSApp.activate(ignoringOtherApps: true)
         panel.showAnimated()
     }
@@ -2279,6 +2342,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func screenConfigurationChanged() {
         clampToScreen()
+        saveWindowPlacement()
+    }
+
+    func restoreImportedPlacement() {
+        pendingPlacementRestore = true
+        applyPendingPlacement()
+    }
+
+    private func applyPendingPlacement() {
+        guard pendingPlacementRestore, !panel.styleMask.contains(.fullScreen), !changingFullScreen else { return }
+        pendingPlacementRestore = false
+        hasWindowPlacement = panel.restorePlacement(from: store.defaults)
+        clampToScreen()
+    }
+
+    private func saveWindowPlacement() {
+        guard !changingFullScreen, !pendingPlacementRestore else { return }
         panel.savePlacement(to: store.defaults)
     }
 
@@ -2291,10 +2371,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func windowWillEnterFullScreen(_ notification: Notification) { changingFullScreen = true }
     func windowDidEnterFullScreen(_ notification: Notification) { changingFullScreen = false }
     func windowWillExitFullScreen(_ notification: Notification) { changingFullScreen = true }
-    func windowDidExitFullScreen(_ notification: Notification) { changingFullScreen = false; clampToScreen() }
-    func windowDidMove(_ notification: Notification) { if !changingFullScreen { panel.savePlacement(to: store.defaults) } }
-    func windowDidResize(_ notification: Notification) { clampToScreen(); if !changingFullScreen { panel.savePlacement(to: store.defaults) } }
-    func windowDidChangeScreen(_ notification: Notification) { clampToScreen(); if !changingFullScreen { panel.savePlacement(to: store.defaults) } }
+    func windowDidExitFullScreen(_ notification: Notification) {
+        changingFullScreen = false; applyPendingPlacement(); clampToScreen()
+    }
+    func windowDidMove(_ notification: Notification) { saveWindowPlacement() }
+    func windowDidResize(_ notification: Notification) { clampToScreen(); saveWindowPlacement() }
+    func windowDidChangeScreen(_ notification: Notification) { clampToScreen(); saveWindowPlacement() }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationWillTerminate(_ notification: Notification) { store.ai.saveConversations() }
