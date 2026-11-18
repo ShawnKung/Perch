@@ -8,7 +8,138 @@ private struct AIStreamingProbe: View {
     var body: some View { AIMarkdownView(text: ai.sessions[tab]?.messages.last?.text ?? "") }
 }
 
+private struct AIHistoryManagementProbe: View {
+    @ObservedObject var ai: AIController
+    let owner: UUID
+    var body: some View {
+        AIHistoryList(conversations: ai.activeConversations, active: ai.sessions[owner]?.id,
+                      open: { _ in }, delete: { ai.archiveConversations($0) },
+                      fork: { _ = ai.forkConversation($0) },
+                      rename: { ai.renameConversation($0, title: $1) },
+                      pin: { ai.pinConversations($0, pinned: $1) })
+    }
+}
+
 extension AISelfCheck {
+    static func historyManagementUI(baseURL: String) async throws {
+        let suite = "dev.perch.history-management.\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("perch-history-\(UUID())")
+        defer {
+            defaults.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let ai = AIController(defaults: defaults, conversationDirectory: directory)
+        let owner = UUID()
+        precondition(ai.save(AIConfiguration(provider: .custom, baseURL: baseURL + "/v1", model: "fixture"), key: "synthetic-key"))
+        precondition(ai.send("Rename title fixture", tab: owner, browser: nil, usePage: false))
+        let id = ai.sessions[owner]!.id
+        ai.renameConversation(id, title: "手动命名 🙂")
+        ai.pinConversations([id], pinned: true)
+        ai.drafts[owner] = "保留草稿"
+        let host = NSHostingView(rootView: AIHistoryManagementProbe(ai: ai, owner: owner))
+        let window = NSWindow(contentRect: NSRect(x: 120, y: 160, width: 280, height: 500),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.contentView = host; window.makeKeyAndOrderFront(nil)
+        defer { window.orderOut(nil); window.contentView = nil }
+        func views<T: NSView>(_ view: NSView, _ type: T.Type) -> [T] {
+            (view as? T).map { [$0] } ?? view.subviews.flatMap { views($0, type) }
+        }
+        try await wait { views(host, AIHistoryTable.self).first?.conversationIDs.contains(id) == true }
+        let table = views(host, AIHistoryTable.self).first!
+        func labels() -> [String] {
+            (0..<table.numberOfRows).map {
+                (table.view(atColumn: 0, row: $0, makeIfNecessary: true) as? AIHistoryCell)?.textField?.stringValue ?? ""
+            }
+        }
+        func action(_ title: String, id: UUID) throws {
+            guard let row = table.conversationIDs.firstIndex(of: id) else { throw PerchError("Missing history row") }
+            table.deselectAll(nil)
+            let rect = table.rect(ofRow: row)
+            let event = NSEvent.mouseEvent(with: .rightMouseDown,
+                location: table.convert(NSPoint(x: rect.midX, y: rect.midY), to: nil), modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!
+            guard let menu = table.menu(for: event), let index = menu.items.firstIndex(where: { $0.title == title }) else {
+                throw PerchError("Missing history menu action: \(title)")
+            }
+            menu.performActionForItem(at: index)
+        }
+        func rename(_ value: String, cancel: Bool = false) async throws {
+            try action("重命名…", id: id)
+            try await wait { window.attachedSheet != nil }
+            let sheet = window.attachedSheet!
+            let field = views(sheet.contentView!, NSTextField.self).first { $0.isEditable }!
+            try await wait { field.currentEditor() != nil }
+            let editor = field.currentEditor() as! NSTextView
+            editor.setSelectedRange(NSRange(location: 0, length: (editor.string as NSString).length))
+            editor.insertText(value, replacementRange: editor.selectedRange())
+            let button = views(sheet.contentView!, NSButton.self).first { $0.title == (cancel ? "取消" : "保存") }!
+            let point = button.convert(NSPoint(x: button.bounds.midX, y: button.bounds.midY), to: button.superview)
+            precondition(button.hitTest(point) === button, "Rename sheet action must be hittable")
+            button.performClick(nil)
+            try await wait { window.attachedSheet == nil }
+        }
+        try await wait { ai.sessions[owner]?.requestID == nil }
+        precondition(ai.sessions[owner]?.title == "手动命名 🙂", "Delayed automatic title must not overwrite a manual rename")
+        try await wait { labels().prefix(2) == ["置顶会话", "手动命名 🙂"] }
+        let originalUpdated = ai.sessions[owner]!.updated
+        try await rename("  新的中文会话 🙂  ")
+        try await wait { labels().contains("新的中文会话 🙂") }
+        try await rename("取消后的标题", cancel: true)
+        try await rename("   ")
+        precondition(ai.sessions[owner]?.title == "新的中文会话 🙂" && ai.drafts[owner] == "保留草稿")
+        precondition(ai.sessions[owner]?.updated == originalUpdated, "Metadata edits must preserve chronological order")
+        let restored = AIController(defaults: defaults, conversationDirectory: directory)
+        precondition(restored.conversations[id]?.title == "新的中文会话 🙂" && restored.conversations[id]?.isPinned == true)
+        precondition(restored.conversations[id]?.markdown.hasPrefix("# 新的中文会话 🙂") == true)
+        let fork = ai.forkConversation(id)!
+        try await wait { table.conversationIDs.contains(fork) }
+        precondition(ai.conversations[fork]?.isPinned == false)
+        // Pin a webpage conversation, then recover its original group after unpinning.
+        let webOwner = UUID()
+        precondition(ai.send("Web history fixture", tab: webOwner, browser: nil, usePage: false, origin: .web))
+        let web = ai.sessions[webOwner]!.id
+        ai.renameConversation(web, title: "网页会话")
+        try await wait { ai.sessions[webOwner]?.requestID == nil }
+        try await wait { table.conversationIDs.contains(web) }
+        try action("置顶会话", id: web)
+        try await wait { labels().first == "置顶会话" && labels().firstIndex(of: "网页会话")! < labels().firstIndex(of: "Chat")! }
+        precondition(ai.sessions[webOwner]?.origin == .web)
+        table.choose(0, modifiers: [])
+        precondition(!table.conversationIDs.contains(id) && !table.conversationIDs.contains(web))
+        table.choose(0, modifiers: [])
+        try await wait { table.conversationIDs.contains(id) && table.conversationIDs.contains(web) }
+        try action("取消置顶", id: web)
+        try await wait { labels().firstIndex(of: "网页会话")! > labels().firstIndex(of: "网页对话")! }
+        try action("取消置顶", id: id)
+        try await wait { !labels().contains("置顶会话") }
+        precondition(labels().first == "Chat" && labels().contains("新的中文会话 🙂"))
+        let selected = Set([id, web])
+        table.selectRowIndexes(IndexSet(table.conversationIDs.indices.filter {
+            table.conversationIDs[$0].map { selected.contains($0) } == true
+        }), byExtendingSelection: false)
+        let bulk = table.contextMenu(at: table.conversationIDs.firstIndex(of: id)!)!
+        precondition(!bulk.items.contains { $0.title == "重命名…" })
+        bulk.performActionForItem(at: bulk.items.firstIndex { $0.title == "置顶会话" }!)
+        try await wait { ai.sessions[owner]?.isPinned == true && ai.sessions[webOwner]?.isPinned == true }
+        try await wait { labels().first == "置顶会话" }
+        precondition(Set(table.selectedRowIndexes.compactMap { table.conversationIDs[$0] }) == selected)
+        try action("取消置顶", id: web)
+        try await wait { ai.sessions[webOwner]?.isPinned == false }
+        try action("取消置顶", id: id)
+        try await wait { !labels().contains("置顶会话") }
+        try action("置顶会话", id: id)
+        try await wait { labels().first == "置顶会话" }
+        try action("归档对话", id: id)
+        try await wait { !table.conversationIDs.contains(id) }
+        precondition(ai.conversations[id]?.isPinned == false)
+        ai.restoreConversations([id])
+        try await wait { table.conversationIDs.contains(id) }
+        precondition(labels().first == "Chat")
+        print("PASS: native history rename sheet save/cancel/blank, title race, disk persistence, pinned Chat/web grouping, collapse, unpin, Fork and archive")
+    }
+
     static func typographyUI() async throws {
         NSApp.accessibilitySetValue(true, forAttribute: NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface"))
         let originalSize = PerchTheme.shared.chatFontSize
@@ -98,6 +229,17 @@ extension AISelfCheck {
         }
         let settingsHost = NSHostingView(rootView: SettingsPage(store: store).defaultAppStorage(defaults))
         window.contentView = settingsHost; window.makeKeyAndOrderFront(nil)
+        try await wait { window.isKeyWindow }
+        try await wait { element(settingsHost, "主窗口跟随鼠标显示") != nil }
+        let follow = try frame(settingsHost, "主窗口跟随鼠标显示")
+        try snapshot(settingsHost, "settings-window")
+        click(NSPoint(x: follow.maxX - 12, y: follow.midY))
+        try await wait { store.settings.followMouseOnShow }
+        let followSettings = try JSONDecoder().decode(BrowserSettings.self, from: defaults.data(forKey: "settings")!)
+        precondition(followSettings.followMouseOnShow)
+        click(NSPoint(x: follow.maxX - 12, y: follow.midY))
+        try await wait { !store.settings.followMouseOnShow }
+        print("PASS: native mouse-follow toggle enables/disables and persists settings")
         try await wait { element(settingsHost, "Chat 正文字号") != nil }
         try snapshot(settingsHost, "settings-font-default")
         let slider = try frame(settingsHost, "Chat 正文字号")
@@ -111,7 +253,7 @@ extension AISelfCheck {
         click(NSPoint(x: reset.midX, y: reset.midY))
         try await wait { store.settings.chatFontSize == 13 && PerchTheme.shared.chatFontSize == 13 }
         let legacy = try JSONDecoder().decode(BrowserSettings.self, from: Data("{}".utf8))
-        precondition(legacy.chatFontSize == 13)
+        precondition(legacy.chatFontSize == 13 && !legacy.followMouseOnShow)
         for invalid in [0, 23] {
             precondition((try? JSONDecoder().decode(BrowserSettings.self, from: Data("{\"chatFontSize\":\(invalid)}".utf8))) == nil)
         }
@@ -437,6 +579,11 @@ extension AISelfCheck {
             precondition(ai.send("Background fixture " + queued, tab: ownerA, browser: nil, usePage: false))
             try await wait { cell(a)?.progress?.window === window }
             precondition(cell(a)?.archiveButton?.isEnabled == false && cell(a)?.titleTrailing?.constant == -38)
+            let history = find(host, AIHistoryTable.self)!
+            let pinMenu = history.contextMenu(at: history.conversationIDs.firstIndex(of: a)!)!
+            pinMenu.performActionForItem(at: pinMenu.items.firstIndex { $0.title == "置顶会话" }!)
+            try await wait { ai.sessions[ownerA]?.isPinned == true && history.conversationIDs.firstIndex(of: a) == 1 }
+            precondition(cell(a)?.progress != nil && ai.sessions[ownerA]?.requestID == requestA)
 
             store.newChat()
             let ownerB = store.chatOwner, runB = UUID().uuidString

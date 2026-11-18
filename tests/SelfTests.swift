@@ -2391,6 +2391,37 @@ final class WindowSelfCheck {
                      "Window frame restore: expected \(savedFrame), got \(restored.frame), restored=\(didRestore)")
         defaults.set("invalid", forKey: "windowFrame")
         precondition(!restored.restorePlacement(from: defaults), "Invalid frame data must be ignored")
+        let store = Store(defaults: defaults)
+        let delegate = AppDelegate(store: store)
+        delegate.panel = restored
+        store.settings.followMouseOnShow = true
+        delegate.show()
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main!
+        precondition(screen.visibleFrame.contains(restored.frame))
+        let expected = ScreenPlacement.nearMouse(mouse, size: restored.frame.size, in: screen.visibleFrame)
+        // AppKit aligns native window origins to screen pixels.
+        precondition(abs(restored.frame.minX - expected.minX) <= 1 && abs(restored.frame.minY - expected.minY) <= 1,
+                     "Mouse placement: expected \(expected), got \(restored.frame)")
+        let followed = restored.frame
+        restored.setFrameOrigin(NSPoint(x: followed.minX + 30, y: followed.minY + 30))
+        delegate.show()
+        precondition(restored.frame == followed, "Every explicit show must reposition near the mouse")
+        store.settings.followMouseOnShow = false
+        let manual = NSRect(x: screen.visibleFrame.minX + 10, y: screen.visibleFrame.minY + 10, width: 232, height: 176)
+        restored.setFrame(manual, display: false)
+        delegate.show()
+        precondition(restored.frame == manual, "Disabled mouse following must preserve manual placement")
+        for bounds in [NSRect(x: -1600, y: 30, width: 1600, height: 900),
+                       NSRect(x: 100, y: -700, width: 700, height: 600)] {
+            for point in [NSPoint(x: bounds.minX, y: bounds.minY), NSPoint(x: bounds.maxX, y: bounds.maxY),
+                          NSPoint(x: bounds.midX, y: bounds.midY)] {
+                let frame = ScreenPlacement.nearMouse(point, size: NSSize(width: 850, height: 660), in: bounds)
+                precondition(bounds.contains(frame), "Mouse placement must fit negative-coordinate and smaller displays")
+            }
+        }
+        restored.orderOut(nil)
+        print("PASS: real window show follows mouse on each presentation, disabled placement and multi-screen edge fitting")
         panel.showAnimated()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [self] in
             precondition(panel.isVisible && panel.alphaValue == 1)

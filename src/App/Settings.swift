@@ -169,6 +169,7 @@ struct BrowserSettings: Codable, Equatable {
     var aiSendWithCommand = false
     var theme: ThemeColor = .blue
     var showWindowOnLaunch = false
+    var followMouseOnShow = false
     var historyRecordingEnabled = true
     private var shortcutDefaultsVersion = 1
 
@@ -176,7 +177,7 @@ struct BrowserSettings: Codable, Equatable {
     enum CodingKeys: String, CodingKey {
         case uaMode, customUA, openKey, closeKey, toggleKey, searchEngine, customSearchURL, savePasswords
         case linkPreviewEnabled, linkPreviewKey, linkPreviewDelay, aiSendWithCommand, theme, showWindowOnLaunch
-        case historyRecordingEnabled, shortcutDefaultsVersion, chatFontSize
+        case historyRecordingEnabled, shortcutDefaultsVersion, chatFontSize, followMouseOnShow
     }
     init(from decoder: Decoder) throws {
         self.init()
@@ -202,6 +203,7 @@ struct BrowserSettings: Codable, Equatable {
         aiSendWithCommand = try c.decodeIfPresent(Bool.self, forKey: .aiSendWithCommand) ?? false
         theme = try c.decodeIfPresent(ThemeColor.self, forKey: .theme) ?? .green
         showWindowOnLaunch = try c.decodeIfPresent(Bool.self, forKey: .showWindowOnLaunch) ?? false
+        followMouseOnShow = try c.decodeIfPresent(Bool.self, forKey: .followMouseOnShow) ?? false
         historyRecordingEnabled = try c.decodeIfPresent(Bool.self, forKey: .historyRecordingEnabled) ?? true
         chatFontSize = try c.decodeIfPresent(Double.self, forKey: .chatFontSize) ?? Self.defaultChatFontSize
         guard chatFontSize.isFinite, Self.chatFontSizeRange.contains(chatFontSize) else {
@@ -479,6 +481,11 @@ struct SettingsPage: View {
                     Text(loginStatus).font(.caption).foregroundStyle(.secondary)
                 }
                 Button("打开系统登录项设置") { SMAppService.openSystemSettingsLoginItems() }
+            }
+            Section("窗口") {
+                Toggle("主窗口跟随鼠标显示", isOn: $draft.followMouseOnShow)
+                    .accessibilityLabel("主窗口跟随鼠标显示")
+                    .help("每次唤出主窗口时显示在鼠标附近，并保持在屏幕可用区域内。")
             }
             Section("外观") {
                 HStack {

@@ -585,6 +585,7 @@ enum AISelfCheck {
         print("PASS: native/standard search, direct HTTP in all protocols, independent keys, sources/usage/history/export, off/idle/error and frozen queue route")
     }
     static func run(baseURL: String) async throws {
+        try await historyManagementUI(baseURL: baseURL)
         setbuf(stdout, nil)
         guard URL(string: baseURL)?.host == "127.0.0.1" else { throw PerchError("AI self-check requires a loopback fixture") }
         let suite = "dev.perch.ai.selftest.\(UUID())"
@@ -1588,6 +1589,7 @@ enum AISelfCheck {
         print("PASS: Return/Cmd+Return clear native text before late notifications; rejected sends and IME retain drafts")
     }
     static func composerUI(baseURL: String) async throws {
+        try await historyManagementUI(baseURL: baseURL)
         composerReturnChecks()
         // SwiftUI otherwise leaves its accessibility tree empty without an external screen reader.
         NSApp.accessibilitySetValue(true, forAttribute: NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface"))
