@@ -121,7 +121,8 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         webView.find(findQuery, configuration: configuration) { _ in }
     }
     var onVisit: ((String, String) -> Void)?
-    var onNewTab: ((URL) -> Void)?
+    var onNewTab: ((URL, Bool) -> Void)?
+    var onOpenInPerch: ((URL) -> Void)?
     var onBookmark: (() -> Void)?
     var isBookmarked: (() -> Bool)?
     var clipboard = NSPasteboard.general
@@ -192,7 +193,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         add(loading ? "停止加载" : "重新加载", loading ? "stop" : "reload")
         menu.addItem(.separator())
         add("复制当前网址", "copy")
-        add("在默认浏览器打开", "external")
+        add("在 Perch 中打开", "external")
         if onBookmark != nil { add(isBookmarked?() == true ? "移除书签" : "加入书签", "bookmark") }
         add("在页面中查找…", "find")
     }
@@ -218,7 +219,10 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         case "stop": webView.stopLoading()
         case "copy": clipboard.clearContents(); clipboard.setString(values[1], forType: .string)
         case "external":
-            if let url = URLInput.parse(values[1], search: false) { NSWorkspace.shared.open(url) }
+            if let url = URLInput.parse(values[1], search: false) {
+                if let onOpenInPerch { onOpenInPerch(url) }
+                else { onNewTab?(url, false) }
+            }
         case "bookmark": onBookmark?()
         case "find": finding = true
         default: break
@@ -339,17 +343,27 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         guard let url = navigationAction.request.url,
               ["http", "https", "about"].contains(url.scheme?.lowercased() ?? "") else {
-            error = "这个链接需要其他应用打开，请使用右上角的「在浏览器打开」。"
+            error = "此链接使用其他应用的专用协议，Perch 暂不支持打开。"
+            decisionHandler(.cancel)
+            return
+        }
+        if navigationAction.navigationType == .linkActivated, opensInBackground(navigationAction) {
+            onNewTab?(url, true)
             decisionHandler(.cancel)
             return
         }
         decisionHandler(.allow)
     }
 
+    private func opensInBackground(_ action: WKNavigationAction) -> Bool {
+        // WebKit exposes a button bit mask (middle = 1 << 2), unlike NSEvent's zero-based index.
+        action.buttonNumber == 1 << 2 || action.modifierFlags.contains(.command)
+    }
+
     func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse,
                  decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
         guard navigationResponse.canShowMIMEType else {
-            error = "此内容需要下载。请在默认浏览器中打开后下载。"
+            error = "此内容需要下载，Perch 暂不支持下载。"
             decisionHandler(.cancel)
             return
         }
@@ -361,7 +375,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
                  for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
         if navigationAction.targetFrame == nil, let url = navigationAction.request.url,
            ["https", "http"].contains(url.scheme?.lowercased() ?? "") {
-            onNewTab?(url)
+            onNewTab?(url, opensInBackground(navigationAction))
         }
         return nil
     }
@@ -559,7 +573,9 @@ final class Store: ObservableObject {
                 self.persistTabs()
                 self.recordVisit(title: title, address: address)
             }
-            view.onNewTab = { [weak self] url in self?.newTab(address: url.absoluteString) }
+            view.onNewTab = { [weak self] url, background in
+                self?.newTab(address: url.absoluteString, after: id, select: !background)
+            }
             view.onBookmark = { [weak self, weak view] in
                 guard let self, let view else { return }
                 self.toggleBookmark(title: view.title, address: view.address)
@@ -609,13 +625,13 @@ final class Store: ObservableObject {
         if select { selected = id }
     }
 
-    func newTab(address: String = "", title: String = "新标签页", after: UUID? = nil) {
+    func newTab(address: String = "", title: String = "新标签页", after: UUID? = nil, select: Bool = true) {
         let tab = Tab(title: title == "新标签页" ? URL(string: address)?.host ?? title : title, address: address)
         if let after, let index = tabs.firstIndex(where: { $0.id == after }) {
             tabs.insert(tab, at: tabs[index].pinned ? tabs.filter(\.pinned).count : index + 1)
         } else { tabs.append(tab) }
-        activate(tab.id)
-        if address.isEmpty { pendingAddressFocus = tab.id }
+        activate(tab.id, select: select)
+        if select && address.isEmpty { pendingAddressFocus = tab.id }
     }
 
     @Published var chatHistoryVisible = true
@@ -942,7 +958,11 @@ final class Store: ObservableObject {
         let browser = Browser(url: url, userAgent: settings.userAgent,
                               dataStore: defaults === UserDefaults.standard ? .default() : .nonPersistent(),
                               previewDefaults: defaults)
-        browser.onNewTab = { [weak browser] url in browser?.load(url) }
+        browser.onNewTab = { [weak self, weak browser] url, background in
+            if background { self?.newTab(address: url.absoluteString, select: false) }
+            else { browser?.load(url) }
+        }
+        browser.onOpenInPerch = { [weak self] url in self?.newTab(address: url.absoluteString) }
         return browser
     }
 
@@ -1610,8 +1630,8 @@ struct WindowTools: View {
                 Button("历史记录") { store.openBookmarks(history: true) }
                 Button("密码管理") { store.library = .passwords }
                 Divider()
-                Button("在默认浏览器打开") {
-                    if let url = URLInput.parse(store.browser?.address ?? "", search: false) { NSWorkspace.shared.open(url) }
+                Button("在新标签页打开") {
+                    if let url = URLInput.parse(store.browser?.address ?? "", search: false) { store.newTab(address: url.absoluteString) }
                 }.disabled(store.browser == nil)
                 Divider()
                 Button("回到首页") { store.selected = nil }

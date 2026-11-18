@@ -913,9 +913,13 @@ final class BookmarkPreviewController: NSObject, NSWindowDelegate {
                           styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                           backing: .buffered, defer: false)
         super.init()
+        browser.onOpenInPerch = { [weak self] url in
+            self?.openInTab(url)
+        }
         window.title = title
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
+        window.animationBehavior = .none
         window.collectionBehavior = [.fullScreenPrimary]
         for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
             window.standardWindowButton(type)?.isHidden = true
@@ -943,19 +947,20 @@ final class BookmarkPreviewController: NSObject, NSWindowDelegate {
                                                width: window.frame.width, height: window.frame.height),
                                         from: bounds, to: bounds)
         window.setFrame(frame, display: false)
-        parent.addChildWindow(window, ordered: .above)
         let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        // Adding a child orders it on screen, so prepare opacity before attachment.
         window.alphaValue = reduceMotion ? 1 : 0
+        parent.addChildWindow(window, ordered: .above)
         window.makeKeyAndOrderFront(nil)
         if !reduceMotion {
             NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0.14
+                context.duration = 0.22
                 window.animator().alphaValue = 1
             }
         }
     }
-    func openInTab() {
-        guard !closing, let url = URLInput.parse(browser.address, search: false) else { return }
+    func openInTab(_ address: URL? = nil) {
+        guard !closing, let url = URLInput.parse(address?.absoluteString ?? browser.address, search: false) else { return }
         onOpenTab?(Site(title: browser.title, address: url.absoluteString))
         close()
     }
