@@ -105,7 +105,10 @@ extension AISelfCheck {
                 ai.conversations[id]?.isPinned == true ? "取消置顶" : "置顶会话", "归档会话"])
             precondition(menu.items.allSatisfy { $0.image != nil }, "Menu text must share the same image column")
             if #available(macOS 27.0, *) {
-                precondition(menu.items.allSatisfy { $0.preferredImageVisibility == .visible },
+                precondition(menu.items.allSatisfy {
+                    $0.responds(to: NSSelectorFromString("preferredImageVisibility"))
+                        && ($0.value(forKey: "preferredImageVisibility") as? NSNumber)?.intValue == 1
+                },
                              "macOS 27 must display all menu symbols")
             }
             menu.performActionForItem(at: index)
