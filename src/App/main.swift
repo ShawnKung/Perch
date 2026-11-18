@@ -1906,6 +1906,30 @@ enum ScreenPlacement {
 }
 
 final class Panel: NSPanel {
+    private weak var relocatedSheet: NSWindow?
+    private var sheetDismissalFrame: NSRect?
+
+    func setPlacement(_ rect: NSRect, display: Bool) {
+        if rect != frame, let attachedSheet { relocatedSheet = attachedSheet }
+        setFrame(rect, display: display)
+    }
+
+    override func endSheet(_ sheetWindow: NSWindow, returnCode: NSApplication.ModalResponse) {
+        let previous = sheetDismissalFrame
+        if sheetWindow === relocatedSheet {
+            sheetDismissalFrame = frame
+            relocatedSheet = nil
+        }
+        defer { sheetDismissalFrame = previous }
+        super.endSheet(sheetWindow, returnCode: returnCode)
+    }
+
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        // A tall sheet remembers the old parent origin. Constrain its dismissal
+        // animation before it moves, only when placement changed while attached.
+        sheetDismissalFrame ?? super.constrainFrameRect(frameRect, to: screen)
+    }
+
     private final class FocusSnapshot {
         weak var responder: NSView?
         weak var field: NSTextField?
@@ -2032,7 +2056,7 @@ final class Panel: NSPanel {
         let frame = NSRectFromString(raw)
         guard [frame.minX, frame.minY, frame.width, frame.height].allSatisfy(\.isFinite),
               frame.width > 0, frame.height > 0 else { return false }
-        setFrame(frame, display: false)
+        setPlacement(frame, display: false)
         return true
     }
 
@@ -2370,7 +2394,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             ?? ScreenPlacement.fit(panel.frame, from: source, to: bounds)
         panel.minSize = NSSize(width: min(640, bounds.width), height: min(520, bounds.height))
         panel.maxSize = bounds.size
-        if panel.frame != frame { panel.setFrame(frame, display: true) }
+        if panel.frame != frame { panel.setPlacement(frame, display: true) }
     }
 
     @objc private func screenConfigurationChanged() {
@@ -2619,8 +2643,11 @@ if CommandLine.arguments.contains("--scroll-self-test") {
 } else if CommandLine.arguments.contains("--window-self-test") {
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)
-    let check = WindowSelfCheck()
-    withExtendedLifetime(check) { app.run() }
+    Task { @MainActor in
+        setbuf(stdout, nil)
+        _ = WindowSelfCheck()
+    }
+    app.run()
 } else if CommandLine.arguments.contains("--web-self-test") {
     let app = NSApplication.shared
     let check = WebSelfCheck()
