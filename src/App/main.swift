@@ -1784,6 +1784,12 @@ struct RootView: View {
 extension Notification.Name { static let focusAddress = Notification.Name("PerchFocusAddress") }
 
 enum ScreenPlacement {
+    static func nearMouse(_ point: NSPoint, size: NSSize, in bounds: NSRect) -> NSRect {
+        let size = NSSize(width: min(size.width, bounds.width), height: min(size.height, bounds.height))
+        let frame = NSRect(x: point.x - size.width / 2, y: point.y - size.height - 12,
+                           width: size.width, height: size.height)
+        return fit(frame, from: bounds, to: bounds)
+    }
     static func screenIndex(for frame: NSRect, in screens: [NSRect]) -> Int? {
         screens.indices.filter { screens[$0].intersects(frame) }.max {
             let a = screens[$0].intersection(frame), b = screens[$1].intersection(frame)
@@ -2056,7 +2062,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.collectionBehavior = [.moveToActiveSpace, .fullScreenPrimary]
         panel.contentView = RootHostingView(rootView: RootView(store: store))
         panel.bindTabFocus(to: store)
-        hasWindowPlacement = panel.restorePlacement()
+        hasWindowPlacement = panel.restorePlacement(from: store.defaults)
         panel.delegate = self
         NotificationCenter.default.addObserver(self, selector: #selector(screenConfigurationChanged),
                                                name: NSApplication.didChangeScreenParametersNotification, object: nil)
@@ -2212,8 +2218,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if panel.shouldHideForStatusClick() { panel.hideAnimated() }
         else {
             NSApp.activate(ignoringOtherApps: true)
-            if panel.isVisible && !panel.isHiding { clampToScreen(on: target); panel.focusWindow() }
-            else { show() }
+            present(on: target)
         }
     }
 
@@ -2246,25 +2251,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func present(on target: NSScreen?) {
-        if !hasWindowPlacement, let button = statusItem.button, let window = button.window {
+        let followMouse = store.settings.followMouseOnShow
+        if !followMouse && !hasWindowPlacement, let button = statusItem.button, let window = button.window {
             let rect = window.convertToScreen(button.convert(button.bounds, to: nil))
             panel.setFrameOrigin(NSPoint(x: rect.maxX - panel.frame.width, y: rect.minY - panel.frame.height - 6))
         }
-        clampToScreen(on: target)
+        clampToScreen(on: followMouse ? mouseScreen() : target, near: followMouse ? NSEvent.mouseLocation : nil)
         hasWindowPlacement = true
-        panel.savePlacement()
+        panel.savePlacement(to: store.defaults)
         NSApp.activate(ignoringOtherApps: true)
         panel.showAnimated()
     }
 
-    func clampToScreen(on target: NSScreen? = nil) {
+    func clampToScreen(on target: NSScreen? = nil, near point: NSPoint? = nil) {
         guard !fittingScreen, !panel.styleMask.contains(.fullScreen), !changingFullScreen,
               let screen = target ?? currentScreen() else { return }
         fittingScreen = true
         defer { fittingScreen = false }
         let bounds = screen.visibleFrame
         let source = currentScreen()?.visibleFrame ?? bounds
-        let frame = ScreenPlacement.fit(panel.frame, from: source, to: bounds)
+        let frame = point.map { ScreenPlacement.nearMouse($0, size: panel.frame.size, in: bounds) }
+            ?? ScreenPlacement.fit(panel.frame, from: source, to: bounds)
         panel.minSize = NSSize(width: min(640, bounds.width), height: min(520, bounds.height))
         panel.maxSize = bounds.size
         if panel.frame != frame { panel.setFrame(frame, display: true) }
@@ -2272,7 +2279,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func screenConfigurationChanged() {
         clampToScreen()
-        panel.savePlacement()
+        panel.savePlacement(to: store.defaults)
     }
 
     func updateWindowLevel() {
@@ -2285,9 +2292,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func windowDidEnterFullScreen(_ notification: Notification) { changingFullScreen = false }
     func windowWillExitFullScreen(_ notification: Notification) { changingFullScreen = true }
     func windowDidExitFullScreen(_ notification: Notification) { changingFullScreen = false; clampToScreen() }
-    func windowDidMove(_ notification: Notification) { if !changingFullScreen { panel.savePlacement() } }
-    func windowDidResize(_ notification: Notification) { clampToScreen(); if !changingFullScreen { panel.savePlacement() } }
-    func windowDidChangeScreen(_ notification: Notification) { clampToScreen(); if !changingFullScreen { panel.savePlacement() } }
+    func windowDidMove(_ notification: Notification) { if !changingFullScreen { panel.savePlacement(to: store.defaults) } }
+    func windowDidResize(_ notification: Notification) { clampToScreen(); if !changingFullScreen { panel.savePlacement(to: store.defaults) } }
+    func windowDidChangeScreen(_ notification: Notification) { clampToScreen(); if !changingFullScreen { panel.savePlacement(to: store.defaults) } }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationWillTerminate(_ notification: Notification) { store.ai.saveConversations() }

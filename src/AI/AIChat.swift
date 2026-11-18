@@ -275,6 +275,7 @@ struct AISession: Codable, Identifiable {
     var summaryTitle: String?
     var titleAttempted: Bool?
     var isArchived: Bool?
+    var isPinned: Bool?
     var webPageURLs: [URL]?
     var pageReferences: [AIPageReference]?
     var readingPosition: AIReadingPosition?
@@ -282,7 +283,7 @@ struct AISession: Codable, Identifiable {
     var searchEnabled: Bool?
     var title: String { summaryTitle ?? String(messages.first?.text.prefix(20) ?? "新对话") }
     // A request cannot resume after the application exits.
-    enum CodingKeys: String, CodingKey { case id, updated, messages, error, origin, summaryTitle, titleAttempted, isArchived, webPageURLs, pageReferences, readingPosition, searchChoice, searchEnabled }
+    enum CodingKeys: String, CodingKey { case id, updated, messages, error, origin, summaryTitle, titleAttempted, isArchived, isPinned, webPageURLs, pageReferences, readingPosition, searchChoice, searchEnabled }
     mutating func finishActivity(searchStatus: String) {
         phase = nil
         if let index = messages.indices.last, messages[index].role == "assistant",
@@ -1102,15 +1103,35 @@ final class AIController: ObservableObject {
         for id in ids { conversations.removeValue(forKey: id); readingPositions.removeValue(forKey: id) }
         saveConversations()
     }
+    private func updateConversations(_ ids: Set<UUID>, update: (inout AISession) -> Void) {
+        for id in ids where conversations[id] != nil { update(&conversations[id]!) }
+        for owner in Array(sessions.keys) where sessions[owner].map({ ids.contains($0.id) }) == true {
+            update(&sessions[owner]!)
+        }
+        saveConversations()
+    }
+    func renameConversation(_ id: UUID, title: String) {
+        let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { return }
+        updateConversations([id]) { session in
+            session.summaryTitle = title
+            session.titleAttempted = true
+        }
+    }
+    func pinConversations(_ ids: Set<UUID>, pinned: Bool) {
+        updateConversations(ids) { session in
+            if session.isArchived != true { session.isPinned = pinned }
+        }
+    }
     func archiveConversations(_ ids: Set<UUID>) {
         for owner in Array(sessions.keys) where sessions[owner].map({ ids.contains($0.id) }) == true {
             queuedMessages.removeValue(forKey: owner); pausedQueues.remove(owner)
             tasks.removeValue(forKey: owner)?.cancel()
             sessions[owner]?.finishActivity(searchStatus: "搜索已停止")
-            sessions[owner]?.requestID = nil; sessions[owner]?.isArchived = true
+            sessions[owner]?.requestID = nil; sessions[owner]?.isArchived = true; sessions[owner]?.isPinned = false
             cancelEditing(owner)
         }
-        for id in ids where conversations[id] != nil { conversations[id]?.isArchived = true }
+        for id in ids where conversations[id] != nil { conversations[id]?.isArchived = true; conversations[id]?.isPinned = false }
         saveConversations()
     }
     func restoreConversations(_ ids: Set<UUID>) {
@@ -1128,7 +1149,7 @@ final class AIController: ObservableObject {
         }
         copy.id = UUID(); copy.updated = Date(); copy.requestID = nil; copy.error = nil; copy.readingPosition = nil
         copy.finishActivity(searchStatus: "搜索已中断")
-        copy.summaryTitle = String(copy.title.prefix(17)) + " 副本"; copy.titleAttempted = true; copy.isArchived = false
+        copy.summaryTitle = String(copy.title.prefix(17)) + " 副本"; copy.titleAttempted = true; copy.isArchived = false; copy.isPinned = false
         for index in copy.messages.indices { copy.messages[index].id = UUID() }
         conversations[copy.id] = copy; saveConversations()
         return copy.id
@@ -1460,7 +1481,7 @@ final class AIController: ObservableObject {
                 conversations[original.id] = original
                 revised.id = UUID(); revised.updated = Date(); revised.error = nil
                 revised.summaryTitle = String(original.title.prefix(17)) + " 副本"
-                revised.titleAttempted = true; revised.isArchived = false
+                revised.titleAttempted = true; revised.isArchived = false; revised.isPinned = false
             }
             revised.messages = Array(original.messages.prefix(index))
             if edit.fork {
@@ -1526,7 +1547,10 @@ final class AIController: ObservableObject {
                     let title = try? await self.summarizeTitle(String(question.prefix(500)), configuration: configuration, model: model, key: key)
                     try Task.checkCancellation()
                     guard self.sessions[tab]?.requestID == requestID else { return }
-                    self.sessions[tab]?.summaryTitle = title ?? String((question.isEmpty ? "附件对话" : question).prefix(20))
+                    // A manual rename made while the title request was running takes precedence.
+                    if self.sessions[tab]?.summaryTitle == nil {
+                        self.sessions[tab]?.summaryTitle = title ?? String((question.isEmpty ? "附件对话" : question).prefix(20))
+                    }
                     self.saveConversations()
                 }
                 var content = question

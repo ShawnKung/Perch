@@ -1532,7 +1532,9 @@ struct AIChatSidebar: View {
                           delete: { if showArchived { ai.deleteConversations($0) } else { ai.archiveConversations($0) } },
                           fork: { if let id = ai.forkConversation($0) { store.openChat(conversation: id) } },
                           archived: showArchived, restore: { ai.restoreConversations($0) },
-                          newChat: newChat)
+                          newChat: newChat,
+                          rename: { ai.renameConversation($0, title: $1) },
+                          pin: { ai.pinConversations($0, pinned: $1) })
                 .id(showArchived)
             HStack {
                 Button(showArchived ? "返回历史对话" : "已归档对话") { showArchived.toggle() }
