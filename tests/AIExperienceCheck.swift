@@ -198,7 +198,7 @@ extension AISelfCheck {
             guard let node = node as? NSObject else { return nil }
             for key in ["accessibilityLabel", "accessibilityTitle"] where node.responds(to: NSSelectorFromString(key)) {
                 if node.value(forKey: key) as? String == label {
-                    if label != "Chat 正文字号" ||
+                    if label != "Chat字号" ||
                         (node.responds(to: NSSelectorFromString("accessibilityRole")) &&
                          node.value(forKey: "accessibilityRole") as? String == NSAccessibility.Role.slider.rawValue) {
                         return node
@@ -240,9 +240,9 @@ extension AISelfCheck {
         click(NSPoint(x: follow.maxX - 12, y: follow.midY))
         try await wait { !store.settings.followMouseOnShow }
         print("PASS: native mouse-follow toggle enables/disables and persists settings")
-        try await wait { element(settingsHost, "Chat 正文字号") != nil }
+        try await wait { element(settingsHost, "Chat字号") != nil }
         try snapshot(settingsHost, "settings-font-default")
-        let slider = try frame(settingsHost, "Chat 正文字号")
+        let slider = try frame(settingsHost, "Chat字号")
         click(NSPoint(x: slider.maxX - 8, y: slider.midY))
         try await wait { store.settings.chatFontSize > 13 }
         try await Task.sleep(nanoseconds: 150_000_000)

@@ -78,6 +78,7 @@ enum SelfTests {
     }
     @MainActor
     static func run() throws {
+        try BackupSelfCheck.run()
         try addressSuggestions()
         try databaseSnapshot()
         let source = NSRect(x: 0, y: 25, width: 1440, height: 875)
@@ -1806,8 +1807,22 @@ final class LayoutSelfCheck {
         await hover("#link")
         flags(.option)
         check(trigger.preview != nil, "Zero seconds must present immediately in the triggering event; active=\(NSApp.isActive), key=\(panel.isKeyWindow), link=\(browser.hoverLinks?.site?.address ?? "none")")
-        trigger.preview?.close()
+        let fading = trigger.preview!
         await settle()
+        check(fading.window.alphaValue == 1 && fading.window.isVisible, "Preview must finish fading in")
+        fading.close()
+        check(fading.window.ignoresMouseEvents, "Fading-out preview must stop accepting clicks immediately")
+        await settle()
+        check(trigger.preview == nil && !fading.window.isVisible && fading.window.contentView == nil,
+              "Fade-out must release preview content and detach the child window")
+        flags([])
+        await focus()
+        await hover("#link")
+        flags(.option)
+        let interrupted = trigger.preview!
+        interrupted.close()
+        await settle()
+        check(trigger.preview == nil && !interrupted.window.isVisible, "Closing during fade-in must stay closed")
         check(store.tabs.map(\.id) == tabs && store.history.count == visits, "Preview must not add tabs or history")
         print("PASS: hover/frame link tracking, isolated bridge, invalid URL rejection, zero-delay immediate trigger, huge-delay cancellation, hold/release/leave/edit cancellation, custom trigger, global switch, Esc, no nesting, remembered size and tab/history isolation")
     }
@@ -1823,7 +1838,7 @@ final class LayoutSelfCheck {
         }
         precondition(root.bounds.size == NSSize(width: 780, height: 580),
                      "Settings must open at the shared bookmark manager size")
-        precondition(LibraryPage.allCases.map(\.rawValue) == ["常规", "AI", "书签与历史", "密码", "导入"],
+        precondition(LibraryPage.allCases.map(\.rawValue) == ["常规", "AI", "书签与历史", "密码", "导入导出"],
                      "Manager tabs must keep the requested labels and order")
         precondition(!(sheet.firstResponder is NSTextView), "Opening settings must not auto-focus numeric input")
         NSApp.accessibilitySetValue(true, forAttribute: NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface"))
@@ -1904,6 +1919,16 @@ final class LayoutSelfCheck {
             precondition(panel.sheets.first === sheet && sheet.frame == frame &&
                          root.bounds.size == NSSize(width: 780, height: 580),
                          "All library pages must preserve the same sheet and content size")
+            if page == .importer {
+                for label in ["导出 ZIP…", "导入 ZIP…"] {
+                    guard let button = themeButton(root, label: label),
+                          let frame = (button.value(forKey: "accessibilityFrame") as? NSValue)?.rectValue else {
+                        preconditionFailure("Backup actions must be accessible")
+                    }
+                    precondition(frame.width > 40 && frame.height > 10 && sheet.frame.contains(frame),
+                                 "Backup actions must be visible in the fixed-size manager")
+                }
+            }
             let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds)!
             root.cacheDisplay(in: root.bounds, to: bitmap)
             let color = bitmap.colorAt(x: Int(10 * CGFloat(bitmap.pixelsWide) / root.bounds.width),
@@ -2412,6 +2437,21 @@ final class WindowSelfCheck {
         restored.setFrame(manual, display: false)
         delegate.show()
         precondition(restored.frame == manual, "Disabled mouse following must preserve manual placement")
+        let importedFrame = NSRect(x: screen.visibleFrame.minX + 50, y: screen.visibleFrame.minY + 60,
+                                   width: 700, height: 540)
+        defaults.set(NSStringFromRect(importedFrame), forKey: LayoutPreference.windowFrame.rawValue)
+        delegate.restoreImportedPlacement()
+        precondition(restored.frame == importedFrame, "Imported placement must apply before the current window can overwrite it")
+        let deferredFrame = importedFrame.offsetBy(dx: 20, dy: 20)
+        delegate.windowWillEnterFullScreen(Notification(name: NSWindow.willEnterFullScreenNotification, object: restored))
+        defaults.set(NSStringFromRect(deferredFrame), forKey: LayoutPreference.windowFrame.rawValue)
+        delegate.restoreImportedPlacement()
+        delegate.windowDidMove(Notification(name: NSWindow.didMoveNotification, object: restored))
+        precondition(restored.frame == importedFrame &&
+                     defaults.string(forKey: LayoutPreference.windowFrame.rawValue) == NSStringFromRect(deferredFrame),
+                     "Fullscreen transition must defer placement without overwriting imported coordinates")
+        delegate.windowDidExitFullScreen(Notification(name: NSWindow.didExitFullScreenNotification, object: restored))
+        precondition(restored.frame == deferredFrame, "Leaving fullscreen must apply pending imported placement")
         for bounds in [NSRect(x: -1600, y: 30, width: 1600, height: 900),
                        NSRect(x: 100, y: -700, width: 700, height: 600)] {
             for point in [NSPoint(x: bounds.minX, y: bounds.minY), NSPoint(x: bounds.maxX, y: bounds.maxY),

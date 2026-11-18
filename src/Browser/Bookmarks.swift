@@ -904,7 +904,7 @@ final class BookmarkPreviewController: NSObject, NSWindowDelegate {
         self.defaults = defaults
         self.parentWindow = parent
         let available = parent.screen?.visibleFrame.size ?? NSSize(width: 1040, height: 720)
-        let saved = defaults.string(forKey: "previewContentSize").map(NSSizeFromString) ?? NSSize(width: 960, height: 640)
+        let saved = defaults.string(forKey: LayoutPreference.previewContentSize.rawValue).map(NSSizeFromString) ?? NSSize(width: 960, height: 640)
         let valid = saved.width.isFinite && saved.height.isFinite && saved.width >= 640 && saved.height >= 420
         let preferred = valid ? saved : NSSize(width: 960, height: 640)
         let size = NSSize(width: max(640, min(preferred.width, available.width - 80)),
@@ -944,7 +944,15 @@ final class BookmarkPreviewController: NSObject, NSWindowDelegate {
                                         from: bounds, to: bounds)
         window.setFrame(frame, display: false)
         parent.addChildWindow(window, ordered: .above)
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        window.alphaValue = reduceMotion ? 1 : 0
         window.makeKeyAndOrderFront(nil)
+        if !reduceMotion {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.14
+                window.animator().alphaValue = 1
+            }
+        }
     }
     func openInTab() {
         guard !closing, let url = URLInput.parse(browser.address, search: false) else { return }
@@ -954,14 +962,24 @@ final class BookmarkPreviewController: NSObject, NSWindowDelegate {
     func close() {
         guard !closing else { return }
         closing = true
-        finish()
+        window.ignoresMouseEvents = true
+        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion || !window.isVisible {
+            finish()
+        } else {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.14
+                window.animator().alphaValue = 0
+            } completionHandler: { [self] in
+                Task { @MainActor in finish() }
+            }
+        }
     }
     func windowShouldClose(_ sender: NSWindow) -> Bool { close(); return false }
     func windowDidResize(_ notification: Notification) { saveSize() }
     private func saveSize() {
         guard !window.styleMask.contains(.fullScreen), !changingFullScreen,
               let content = window.contentView, content.bounds.width >= 640, content.bounds.height >= 420 else { return }
-        defaults.set(NSStringFromSize(content.bounds.size), forKey: "previewContentSize")
+        defaults.set(NSStringFromSize(content.bounds.size), forKey: LayoutPreference.previewContentSize.rawValue)
     }
     deinit { if let escapeMonitor { NSEvent.removeMonitor(escapeMonitor) } }
     private func finish() {
