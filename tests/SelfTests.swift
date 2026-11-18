@@ -449,7 +449,7 @@ enum SelfTests {
         let previewBrowser = store.bookmarkPreviewBrowser(for: previewSite)!
         precondition(!previewBrowser.webView.configuration.websiteDataStore.isPersistent)
         precondition(previewBrowser.onVisit == nil)
-        previewBrowser.onNewTab?(URL(string: "http://127.0.0.1:9/next")!)
+        previewBrowser.onNewTab?(URL(string: "http://127.0.0.1:9/next")!, false)
         precondition(previewBrowser.address == "http://127.0.0.1:9/next")
         precondition(store.tabs.map(\.id) == previewTabs && store.history.count == previewHistory.count)
         precondition(store.bookmarkPreviewBrowser(for: Site(title: "Invalid", address: "javascript:alert(1)")) == nil)
@@ -868,6 +868,37 @@ enum WebTabSelfCheck {
         var hit = root.hitTest(root.convert(NSPoint(x: first.bounds.midX, y: first.bounds.midY), from: first))
         while hit != nil && hit !== first { hit = hit?.superview }
         precondition(hit === first, "Browser status overlays must not intercept page clicks")
+        let savedTabCount = store.tabs.count
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        try await AISelfCheck.wait { NSApp.isActive && window.isKeyWindow }
+        window.makeFirstResponder(first)
+        _ = try await first.evaluateJavaScript("""
+        const link=document.createElement('a');link.id='backgroundLink';link.href='https://background-fixture.invalid/';
+        link.textContent='Background';link.style='position:fixed;left:30px;top:30px;z-index:1000';document.body.append(link);
+        """)
+        let position = try await first.evaluateJavaScript("""
+        (()=>{const r=backgroundLink.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()
+        """) as! [String: Double]
+        let location = first.convert(NSPoint(x: position["x"]!, y: first.isFlipped ? position["y"]! : first.bounds.height - position["y"]!), to: nil)
+        for middle in [false, true] {
+            for type in middle ? [NSEvent.EventType.otherMouseDown, .otherMouseUp] : [.leftMouseDown, .leftMouseUp] {
+                let raw = NSEvent.mouseEvent(with: type, location: location, modifierFlags: middle ? [] : .command,
+                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil,
+                    eventNumber: 1, clickCount: 1, pressure: 1)!
+                let cg = raw.cgEvent!
+                if middle { cg.setIntegerValueField(.mouseEventButtonNumber, value: 2) }
+                window.sendEvent(middle ? NSEvent(cgEvent: cg)! : raw)
+            }
+            try await AISelfCheck.wait {
+                store.tabs.count >= savedTabCount + (middle ? 2 : 1)
+            }
+            precondition(store.tabs.count == savedTabCount + (middle ? 2 : 1), "A link click must create exactly one tab")
+            precondition(store.selected == firstID && first.window === window, "Modified link clicks must preserve the active tab")
+            let after = try await state()
+            precondition(after == before, "Background navigation must preserve scroll, input and document identity")
+        }
+        print("PASS: native Command-click and middle-click open background tabs without changing the current page")
         window.setContentSize(NSSize(width: 950, height: 700))
         try await AISelfCheck.wait { first.frame != firstFrame }
         precondition(second.frame == secondFrame, "Actual resizing must not resize detached pages")
@@ -1602,7 +1633,7 @@ final class LayoutSelfCheck {
               }, true);
             }
             </script>
-            <a id="link" href="https://perch-preview.invalid/target">Preview target</a>
+            <a id="link" style="position:fixed;left:8px;top:8px" href="https://perch-preview.invalid/target">Preview target</a>
             <a id="unsafe" href="javascript:alert(1)">Unsafe target</a><input id="text">
             <iframe id="frame" srcdoc="<a id='inner' href='https://perch-frame.invalid/target'>Inner link</a>"></iframe>
             </body></html>
@@ -1745,6 +1776,7 @@ final class LayoutSelfCheck {
         let sourceScrollY = (try? await browser.webView.evaluateJavaScript("window.scrollY")) as? Double ?? -1
         check(sourceScrollY > 800, "Long source page must be scrolled before preview")
         await focus()
+        await hover("#link")
         flags(.control)
         await settle()
         guard let restored = trigger.preview else {
@@ -1769,6 +1801,7 @@ final class LayoutSelfCheck {
               store.tabs.last?.address == "http://127.0.0.1:9/preview-current",
               "Open in new tab must use the current preview URL exactly once")
         restored.openInTab()
+        restored.browser.onOpenInPerch?(URL(string: "http://127.0.0.1:9/duplicate")!)
         check(store.tabs.count == tabs.count + 1, "A closed preview must not open duplicate tabs")
         await settle()
         store.activate(tab)
@@ -1808,6 +1841,20 @@ final class LayoutSelfCheck {
         flags(.option)
         check(trigger.preview != nil, "Zero seconds must present immediately in the triggering event; active=\(NSApp.isActive), key=\(panel.isKeyWindow), link=\(browser.hoverLinks?.site?.address ?? "none")")
         let fading = trigger.preview!
+        check(fading.window.animationBehavior == .none, "Preview opacity transition must own window presentation")
+        if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            check(fading.window.alphaValue < 1, "Preview must start transparent")
+            var intermediateOpacity = false
+            let deadline = ProcessInfo.processInfo.systemUptime + 0.6
+            while ProcessInfo.processInfo.systemUptime < deadline {
+                let entries = CGWindowListCopyWindowInfo(.optionIncludingWindow, CGWindowID(fading.window.windowNumber)) as? [[String: Any]]
+                if let alpha = entries?.first?[kCGWindowAlpha as String] as? Double,
+                   alpha > 0, alpha < 1 { intermediateOpacity = true; break }
+                if fading.window.alphaValue == 1 { break }
+                try? await Task.sleep(nanoseconds: 5_000_000)
+            }
+            check(intermediateOpacity, "Window server must display intermediate preview opacity")
+        }
         await settle()
         check(fading.window.alphaValue == 1 && fading.window.isVisible, "Preview must finish fading in")
         fading.close()

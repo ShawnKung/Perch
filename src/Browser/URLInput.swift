@@ -63,16 +63,16 @@ enum URLInput {
         precondition(parse(" example.com ")?.absoluteString == "https://example.com/")
         precondition(parse("https://EXAMPLE.com") == parse("https://example.com/"))
         precondition(parse("http://localhost:8080/a")?.host == "localhost")
-        precondition(parse("10.37.94.112:10000")?.absoluteString == "http://10.37.94.112:10000/")
+        precondition(parse("10.0.0.1:10000")?.absoluteString == "http://10.0.0.1:10000/")
         precondition(parse("localhost:8080/a")?.scheme == "http")
         precondition(parse("192.168.1.1")?.scheme == "http")
         precondition(parse("172.16.0.1")?.scheme == "http")
         precondition(parse("172.32.0.1")?.scheme == "https")
         precondition(parse("8.8.8.8")?.scheme == "https")
-        precondition(parse("https://10.37.94.112:10000")?.scheme == "https")
+        precondition(parse("https://10.0.0.1:10000")?.scheme == "https")
         let tls = NSError(domain: NSURLErrorDomain, code: NSURLErrorSecureConnectionFailed)
-        precondition(httpAlternative(for: "https://10.37.94.112:10000/a?q=b", error: tls)?.absoluteString ==
-                     "http://10.37.94.112:10000/a?q=b")
+        precondition(httpAlternative(for: "https://10.0.0.1:10000/a?q=b", error: tls)?.absoluteString ==
+                     "http://10.0.0.1:10000/a?q=b")
         precondition(httpAlternative(for: "https://example.com", error: tls) == nil)
         precondition(httpAlternative(for: "https://10.0.0.1", error: NSError(domain: NSURLErrorDomain,
                                                                           code: NSURLErrorTimedOut)) == nil)
