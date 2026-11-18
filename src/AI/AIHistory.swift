@@ -462,26 +462,34 @@ struct AIHistoryList: NSViewRepresentable {
             menuSelection = Set(table.selectedRowIndexes.compactMap { rows[$0].session?.id })
             forkID = session.id
             let menu = NSMenu()
-            let copy = NSMenuItem(title: "Fork（复制对话）", action: #selector(copyConversation), keyEquivalent: "")
-            copy.target = self; menu.addItem(copy)
             if menuSelection.count == 1 {
                 let rename = NSMenuItem(title: "重命名…", action: #selector(renameConversation), keyEquivalent: "")
+                rename.image = NSImage(systemSymbolName: "pencil", accessibilityDescription: nil)
                 rename.target = self; menu.addItem(rename)
             }
+            let copy = NSMenuItem(title: "复制会话", action: #selector(copyConversation), keyEquivalent: "")
+            copy.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: nil)
+            copy.target = self; menu.addItem(copy)
             if !parent.archived {
                 pinSelection = parent.conversations.contains { menuSelection.contains($0.id) && $0.isPinned != true }
                 let pin = NSMenuItem(title: pinSelection ? "置顶会话" : "取消置顶", action: #selector(pinConversations), keyEquivalent: "")
+                pin.image = NSImage(systemSymbolName: pinSelection ? "pin" : "pin.slash", accessibilityDescription: nil)
                 pin.target = self; menu.addItem(pin)
             }
-            menu.addItem(.separator())
             if parent.archived {
                 let restore = NSMenuItem(title: "恢复对话", action: #selector(restoreSelection), keyEquivalent: "")
+                restore.image = NSImage(systemSymbolName: "arrow.uturn.backward", accessibilityDescription: nil)
                 restore.target = self; menu.addItem(restore)
             }
             let verb = parent.archived ? "彻底删除" : "归档"
-            let remove = NSMenuItem(title: menuSelection.count > 1 ? "\(verb) \(menuSelection.count) 个对话" : "\(verb)对话",
+            let remove = NSMenuItem(title: menuSelection.count > 1 ? "\(verb) \(menuSelection.count) 个会话" : "\(verb)会话",
                                     action: #selector(deleteSelection), keyEquivalent: "")
+            remove.image = NSImage(systemSymbolName: parent.archived ? "trash" : "archivebox", accessibilityDescription: nil)
             remove.target = self; menu.addItem(remove)
+            // macOS 27 hides menu images by default.
+            if #available(macOS 27.0, *) {
+                for item in menu.items { item.preferredImageVisibility = .visible }
+            }
             return menu
         }
         @objc func copyConversation() { if let forkID { parent.fork(forkID) } }

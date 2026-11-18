@@ -45,20 +45,41 @@ window.renderTable = rows => {
   document.documentElement.style.overflow='auto'; document.body.style.overflow='auto'; document.body.style.padding='12px';
 };
 window.enhanceCitations = (root, sources) => {
-  const known = new Map(sources.map(source => [source.url, source]));
+  const canonical = value => {try {return new URL(value).href} catch (_) {return value}};
+  const known = new Map(sources.map(source => [canonical(source.url), source]));
+  const targets = new Map();
+  let activeLink = null;
+  const activate = (link, event = {}) => {
+    if (activeLink === link) return;
+    if (activeLink) targets.get(activeLink)?.hide();
+    activeLink = link;
+    if (link) targets.get(link)?.show(event);
+  };
+  window.updateCitationHover = (x, y) => {
+    const link = Number.isFinite(x) && Number.isFinite(y)
+      ? document.elementFromPoint(x, y)?.closest('a.source-citation') : null;
+    activate(link && targets.has(link) ? link : null, {clientX:x, clientY:y});
+  };
   root.querySelectorAll('a').forEach(link => {
-    const source = known.get(link.href);
-    if (!source) return;
+    if (!/^https?:/i.test(link.href)) return;
+    const source = known.get(link.href) || {url:link.href, title:link.textContent.trim() || link.hostname};
     link.classList.add('source-citation');
     link.setAttribute('aria-label', link.textContent + ' · ' + source.title);
-    const show=()=>{
-      const r=link.getBoundingClientRect();
+    const show=event=>{
+      const rects=Array.from(link.getClientRects());
+      const r=rects.find(r=>event.clientX>=r.left && event.clientX<=r.right && event.clientY>=r.top && event.clientY<=r.bottom) || rects[0];
+      if (!r) return;
       window.webkit.messageHandlers.markdown.postMessage({citation:{
-        action:'enter',url:source.url,x:r.x,y:r.y,width:r.width,height:r.height
+        action:'enter',url:source.url,title:source.title,x:r.x,y:r.y,width:r.width,height:r.height
       }});
     };
     const hide=()=>window.webkit.messageHandlers.markdown.postMessage({citation:{action:'leave',url:source.url}});
-    link.addEventListener('mouseenter',show); link.addEventListener('mouseleave',hide);
-    link.addEventListener('focus',show); link.addEventListener('blur',hide);
+    targets.set(link, {show, hide});
+    if (!window.nativeCitationHover) {
+      link.addEventListener('mouseenter',event=>activate(link,event));
+      link.addEventListener('mouseleave',()=>{if (activeLink===link) activate(null)});
+    }
+    link.addEventListener('focus',event=>activate(link,event));
+    link.addEventListener('blur',()=>{if (activeLink===link) activate(null)});
   });
 };
