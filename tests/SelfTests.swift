@@ -78,6 +78,7 @@ enum SelfTests {
     }
     @MainActor
     static func run() throws {
+        try BackupSelfCheck.run()
         try addressSuggestions()
         try databaseSnapshot()
         let source = NSRect(x: 0, y: 25, width: 1440, height: 875)
@@ -448,7 +449,7 @@ enum SelfTests {
         let previewBrowser = store.bookmarkPreviewBrowser(for: previewSite)!
         precondition(!previewBrowser.webView.configuration.websiteDataStore.isPersistent)
         precondition(previewBrowser.onVisit == nil)
-        previewBrowser.onNewTab?(URL(string: "http://127.0.0.1:9/next")!)
+        previewBrowser.onNewTab?(URL(string: "http://127.0.0.1:9/next")!, false)
         precondition(previewBrowser.address == "http://127.0.0.1:9/next")
         precondition(store.tabs.map(\.id) == previewTabs && store.history.count == previewHistory.count)
         precondition(store.bookmarkPreviewBrowser(for: Site(title: "Invalid", address: "javascript:alert(1)")) == nil)
@@ -867,6 +868,37 @@ enum WebTabSelfCheck {
         var hit = root.hitTest(root.convert(NSPoint(x: first.bounds.midX, y: first.bounds.midY), from: first))
         while hit != nil && hit !== first { hit = hit?.superview }
         precondition(hit === first, "Browser status overlays must not intercept page clicks")
+        let savedTabCount = store.tabs.count
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        try await AISelfCheck.wait { NSApp.isActive && window.isKeyWindow }
+        window.makeFirstResponder(first)
+        _ = try await first.evaluateJavaScript("""
+        const link=document.createElement('a');link.id='backgroundLink';link.href='https://background-fixture.invalid/';
+        link.textContent='Background';link.style='position:fixed;left:30px;top:30px;z-index:1000';document.body.append(link);
+        """)
+        let position = try await first.evaluateJavaScript("""
+        (()=>{const r=backgroundLink.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()
+        """) as! [String: Double]
+        let location = first.convert(NSPoint(x: position["x"]!, y: first.isFlipped ? position["y"]! : first.bounds.height - position["y"]!), to: nil)
+        for middle in [false, true] {
+            for type in middle ? [NSEvent.EventType.otherMouseDown, .otherMouseUp] : [.leftMouseDown, .leftMouseUp] {
+                let raw = NSEvent.mouseEvent(with: type, location: location, modifierFlags: middle ? [] : .command,
+                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil,
+                    eventNumber: 1, clickCount: 1, pressure: 1)!
+                let cg = raw.cgEvent!
+                if middle { cg.setIntegerValueField(.mouseEventButtonNumber, value: 2) }
+                window.sendEvent(middle ? NSEvent(cgEvent: cg)! : raw)
+            }
+            try await AISelfCheck.wait {
+                store.tabs.count >= savedTabCount + (middle ? 2 : 1)
+            }
+            precondition(store.tabs.count == savedTabCount + (middle ? 2 : 1), "A link click must create exactly one tab")
+            precondition(store.selected == firstID && first.window === window, "Modified link clicks must preserve the active tab")
+            let after = try await state()
+            precondition(after == before, "Background navigation must preserve scroll, input and document identity")
+        }
+        print("PASS: native Command-click and middle-click open background tabs without changing the current page")
         window.setContentSize(NSSize(width: 950, height: 700))
         try await AISelfCheck.wait { first.frame != firstFrame }
         precondition(second.frame == secondFrame, "Actual resizing must not resize detached pages")
@@ -1601,7 +1633,7 @@ final class LayoutSelfCheck {
               }, true);
             }
             </script>
-            <a id="link" href="https://perch-preview.invalid/target">Preview target</a>
+            <a id="link" style="position:fixed;left:8px;top:8px" href="https://perch-preview.invalid/target">Preview target</a>
             <a id="unsafe" href="javascript:alert(1)">Unsafe target</a><input id="text">
             <iframe id="frame" srcdoc="<a id='inner' href='https://perch-frame.invalid/target'>Inner link</a>"></iframe>
             </body></html>
@@ -1744,6 +1776,7 @@ final class LayoutSelfCheck {
         let sourceScrollY = (try? await browser.webView.evaluateJavaScript("window.scrollY")) as? Double ?? -1
         check(sourceScrollY > 800, "Long source page must be scrolled before preview")
         await focus()
+        await hover("#link")
         flags(.control)
         await settle()
         guard let restored = trigger.preview else {
@@ -1768,6 +1801,7 @@ final class LayoutSelfCheck {
               store.tabs.last?.address == "http://127.0.0.1:9/preview-current",
               "Open in new tab must use the current preview URL exactly once")
         restored.openInTab()
+        restored.browser.onOpenInPerch?(URL(string: "http://127.0.0.1:9/duplicate")!)
         check(store.tabs.count == tabs.count + 1, "A closed preview must not open duplicate tabs")
         await settle()
         store.activate(tab)
@@ -1806,8 +1840,36 @@ final class LayoutSelfCheck {
         await hover("#link")
         flags(.option)
         check(trigger.preview != nil, "Zero seconds must present immediately in the triggering event; active=\(NSApp.isActive), key=\(panel.isKeyWindow), link=\(browser.hoverLinks?.site?.address ?? "none")")
-        trigger.preview?.close()
+        let fading = trigger.preview!
+        check(fading.window.animationBehavior == .none, "Preview opacity transition must own window presentation")
+        if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            check(fading.window.alphaValue < 1, "Preview must start transparent")
+            var intermediateOpacity = false
+            let deadline = ProcessInfo.processInfo.systemUptime + 0.6
+            while ProcessInfo.processInfo.systemUptime < deadline {
+                let entries = CGWindowListCopyWindowInfo(.optionIncludingWindow, CGWindowID(fading.window.windowNumber)) as? [[String: Any]]
+                if let alpha = entries?.first?[kCGWindowAlpha as String] as? Double,
+                   alpha > 0, alpha < 1 { intermediateOpacity = true; break }
+                if fading.window.alphaValue == 1 { break }
+                try? await Task.sleep(nanoseconds: 5_000_000)
+            }
+            check(intermediateOpacity, "Window server must display intermediate preview opacity")
+        }
         await settle()
+        check(fading.window.alphaValue == 1 && fading.window.isVisible, "Preview must finish fading in")
+        fading.close()
+        check(fading.window.ignoresMouseEvents, "Fading-out preview must stop accepting clicks immediately")
+        await settle()
+        check(trigger.preview == nil && !fading.window.isVisible && fading.window.contentView == nil,
+              "Fade-out must release preview content and detach the child window")
+        flags([])
+        await focus()
+        await hover("#link")
+        flags(.option)
+        let interrupted = trigger.preview!
+        interrupted.close()
+        await settle()
+        check(trigger.preview == nil && !interrupted.window.isVisible, "Closing during fade-in must stay closed")
         check(store.tabs.map(\.id) == tabs && store.history.count == visits, "Preview must not add tabs or history")
         print("PASS: hover/frame link tracking, isolated bridge, invalid URL rejection, zero-delay immediate trigger, huge-delay cancellation, hold/release/leave/edit cancellation, custom trigger, global switch, Esc, no nesting, remembered size and tab/history isolation")
     }
@@ -1823,7 +1885,7 @@ final class LayoutSelfCheck {
         }
         precondition(root.bounds.size == NSSize(width: 780, height: 580),
                      "Settings must open at the shared bookmark manager size")
-        precondition(LibraryPage.allCases.map(\.rawValue) == ["常规", "AI", "书签与历史", "密码", "导入"],
+        precondition(LibraryPage.allCases.map(\.rawValue) == ["常规", "AI", "书签与历史", "密码", "导入导出"],
                      "Manager tabs must keep the requested labels and order")
         precondition(!(sheet.firstResponder is NSTextView), "Opening settings must not auto-focus numeric input")
         NSApp.accessibilitySetValue(true, forAttribute: NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface"))
@@ -1904,6 +1966,16 @@ final class LayoutSelfCheck {
             precondition(panel.sheets.first === sheet && sheet.frame == frame &&
                          root.bounds.size == NSSize(width: 780, height: 580),
                          "All library pages must preserve the same sheet and content size")
+            if page == .importer {
+                for label in ["导出 ZIP…", "导入 ZIP…"] {
+                    guard let button = themeButton(root, label: label),
+                          let frame = (button.value(forKey: "accessibilityFrame") as? NSValue)?.rectValue else {
+                        preconditionFailure("Backup actions must be accessible")
+                    }
+                    precondition(frame.width > 40 && frame.height > 10 && sheet.frame.contains(frame),
+                                 "Backup actions must be visible in the fixed-size manager")
+                }
+            }
             let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds)!
             root.cacheDisplay(in: root.bounds, to: bitmap)
             let color = bitmap.colorAt(x: Int(10 * CGFloat(bitmap.pixelsWide) / root.bounds.width),
@@ -1916,6 +1988,55 @@ final class LayoutSelfCheck {
         print("PASS: native library picker preserves the same 780x580 window and paper background through all \(LibraryPage.allCases.count) pages")
         store.library = nil
         await settle()
+        let originalFrame = panel.frame
+        func closeSettings() {
+            guard let current = panel.attachedSheet, let content = current.contentView,
+                  let done = themeButton(content, label: "完成"),
+                  let buttonFrame = (done.value(forKey: "accessibilityFrame") as? NSValue)?.rectValue else {
+                preconditionFailure("Settings must expose its Done button")
+            }
+            current.makeKeyAndOrderFront(nil)
+            let point = current.convertPoint(fromScreen: NSPoint(x: buttonFrame.midX, y: buttonFrame.midY))
+            for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                NSApp.sendEvent(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
+                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: current.windowNumber,
+                    context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!)
+            }
+        }
+        let screens = NSScreen.screens.map(\.visibleFrame)
+        for (index, bounds) in screens.enumerated() {
+            let small = NSRect(x: bounds.minX + 90, y: bounds.minY + 1, width: 700, height: 552)
+            panel.setFrame(small, display: true)
+            await settle()
+            let beforeSheet = panel.frame
+            store.library = .settings
+            await settle()
+            closeSettings()
+            await settle()
+            precondition(panel.attachedSheet == nil && panel.frame == beforeSheet,
+                         "An unmoved tall sheet must retain AppKit's ordinary parent restoration")
+            store.library = .settings
+            await settle()
+            let destination = screens[(index + 1) % screens.count]
+            panel.setPlacement(NSRect(origin: NSPoint(x: destination.minX + 120, y: destination.minY + 160),
+                                      size: panel.frame.size), display: true)
+            await settle()
+            let moved = panel.frame
+            var dismissalFrames: [NSRect] = []
+            let observer = NotificationCenter.default.addObserver(forName: NSWindow.didMoveNotification,
+                object: panel, queue: nil) { notification in
+                    dismissalFrames.append((notification.object as! NSWindow).frame)
+                }
+            closeSettings()
+            await settle()
+            NotificationCenter.default.removeObserver(observer)
+            precondition(panel.attachedSheet == nil && panel.frame == moved,
+                         "Closing a tall sheet must preserve the latest explicit window placement")
+            precondition(dismissalFrames.allSatisfy { $0 == moved },
+                         "The entire sheet dismissal must stay on the destination, without moving back first")
+        }
+        panel.setFrame(originalFrame, display: true)
+        print("PASS: actual Done clicks restore unmoved parents and keep relocated parents stationary throughout dismissal across \(screens.count) screens")
         try! store.saveSettings(initial)
         print("PASS: settings open without numeric focus; actual clicks retain input focus inside the field, blur on whitespace and save the decimal")
     }
@@ -2391,6 +2512,52 @@ final class WindowSelfCheck {
                      "Window frame restore: expected \(savedFrame), got \(restored.frame), restored=\(didRestore)")
         defaults.set("invalid", forKey: "windowFrame")
         precondition(!restored.restorePlacement(from: defaults), "Invalid frame data must be ignored")
+        let store = Store(defaults: defaults)
+        let delegate = AppDelegate(store: store)
+        delegate.panel = restored
+        store.settings.followMouseOnShow = true
+        delegate.show()
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main!
+        precondition(screen.visibleFrame.contains(restored.frame))
+        let expected = ScreenPlacement.nearMouse(mouse, size: restored.frame.size, in: screen.visibleFrame)
+        // AppKit aligns native window origins to screen pixels.
+        precondition(abs(restored.frame.minX - expected.minX) <= 1 && abs(restored.frame.minY - expected.minY) <= 1,
+                     "Mouse placement: expected \(expected), got \(restored.frame)")
+        let followed = restored.frame
+        restored.setFrameOrigin(NSPoint(x: followed.minX + 30, y: followed.minY + 30))
+        delegate.show()
+        precondition(restored.frame == followed, "Every explicit show must reposition near the mouse")
+        store.settings.followMouseOnShow = false
+        let manual = NSRect(x: screen.visibleFrame.minX + 10, y: screen.visibleFrame.minY + 10, width: 232, height: 176)
+        restored.setFrame(manual, display: false)
+        delegate.show()
+        precondition(restored.frame == manual, "Disabled mouse following must preserve manual placement")
+        let importedFrame = NSRect(x: screen.visibleFrame.minX + 50, y: screen.visibleFrame.minY + 60,
+                                   width: 700, height: 540)
+        defaults.set(NSStringFromRect(importedFrame), forKey: LayoutPreference.windowFrame.rawValue)
+        delegate.restoreImportedPlacement()
+        precondition(restored.frame == importedFrame, "Imported placement must apply before the current window can overwrite it")
+        let deferredFrame = importedFrame.offsetBy(dx: 20, dy: 20)
+        delegate.windowWillEnterFullScreen(Notification(name: NSWindow.willEnterFullScreenNotification, object: restored))
+        defaults.set(NSStringFromRect(deferredFrame), forKey: LayoutPreference.windowFrame.rawValue)
+        delegate.restoreImportedPlacement()
+        delegate.windowDidMove(Notification(name: NSWindow.didMoveNotification, object: restored))
+        precondition(restored.frame == importedFrame &&
+                     defaults.string(forKey: LayoutPreference.windowFrame.rawValue) == NSStringFromRect(deferredFrame),
+                     "Fullscreen transition must defer placement without overwriting imported coordinates")
+        delegate.windowDidExitFullScreen(Notification(name: NSWindow.didExitFullScreenNotification, object: restored))
+        precondition(restored.frame == deferredFrame, "Leaving fullscreen must apply pending imported placement")
+        for bounds in [NSRect(x: -1600, y: 30, width: 1600, height: 900),
+                       NSRect(x: 100, y: -700, width: 700, height: 600)] {
+            for point in [NSPoint(x: bounds.minX, y: bounds.minY), NSPoint(x: bounds.maxX, y: bounds.maxY),
+                          NSPoint(x: bounds.midX, y: bounds.midY)] {
+                let frame = ScreenPlacement.nearMouse(point, size: NSSize(width: 850, height: 660), in: bounds)
+                precondition(bounds.contains(frame), "Mouse placement must fit negative-coordinate and smaller displays")
+            }
+        }
+        restored.orderOut(nil)
+        print("PASS: real window show follows mouse on each presentation, disabled placement and multi-screen edge fitting")
         panel.showAnimated()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [self] in
             precondition(panel.isVisible && panel.alphaValue == 1)

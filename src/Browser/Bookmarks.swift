@@ -904,7 +904,7 @@ final class BookmarkPreviewController: NSObject, NSWindowDelegate {
         self.defaults = defaults
         self.parentWindow = parent
         let available = parent.screen?.visibleFrame.size ?? NSSize(width: 1040, height: 720)
-        let saved = defaults.string(forKey: "previewContentSize").map(NSSizeFromString) ?? NSSize(width: 960, height: 640)
+        let saved = defaults.string(forKey: LayoutPreference.previewContentSize.rawValue).map(NSSizeFromString) ?? NSSize(width: 960, height: 640)
         let valid = saved.width.isFinite && saved.height.isFinite && saved.width >= 640 && saved.height >= 420
         let preferred = valid ? saved : NSSize(width: 960, height: 640)
         let size = NSSize(width: max(640, min(preferred.width, available.width - 80)),
@@ -913,9 +913,13 @@ final class BookmarkPreviewController: NSObject, NSWindowDelegate {
                           styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                           backing: .buffered, defer: false)
         super.init()
+        browser.onOpenInPerch = { [weak self] url in
+            self?.openInTab(url)
+        }
         window.title = title
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
+        window.animationBehavior = .none
         window.collectionBehavior = [.fullScreenPrimary]
         for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
             window.standardWindowButton(type)?.isHidden = true
@@ -943,25 +947,44 @@ final class BookmarkPreviewController: NSObject, NSWindowDelegate {
                                                width: window.frame.width, height: window.frame.height),
                                         from: bounds, to: bounds)
         window.setFrame(frame, display: false)
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        // Adding a child orders it on screen, so prepare opacity before attachment.
+        window.alphaValue = reduceMotion ? 1 : 0
         parent.addChildWindow(window, ordered: .above)
         window.makeKeyAndOrderFront(nil)
+        if !reduceMotion {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.22
+                window.animator().alphaValue = 1
+            }
+        }
     }
-    func openInTab() {
-        guard !closing, let url = URLInput.parse(browser.address, search: false) else { return }
+    func openInTab(_ address: URL? = nil) {
+        guard !closing, let url = URLInput.parse(address?.absoluteString ?? browser.address, search: false) else { return }
         onOpenTab?(Site(title: browser.title, address: url.absoluteString))
         close()
     }
     func close() {
         guard !closing else { return }
         closing = true
-        finish()
+        window.ignoresMouseEvents = true
+        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion || !window.isVisible {
+            finish()
+        } else {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.14
+                window.animator().alphaValue = 0
+            } completionHandler: { [self] in
+                Task { @MainActor in finish() }
+            }
+        }
     }
     func windowShouldClose(_ sender: NSWindow) -> Bool { close(); return false }
     func windowDidResize(_ notification: Notification) { saveSize() }
     private func saveSize() {
         guard !window.styleMask.contains(.fullScreen), !changingFullScreen,
               let content = window.contentView, content.bounds.width >= 640, content.bounds.height >= 420 else { return }
-        defaults.set(NSStringFromSize(content.bounds.size), forKey: "previewContentSize")
+        defaults.set(NSStringFromSize(content.bounds.size), forKey: LayoutPreference.previewContentSize.rawValue)
     }
     deinit { if let escapeMonitor { NSEvent.removeMonitor(escapeMonitor) } }
     private func finish() {

@@ -121,7 +121,8 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         webView.find(findQuery, configuration: configuration) { _ in }
     }
     var onVisit: ((String, String) -> Void)?
-    var onNewTab: ((URL) -> Void)?
+    var onNewTab: ((URL, Bool) -> Void)?
+    var onOpenInPerch: ((URL) -> Void)?
     var onBookmark: (() -> Void)?
     var isBookmarked: (() -> Bool)?
     var clipboard = NSPasteboard.general
@@ -192,7 +193,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         add(loading ? "停止加载" : "重新加载", loading ? "stop" : "reload")
         menu.addItem(.separator())
         add("复制当前网址", "copy")
-        add("在默认浏览器打开", "external")
+        add("在 Perch 中打开", "external")
         if onBookmark != nil { add(isBookmarked?() == true ? "移除书签" : "加入书签", "bookmark") }
         add("在页面中查找…", "find")
     }
@@ -218,7 +219,10 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         case "stop": webView.stopLoading()
         case "copy": clipboard.clearContents(); clipboard.setString(values[1], forType: .string)
         case "external":
-            if let url = URLInput.parse(values[1], search: false) { NSWorkspace.shared.open(url) }
+            if let url = URLInput.parse(values[1], search: false) {
+                if let onOpenInPerch { onOpenInPerch(url) }
+                else { onNewTab?(url, false) }
+            }
         case "bookmark": onBookmark?()
         case "find": finding = true
         default: break
@@ -339,17 +343,27 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         guard let url = navigationAction.request.url,
               ["http", "https", "about"].contains(url.scheme?.lowercased() ?? "") else {
-            error = "这个链接需要其他应用打开，请使用右上角的「在浏览器打开」。"
+            error = "此链接使用其他应用的专用协议，Perch 暂不支持打开。"
+            decisionHandler(.cancel)
+            return
+        }
+        if navigationAction.navigationType == .linkActivated, opensInBackground(navigationAction) {
+            onNewTab?(url, true)
             decisionHandler(.cancel)
             return
         }
         decisionHandler(.allow)
     }
 
+    private func opensInBackground(_ action: WKNavigationAction) -> Bool {
+        // WebKit exposes a button bit mask (middle = 1 << 2), unlike NSEvent's zero-based index.
+        action.buttonNumber == 1 << 2 || action.modifierFlags.contains(.command)
+    }
+
     func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse,
                  decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
         guard navigationResponse.canShowMIMEType else {
-            error = "此内容需要下载。请在默认浏览器中打开后下载。"
+            error = "此内容需要下载，Perch 暂不支持下载。"
             decisionHandler(.cancel)
             return
         }
@@ -361,7 +375,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
                  for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
         if navigationAction.targetFrame == nil, let url = navigationAction.request.url,
            ["https", "http"].contains(url.scheme?.lowercased() ?? "") {
-            onNewTab?(url)
+            onNewTab?(url, opensInBackground(navigationAction))
         }
         return nil
     }
@@ -471,6 +485,7 @@ final class Store: ObservableObject {
     }
     private var protectedKeys = Set<String>()
     var changeWindow: (() -> Void)?
+    var restoreWindowPlacement: (() -> Void)?
     var hideWindow: (() -> Void)?
     var applyHotkeys: ((BrowserSettings) throws -> Void)?
     var shortcutRecording: ((Bool) -> Void)?
@@ -491,7 +506,7 @@ final class Store: ObservableObject {
         PerchTheme.shared.chatFontSize = settings.chatFontSize
         if let data = defaults.data(forKey: "sites") {
             do { sites = try JSONDecoder().decode([Site].self, from: data) }
-            catch { notice = "收藏数据无法读取，原始数据已保留。请先备份再添加网站。" }
+            catch { protectedKeys.insert("sites"); notice = "收藏数据无法读取，原始数据已保留。请先备份再添加网站。" }
         } else { sites = Site.defaults }
         let restoredTabs = restore([Tab].self, key: "tabs") ?? []
         let restoredSelection = defaults.string(forKey: "selectedTab").flatMap(UUID.init(uuidString:))
@@ -558,7 +573,9 @@ final class Store: ObservableObject {
                 self.persistTabs()
                 self.recordVisit(title: title, address: address)
             }
-            view.onNewTab = { [weak self] url in self?.newTab(address: url.absoluteString) }
+            view.onNewTab = { [weak self] url, background in
+                self?.newTab(address: url.absoluteString, after: id, select: !background)
+            }
             view.onBookmark = { [weak self, weak view] in
                 guard let self, let view else { return }
                 self.toggleBookmark(title: view.title, address: view.address)
@@ -608,13 +625,13 @@ final class Store: ObservableObject {
         if select { selected = id }
     }
 
-    func newTab(address: String = "", title: String = "新标签页", after: UUID? = nil) {
+    func newTab(address: String = "", title: String = "新标签页", after: UUID? = nil, select: Bool = true) {
         let tab = Tab(title: title == "新标签页" ? URL(string: address)?.host ?? title : title, address: address)
         if let after, let index = tabs.firstIndex(where: { $0.id == after }) {
             tabs.insert(tab, at: tabs[index].pinned ? tabs.filter(\.pinned).count : index + 1)
         } else { tabs.append(tab) }
-        activate(tab.id)
-        if address.isEmpty { pendingAddressFocus = tab.id }
+        activate(tab.id, select: select)
+        if select && address.isEmpty { pendingAddressFocus = tab.id }
     }
 
     @Published var chatHistoryVisible = true
@@ -800,6 +817,10 @@ final class Store: ObservableObject {
         }
         try value.validate()
         try applyHotkeys?(value)
+        applySettings(value)
+    }
+
+    private func applySettings(_ value: BrowserSettings) {
         let changed = settings.userAgent != value.userAgent
         settings = value
         PerchTheme.shared.selection = value.theme
@@ -808,6 +829,74 @@ final class Store: ObservableObject {
         persist(value, key: "settings")
         if changed {
             for browser in browsers.values { browser.webView.customUserAgent = value.userAgent; browser.webView.reload() }
+        }
+    }
+
+    private func checkBackupAccess(_ scope: Set<BackupScope>) throws {
+        let keys = Set(scope.contains(.settings) ? ["settings"] : [])
+            .union(scope.contains(.bookmarks) ? ["sites", "bookmarkFolders", "importedBookmarks"] : [])
+        guard protectedKeys.isDisjoint(with: keys), !scope.contains(.ai) || ai.canRestoreSettings else {
+            throw PerchError("当前设置或书签数据损坏，已保留原数据。请先备份并修复原始数据。")
+        }
+    }
+
+    func settingsBackup(launchAtLogin: Bool, scope: Set<BackupScope> = Set(BackupScope.allCases),
+                        includeKeys: Bool = false) throws -> SettingsBackup {
+        try checkBackupAccess(scope)
+        var providers = ai.providers
+        for index in providers.indices { providers[index].legacyAccount = nil }
+        let backup = SettingsBackup(settings: settings, launchAtLogin: launchAtLogin,
+            layout: LayoutPreference.capture(defaults), providers: providers,
+            selectedProvider: ai.configuration.id, search: ai.searchConfiguration,
+            sites: sites, folders: bookmarkFolders, imported: importedBookmarks, scope: scope,
+            credentials: includeKeys && scope.contains(.ai) ? try ai.backupCredentials() : nil)
+        try backup.validate()
+        return backup
+    }
+
+    func restoreSettingsBackup(_ backup: SettingsBackup,
+                               setLaunchAtLogin: (Bool) throws -> Void = LaunchAtLogin.set) throws {
+        try checkBackupAccess(backup.scope)
+        try backup.validate()
+        // Imported UUIDs must never resolve to credentials already trusted on this Mac.
+        let backup = backup.withFreshCredentialIDs()
+        let encoder = JSONEncoder()
+        var encoded: [String: Data] = [:]
+        if backup.scope.contains(.settings) { encoded["settings"] = try encoder.encode(backup.settings) }
+        if backup.scope.contains(.bookmarks) {
+            encoded["sites"] = try encoder.encode(backup.sites)
+            encoded["bookmarkFolders"] = try encoder.encode(backup.folders)
+            encoded["importedBookmarks"] = try encoder.encode(backup.imported)
+        }
+        if backup.scope.contains(.ai) { encoded["aiProviders"] = try encoder.encode(backup.providers) }
+        let search = try backup.search.map { try encoder.encode($0) }
+        try ai.withImportedCredentials(backup) {
+            guard backup.scope.contains(.settings) else { return }
+            try applyHotkeys?(backup.settings)
+            do { try setLaunchAtLogin(backup.launchAtLogin) }
+            catch {
+                let loginError = error
+                do { try applyHotkeys?(settings) }
+                catch { throw PerchError("登录项导入失败，旧快捷键无法恢复，请重新设置。\(loginError.localizedDescription)") }
+                throw loginError
+            }
+        }
+        // All fallible validation/encoding/system operations finish before changing stored data.
+        for (key, data) in encoded { defaults.set(data, forKey: key) }
+        if backup.scope.contains(.ai) {
+            if let search { defaults.set(search, forKey: "aiSearchProvider") }
+            else { defaults.removeObject(forKey: "aiSearchProvider") }
+            defaults.set(backup.selectedProvider.uuidString, forKey: "aiSelectedProvider")
+            defaults.removeObject(forKey: "aiConfiguration")
+            ai.restoreSettings(backup)
+        }
+        if backup.scope.contains(.bookmarks) {
+            sites = backup.sites; bookmarkFolders = backup.folders; importedBookmarks = backup.imported
+        }
+        if backup.scope.contains(.settings) {
+            LayoutPreference.restore(backup.layout, to: defaults)
+            applySettings(backup.settings)
+            restoreWindowPlacement?()
         }
     }
 
@@ -869,7 +958,11 @@ final class Store: ObservableObject {
         let browser = Browser(url: url, userAgent: settings.userAgent,
                               dataStore: defaults === UserDefaults.standard ? .default() : .nonPersistent(),
                               previewDefaults: defaults)
-        browser.onNewTab = { [weak browser] url in browser?.load(url) }
+        browser.onNewTab = { [weak self, weak browser] url, background in
+            if background { self?.newTab(address: url.absoluteString, select: false) }
+            else { browser?.load(url) }
+        }
+        browser.onOpenInPerch = { [weak self] url in self?.newTab(address: url.absoluteString) }
         return browser
     }
 
@@ -1537,8 +1630,8 @@ struct WindowTools: View {
                 Button("历史记录") { store.openBookmarks(history: true) }
                 Button("密码管理") { store.library = .passwords }
                 Divider()
-                Button("在默认浏览器打开") {
-                    if let url = URLInput.parse(store.browser?.address ?? "", search: false) { NSWorkspace.shared.open(url) }
+                Button("在新标签页打开") {
+                    if let url = URLInput.parse(store.browser?.address ?? "", search: false) { store.newTab(address: url.absoluteString) }
                 }.disabled(store.browser == nil)
                 Divider()
                 Button("回到首页") { store.selected = nil }
@@ -1654,11 +1747,11 @@ final class RootHostingView<Content: View>: NSHostingView<Content> {
 struct RootView: View {
     @ObservedObject private var theme = PerchTheme.shared
     @ObservedObject var store: Store
-    @AppStorage("sidebarHidden") private var sidebarCollapsed = false
-    @AppStorage("sidebarWidth") private var sidebarWidth = 199.0
+    @AppStorage(LayoutPreference.sidebarHidden.rawValue) private var sidebarCollapsed = false
+    @AppStorage(LayoutPreference.sidebarWidth.rawValue) private var sidebarWidth = 199.0
     @State private var dragWidth: Double?
     @State private var liveSidebarWidth: Double?
-    @AppStorage("aiSidebarWidth") private var aiWidth = 320.0
+    @AppStorage(LayoutPreference.aiSidebarWidth.rawValue) private var aiWidth = 320.0
     @State private var aiDragWidth: Double?
     var body: some View {
         VStack(spacing: 0) {
@@ -1784,6 +1877,12 @@ struct RootView: View {
 extension Notification.Name { static let focusAddress = Notification.Name("PerchFocusAddress") }
 
 enum ScreenPlacement {
+    static func nearMouse(_ point: NSPoint, size: NSSize, in bounds: NSRect) -> NSRect {
+        let size = NSSize(width: min(size.width, bounds.width), height: min(size.height, bounds.height))
+        let frame = NSRect(x: point.x - size.width / 2, y: point.y - size.height - 12,
+                           width: size.width, height: size.height)
+        return fit(frame, from: bounds, to: bounds)
+    }
     static func screenIndex(for frame: NSRect, in screens: [NSRect]) -> Int? {
         screens.indices.filter { screens[$0].intersects(frame) }.max {
             let a = screens[$0].intersection(frame), b = screens[$1].intersection(frame)
@@ -1807,6 +1906,30 @@ enum ScreenPlacement {
 }
 
 final class Panel: NSPanel {
+    private weak var relocatedSheet: NSWindow?
+    private var sheetDismissalFrame: NSRect?
+
+    func setPlacement(_ rect: NSRect, display: Bool) {
+        if rect != frame, let attachedSheet { relocatedSheet = attachedSheet }
+        setFrame(rect, display: display)
+    }
+
+    override func endSheet(_ sheetWindow: NSWindow, returnCode: NSApplication.ModalResponse) {
+        let previous = sheetDismissalFrame
+        if sheetWindow === relocatedSheet {
+            sheetDismissalFrame = frame
+            relocatedSheet = nil
+        }
+        defer { sheetDismissalFrame = previous }
+        super.endSheet(sheetWindow, returnCode: returnCode)
+    }
+
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        // A tall sheet remembers the old parent origin. Constrain its dismissal
+        // animation before it moves, only when placement changed while attached.
+        sheetDismissalFrame ?? super.constrainFrameRect(frameRect, to: screen)
+    }
+
     private final class FocusSnapshot {
         weak var responder: NSView?
         weak var field: NSTextField?
@@ -1929,17 +2052,17 @@ final class Panel: NSPanel {
 
     func restorePlacement(from defaults: UserDefaults = .standard) -> Bool {
         // AppKit frame autosave can relocate to the current main screen; retain global coordinates.
-        guard let raw = defaults.string(forKey: "windowFrame") else { return false }
+        guard let raw = defaults.string(forKey: LayoutPreference.windowFrame.rawValue) else { return false }
         let frame = NSRectFromString(raw)
         guard [frame.minX, frame.minY, frame.width, frame.height].allSatisfy(\.isFinite),
               frame.width > 0, frame.height > 0 else { return false }
-        setFrame(frame, display: false)
+        setPlacement(frame, display: false)
         return true
     }
 
     func savePlacement(to defaults: UserDefaults = .standard) {
         guard !styleMask.contains(.fullScreen) else { return }
-        defaults.set(NSStringFromRect(frame), forKey: "windowFrame")
+        defaults.set(NSStringFromRect(frame), forKey: LayoutPreference.windowFrame.rawValue)
     }
 
     override func becomeKey() {
@@ -2010,6 +2133,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var hasWindowPlacement = false
     private var fittingScreen = false
     private var menuScreen: NSScreen?
+    private var pendingPlacementRestore = false
 
     private static func statusImage() -> NSImage? {
         guard let symbol = NSImage(systemSymbolName: "rectangle.topthird.inset.filled",
@@ -2056,12 +2180,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.collectionBehavior = [.moveToActiveSpace, .fullScreenPrimary]
         panel.contentView = RootHostingView(rootView: RootView(store: store))
         panel.bindTabFocus(to: store)
-        hasWindowPlacement = panel.restorePlacement()
+        hasWindowPlacement = panel.restorePlacement(from: store.defaults)
         panel.delegate = self
         NotificationCenter.default.addObserver(self, selector: #selector(screenConfigurationChanged),
                                                name: NSApplication.didChangeScreenParametersNotification, object: nil)
         panel.statusItemPressed = { [weak self] in self?.isPressingStatusItem() ?? false }
         store.changeWindow = { [weak self] in self?.updateWindowLevel() }
+        store.restoreWindowPlacement = { [weak self] in self?.restoreImportedPlacement() }
         store.hideWindow = { [weak self] in self?.panel.hideAnimated() }
         store.applyHotkeys = { [weak self] settings in try self?.hotkeys.apply(settings) }
         store.shortcutRecording = { [weak self] recording in
@@ -2212,8 +2337,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if panel.shouldHideForStatusClick() { panel.hideAnimated() }
         else {
             NSApp.activate(ignoringOtherApps: true)
-            if panel.isVisible && !panel.isHiding { clampToScreen(on: target); panel.focusWindow() }
-            else { show() }
+            present(on: target)
         }
     }
 
@@ -2246,33 +2370,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func present(on target: NSScreen?) {
-        if !hasWindowPlacement, let button = statusItem.button, let window = button.window {
+        applyPendingPlacement()
+        let followMouse = store.settings.followMouseOnShow
+        if !followMouse && !hasWindowPlacement, let button = statusItem.button, let window = button.window {
             let rect = window.convertToScreen(button.convert(button.bounds, to: nil))
             panel.setFrameOrigin(NSPoint(x: rect.maxX - panel.frame.width, y: rect.minY - panel.frame.height - 6))
         }
-        clampToScreen(on: target)
+        clampToScreen(on: followMouse ? mouseScreen() : target, near: followMouse ? NSEvent.mouseLocation : nil)
         hasWindowPlacement = true
-        panel.savePlacement()
+        saveWindowPlacement()
         NSApp.activate(ignoringOtherApps: true)
         panel.showAnimated()
     }
 
-    func clampToScreen(on target: NSScreen? = nil) {
+    func clampToScreen(on target: NSScreen? = nil, near point: NSPoint? = nil) {
         guard !fittingScreen, !panel.styleMask.contains(.fullScreen), !changingFullScreen,
               let screen = target ?? currentScreen() else { return }
         fittingScreen = true
         defer { fittingScreen = false }
         let bounds = screen.visibleFrame
         let source = currentScreen()?.visibleFrame ?? bounds
-        let frame = ScreenPlacement.fit(panel.frame, from: source, to: bounds)
+        let frame = point.map { ScreenPlacement.nearMouse($0, size: panel.frame.size, in: bounds) }
+            ?? ScreenPlacement.fit(panel.frame, from: source, to: bounds)
         panel.minSize = NSSize(width: min(640, bounds.width), height: min(520, bounds.height))
         panel.maxSize = bounds.size
-        if panel.frame != frame { panel.setFrame(frame, display: true) }
+        if panel.frame != frame { panel.setPlacement(frame, display: true) }
     }
 
     @objc private func screenConfigurationChanged() {
         clampToScreen()
-        panel.savePlacement()
+        saveWindowPlacement()
+    }
+
+    func restoreImportedPlacement() {
+        pendingPlacementRestore = true
+        applyPendingPlacement()
+    }
+
+    private func applyPendingPlacement() {
+        guard pendingPlacementRestore, !panel.styleMask.contains(.fullScreen), !changingFullScreen else { return }
+        pendingPlacementRestore = false
+        hasWindowPlacement = panel.restorePlacement(from: store.defaults)
+        clampToScreen()
+    }
+
+    private func saveWindowPlacement() {
+        guard !changingFullScreen, !pendingPlacementRestore else { return }
+        panel.savePlacement(to: store.defaults)
     }
 
     func updateWindowLevel() {
@@ -2284,10 +2428,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func windowWillEnterFullScreen(_ notification: Notification) { changingFullScreen = true }
     func windowDidEnterFullScreen(_ notification: Notification) { changingFullScreen = false }
     func windowWillExitFullScreen(_ notification: Notification) { changingFullScreen = true }
-    func windowDidExitFullScreen(_ notification: Notification) { changingFullScreen = false; clampToScreen() }
-    func windowDidMove(_ notification: Notification) { if !changingFullScreen { panel.savePlacement() } }
-    func windowDidResize(_ notification: Notification) { clampToScreen(); if !changingFullScreen { panel.savePlacement() } }
-    func windowDidChangeScreen(_ notification: Notification) { clampToScreen(); if !changingFullScreen { panel.savePlacement() } }
+    func windowDidExitFullScreen(_ notification: Notification) {
+        changingFullScreen = false; applyPendingPlacement(); clampToScreen()
+    }
+    func windowDidMove(_ notification: Notification) { saveWindowPlacement() }
+    func windowDidResize(_ notification: Notification) { clampToScreen(); saveWindowPlacement() }
+    func windowDidChangeScreen(_ notification: Notification) { clampToScreen(); saveWindowPlacement() }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationWillTerminate(_ notification: Notification) { store.ai.saveConversations() }
@@ -2497,8 +2643,11 @@ if CommandLine.arguments.contains("--scroll-self-test") {
 } else if CommandLine.arguments.contains("--window-self-test") {
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)
-    let check = WindowSelfCheck()
-    withExtendedLifetime(check) { app.run() }
+    Task { @MainActor in
+        setbuf(stdout, nil)
+        _ = WindowSelfCheck()
+    }
+    app.run()
 } else if CommandLine.arguments.contains("--web-self-test") {
     let app = NSApplication.shared
     let check = WebSelfCheck()

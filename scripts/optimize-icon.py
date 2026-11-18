@@ -32,8 +32,12 @@ def compress_png(data):
     original = list(chunks(data, png=True))
     image = b"".join(payload for kind, payload in original if kind == b"IDAT")
     raw = zlib.decompress(image)
-    compressor = zlib.compressobj(level=9, strategy=zlib.Z_FILTERED)
-    packed = compressor.compress(raw) + compressor.flush()
+    candidates = [image]
+    for strategy in [zlib.Z_DEFAULT_STRATEGY, zlib.Z_FILTERED, zlib.Z_RLE,
+                     zlib.Z_HUFFMAN_ONLY, zlib.Z_FIXED]:
+        compressor = zlib.compressobj(level=9, strategy=strategy)
+        candidates.append(compressor.compress(raw) + compressor.flush())
+    packed = min(candidates, key=len)
     if len(packed) >= len(image):
         return data
     result = data[:8]

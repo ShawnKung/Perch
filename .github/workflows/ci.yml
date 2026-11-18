@@ -22,7 +22,7 @@ jobs:
   build:
     name: Build Apple Silicon app
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
       - name: Test release version rules
