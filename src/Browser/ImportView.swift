@@ -1,6 +1,8 @@
 import SwiftUI
 import AppKit
 import WebKit
+import UniformTypeIdentifiers
+import ServiceManagement
 
 struct ImportPage: View {
     @ObservedObject private var theme = PerchTheme.shared
@@ -17,9 +19,38 @@ struct ImportPage: View {
     @State private var profiles: [URL] = []
     @State private var accessDirectory: URL?
     @State private var requiresFileAccess = false
+    @State private var backupStatus = ""
+    @State private var backupScope = Set(BackupScope.allCases)
+    @State private var includeAIKeys = false
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
+                Text("Perch 备份").font(.headline)
+                HStack(spacing: 16) {
+                    ForEach(BackupScope.allCases, id: \.self) { scope in
+                        Toggle(scope.title, isOn: Binding(get: { backupScope.contains(scope) }, set: {
+                            if $0 { backupScope.insert(scope) } else { backupScope.remove(scope) }
+                        }))
+                    }
+                }
+                Toggle("包含 AI 密钥（模型与搜索）", isOn: $includeAIKeys)
+                    .disabled(!backupScope.contains(.ai))
+                Text(includeAIKeys && backupScope.contains(.ai)
+                     ? "ZIP 包含明文 AI 密钥，请妥善保管。密码、Cookie、历史记录及会话不包含在备份中。"
+                     : "AI 密钥默认不导出。密码、Cookie、历史记录及会话不包含在备份中。")
+                    .font(.callout).foregroundStyle(Style.muted)
+                HStack {
+                    Button("导出 ZIP…") { exportBackup() }
+                        .disabled(backupScope.isEmpty)
+                    Button("导入 ZIP…") { importBackup() }
+                    if store.importing { ProgressView().controlSize(.small) }
+                    Spacer()
+                }
+                if !backupStatus.isEmpty {
+                    Text(backupStatus).font(.callout).textSelection(.enabled).lineSpacing(5)
+                }
+                Divider()
+                Text("从其他浏览器导入").font(.headline)
                 HStack(spacing: 12) {
                     Text("来源浏览器").frame(width: 76, alignment: .leading)
                     Picker("来源浏览器", selection: $source) {
@@ -114,6 +145,63 @@ struct ImportPage: View {
                 }
             }.padding(20).disabled(store.importing)
         }.background(Style.paper).onAppear { refreshProfiles() }
+    }
+
+    private func exportBackup() {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.zip]
+        panel.nameFieldStringValue = "Perch-\(DateFormatter.localizedString(from: Date(), dateStyle: .short, timeStyle: .none).replacingOccurrences(of: "/", with: "-")).zip"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        store.importing = true; backupStatus = "正在导出…"
+        Task { @MainActor in
+            defer { store.importing = false }
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            do {
+                let backup = try store.settingsBackup(launchAtLogin: LaunchAtLogin.enabled,
+                    scope: backupScope, includeKeys: includeAIKeys)
+                try await Task.detached(priority: .userInitiated) { try BackupArchive.write(backup, to: url) }.value
+                backupStatus = "已导出 \(url.lastPathComponent)。"
+            } catch { backupStatus = "导出失败：\(error.localizedDescription)" }
+        }
+    }
+
+    private func importBackup() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.zip]
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        store.importing = true; backupStatus = "正在检查备份…"
+        Task { @MainActor in
+            defer { store.importing = false }
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            do {
+                let backup = try await Task.detached(priority: .userInitiated) { try BackupArchive.read(url) }.value
+                let count = backup.sites.count + backup.imported.values.flatMap { $0 }.flatMap(\.sites).count
+                let alert = NSAlert()
+                alert.messageText = "导入并替换\(backup.scopeDescription)？"
+                var details = ["只替换备份包含的类别，其他内容保持不变。"]
+                if backup.scope.contains(.settings) {
+                    details.append("登录时启动将设为\(backup.launchAtLogin ? "开启" : "关闭")。")
+                }
+                if backup.scope.contains(.bookmarks) { details.append("替换个人书签和浏览器导入书签，共 \(count) 个书签。") }
+                if backup.scope.contains(.ai) {
+                    details.append("替换 \(backup.providers.count) 个 AI 供应商及搜索配置，导入 \(backup.credentials?.count ?? 0) 个密钥；未包含的密钥需重新填写。")
+                }
+                alert.informativeText = details.joined(separator: "\n") + "\n\n建议先导出当前备份。"
+                alert.addButton(withTitle: "替换并导入")
+                alert.addButton(withTitle: "取消")
+                guard alert.runModal() == .alertFirstButtonReturn else { backupStatus = ""; return }
+                try store.restoreSettingsBackup(backup)
+                backupStatus = "已导入：\(backup.scopeDescription)。"
+                if backup.scope.contains(.ai) { backupStatus += "已导入 \(backup.credentials?.count ?? 0) 个 AI 密钥，未包含的密钥请在 AI 设置中填写。" }
+                if backup.scope.contains(.settings) { backupStatus += "预览尺寸下次打开时生效，全屏窗口的位置在退出全屏后恢复。" }
+                if backup.scope.contains(.settings), SMAppService.mainApp.status == .requiresApproval {
+                    backupStatus += "\n登录时启动等待系统批准，请到常规设置中打开系统登录项设置。"
+                }
+            } catch { backupStatus = "导入失败：\(error.localizedDescription)" }
+        }
     }
 
     private func chooseDirectory() {

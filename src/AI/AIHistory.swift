@@ -175,6 +175,21 @@ final class AIHistoryTable: NSTableView {
     }
 }
 
+enum AIHistoryGroup: String, CaseIterable {
+    case pinned, chat, web
+    var title: String {
+        switch self {
+        case .pinned: return "置顶会话"
+        case .chat: return AIConversationOrigin.chat.title
+        case .web: return AIConversationOrigin.web.title
+        }
+    }
+    static func group(for session: AISession, archived: Bool) -> Self {
+        if !archived && session.isPinned == true { return .pinned }
+        return session.origin == .web ? .web : .chat
+    }
+}
+
 struct AIHistoryList: NSViewRepresentable {
     @ObservedObject private var theme = PerchTheme.shared
     let conversations: [AISession]
@@ -185,6 +200,8 @@ struct AIHistoryList: NSViewRepresentable {
     var archived = false
     var restore: (Set<UUID>) -> Void = { _ in }
     var newChat: () -> Void = {}
+    var rename: (UUID, String) -> Void = { _, _ in }
+    var pin: (Set<UUID>, Bool) -> Void = { _, _ in }
     func makeCoordinator() -> Coordinator { Coordinator(self) }
     func makeNSView(context: Context) -> NSScrollView {
         let scroll = TabScrollView()
@@ -225,10 +242,11 @@ struct AIHistoryList: NSViewRepresentable {
         var parent: AIHistoryList
         var theme: ThemeColor = .green
         weak var table: AIHistoryTable?
-        var rows: [(origin: AIConversationOrigin, session: AISession?)] = []
-        var collapsed: Set<AIConversationOrigin> = []
+        var rows: [(origin: AIHistoryGroup, session: AISession?)] = []
+        var collapsed: Set<AIHistoryGroup> = []
         var menuSelection: Set<UUID> = []
         var forkID: UUID?
+        private var pinSelection = false
         private var renderedRows: [String] = []
         private var renderedActive: UUID?
         private var renderedFontSize = BrowserSettings.defaultChatFontSize
@@ -246,12 +264,12 @@ struct AIHistoryList: NSViewRepresentable {
             let urls = (session.webPageURLs ?? []) + session.messages.compactMap(\.sourceURL)
             return urls.first.map { "@ " + ($0.host ?? $0.absoluteString) }
         }
-        func refresh(animatedOrigin: AIConversationOrigin? = nil) {
+        func refresh(animatedOrigin: AIHistoryGroup? = nil) {
             guard let table else { return }
             let signature = parent.conversations.map {
-                "\($0.id)|\($0.title)|\(sourceTitle($0) ?? "")|\($0.updated.timeIntervalSince1970)|\($0.origin?.rawValue ?? "chat")|\($0.requestID != nil)"
+                "\($0.id)|\($0.title)|\(sourceTitle($0) ?? "")|\($0.updated.timeIntervalSince1970)|\($0.origin?.rawValue ?? "chat")|\($0.isPinned == true)|\($0.requestID != nil)"
             } +
-                AIConversationOrigin.allCases.filter { collapsed.contains($0) }.map(\.rawValue)
+                AIHistoryGroup.allCases.filter { collapsed.contains($0) }.map(\.rawValue)
             let fontSize = PerchTheme.shared.chatFontSize
             let fontChanged = renderedFontSize != fontSize
             guard signature != renderedRows || renderedActive != parent.active || fontChanged else { return }
@@ -261,9 +279,11 @@ struct AIHistoryList: NSViewRepresentable {
             renderedRows = signature; renderedActive = parent.active; renderedFontSize = fontSize
             let selected = Set(table.selectedRowIndexes.compactMap { table.conversationIDs.indices.contains($0) ? table.conversationIDs[$0] : nil })
             let oldRows = rows
-            rows = AIConversationOrigin.allCases.flatMap { origin in
-                [(origin: origin, session: Optional<AISession>.none)] + (collapsed.contains(origin) ? [] :
-                    parent.conversations.filter { ($0.origin ?? .chat) == origin }.map { (origin: origin, session: Optional($0)) })
+            rows = AIHistoryGroup.allCases.flatMap { origin -> [(origin: AIHistoryGroup, session: AISession?)] in
+                let sessions = parent.conversations.filter { AIHistoryGroup.group(for: $0, archived: parent.archived) == origin }
+                if origin == .pinned && sessions.isEmpty { return [] }
+                return [(origin: origin, session: nil)] + (collapsed.contains(origin) ? [] :
+                    sessions.map { (origin: origin, session: Optional($0)) })
             }
             table.conversationIDs = rows.map { $0.session?.id }
             if let origin = animatedOrigin {
@@ -442,19 +462,55 @@ struct AIHistoryList: NSViewRepresentable {
             menuSelection = Set(table.selectedRowIndexes.compactMap { rows[$0].session?.id })
             forkID = session.id
             let menu = NSMenu()
-            let copy = NSMenuItem(title: "Fork（复制对话）", action: #selector(copyConversation), keyEquivalent: "")
-            copy.target = self; menu.addItem(copy); menu.addItem(.separator())
+            if menuSelection.count == 1 {
+                let rename = NSMenuItem(title: "重命名…", action: #selector(renameConversation), keyEquivalent: "")
+                rename.image = NSImage(systemSymbolName: "pencil", accessibilityDescription: nil)
+                rename.target = self; menu.addItem(rename)
+            }
+            let copy = NSMenuItem(title: "复制会话", action: #selector(copyConversation), keyEquivalent: "")
+            copy.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: nil)
+            copy.target = self; menu.addItem(copy)
+            if !parent.archived {
+                pinSelection = parent.conversations.contains { menuSelection.contains($0.id) && $0.isPinned != true }
+                let pin = NSMenuItem(title: pinSelection ? "置顶会话" : "取消置顶", action: #selector(pinConversations), keyEquivalent: "")
+                pin.image = NSImage(systemSymbolName: pinSelection ? "pin" : "pin.slash", accessibilityDescription: nil)
+                pin.target = self; menu.addItem(pin)
+            }
             if parent.archived {
                 let restore = NSMenuItem(title: "恢复对话", action: #selector(restoreSelection), keyEquivalent: "")
+                restore.image = NSImage(systemSymbolName: "arrow.uturn.backward", accessibilityDescription: nil)
                 restore.target = self; menu.addItem(restore)
             }
             let verb = parent.archived ? "彻底删除" : "归档"
-            let remove = NSMenuItem(title: menuSelection.count > 1 ? "\(verb) \(menuSelection.count) 个对话" : "\(verb)对话",
+            let remove = NSMenuItem(title: menuSelection.count > 1 ? "\(verb) \(menuSelection.count) 个会话" : "\(verb)会话",
                                     action: #selector(deleteSelection), keyEquivalent: "")
+            remove.image = NSImage(systemSymbolName: parent.archived ? "trash" : "archivebox", accessibilityDescription: nil)
             remove.target = self; menu.addItem(remove)
+            // macOS 27 hides menu images. Use the public Objective-C setter so older SDKs
+            // can still build this app; NSMenuItemImageVisibilityVisible has raw value 1.
+            for item in menu.items where item.responds(to: NSSelectorFromString("setPreferredImageVisibility:")) {
+                item.setValue(1, forKey: "preferredImageVisibility")
+            }
             return menu
         }
         @objc func copyConversation() { if let forkID { parent.fork(forkID) } }
+        @objc func renameConversation() {
+            guard let id = forkID, let session = parent.conversations.first(where: { $0.id == id }),
+                  let window = table?.window, window.attachedSheet == nil else { return }
+            let alert = NSAlert()
+            alert.messageText = "重命名会话"
+            alert.addButton(withTitle: "保存"); alert.addButton(withTitle: "取消")
+            let field = NSTextField(string: session.title)
+            field.frame = NSRect(x: 0, y: 0, width: 300, height: 24)
+            field.setAccessibilityLabel("会话名称")
+            alert.accessoryView = field
+            alert.window.initialFirstResponder = field
+            alert.beginSheetModal(for: window) { [weak self] response in
+                if response == .alertFirstButtonReturn { self?.parent.rename(id, field.stringValue) }
+            }
+            field.selectText(nil)
+        }
+        @objc func pinConversations() { parent.pin(menuSelection, pinSelection) }
         @objc func deleteSelection() { parent.delete(menuSelection) }
         @objc func restoreSelection() { parent.restore(menuSelection) }
         @objc func newConversation() { parent.newChat() }
