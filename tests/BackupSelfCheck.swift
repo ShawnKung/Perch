@@ -60,6 +60,67 @@ enum BackupSelfCheck {
         precondition(!json.contains("synthetic-key-only") && !json.contains("synthetic-search-key-only"))
         print("PASS: ZIP roundtrip preserves full settings, layout, providers, folder IDs/order and empty folders without keys")
 
+        var withKeys = try store.settingsBackup(launchAtLogin: true, includeKeys: true)
+        precondition(withKeys.credentials?.providers[provider.id.uuidString] == "synthetic-key-only")
+        precondition(withKeys.credentials?.search == "synthetic-search-key-only")
+        let keyZIP = directory.appendingPathComponent("keys.zip")
+        try BackupArchive.write(withKeys, to: keyZIP)
+        withKeys = try BackupArchive.read(keyZIP)
+        let permissions = try FileManager.default.attributesOfItem(atPath: keyZIP.path)[.posixPermissions] as! NSNumber
+        precondition(permissions.intValue == 0o600)
+        let fresh = withKeys.withFreshCredentialIDs()
+        precondition(fresh.selectedProvider != provider.id)
+        precondition(fresh.credentials?.providers[fresh.selectedProvider.uuidString] == "synthetic-key-only")
+        precondition(fresh.credentials?.providers[provider.id.uuidString] == nil)
+        rejects {
+            try store.ai.withImportedCredentials(fresh) { throw PerchError("Synthetic transaction failure") }
+        }
+        // Retrying identical fresh IDs proves the failed transaction removed every staged key.
+        try store.ai.withImportedCredentials(fresh) {}
+        rejects { try store.ai.withImportedCredentials(fresh) {} }
+        let unchangedKeys = try store.ai.backupCredentials()
+        precondition(unchangedKeys.providers[provider.id.uuidString] == "synthetic-key-only")
+        try store.restoreSettingsBackup(withKeys, setLaunchAtLogin: { _ in })
+        precondition(store.ai.hasKey && store.ai.searchHasKey)
+        let importedKeys = try store.ai.backupCredentials()
+        precondition(importedKeys.providers[store.ai.configuration.id.uuidString] == "synthetic-key-only")
+        precondition(importedKeys.search == "synthetic-search-key-only")
+        print("PASS: opt-in keys roundtrip privately, remap accounts, rollback on failure and reject account overwrite")
+
+        for scope in BackupScope.allCases {
+            let selected = try store.settingsBackup(launchAtLogin: false, scope: [scope], includeKeys: true)
+            let object = try JSONSerialization.jsonObject(with: encoder.encode(selected)) as! [String: Any]
+            precondition((object["settings"] != nil) == (scope == .settings))
+            precondition((object["providers"] != nil) == (scope == .ai))
+            precondition((object["sites"] != nil) == (scope == .bookmarks))
+            precondition((object["credentials"] != nil) == (scope == .ai))
+            var decoded = try JSONDecoder().decode(SettingsBackup.self, from: encoder.encode(selected))
+            try decoded.validate()
+            let oldSettings = store.settings, oldProvider = store.ai.configuration
+            let oldSites = store.sites.map(\.id)
+            if scope == .settings { decoded.settings.chatFontSize = 17 }
+            if scope == .bookmarks { decoded.sites = []; decoded.folders = []; decoded.imported = [:] }
+            var loginTouched = false
+            try store.restoreSettingsBackup(decoded, setLaunchAtLogin: { _ in loginTouched = true })
+            precondition(loginTouched == (scope == .settings))
+            if scope != .settings { precondition(store.settings == oldSettings) }
+            if scope != .ai { precondition(store.ai.configuration == oldProvider && store.ai.hasKey) }
+            if scope != .bookmarks { precondition(store.sites.map(\.id) == oldSites) }
+            else { precondition(store.sites.isEmpty && store.importedBookmarks.isEmpty) }
+        }
+        var legacy = backup; legacy.version = 1
+        let oldBackup = try JSONDecoder().decode(SettingsBackup.self, from: encoder.encode(legacy))
+        try oldBackup.validate()
+        precondition(oldBackup.scope == Set(BackupScope.allCases) && oldBackup.credentials == nil)
+        var invalidKeys = withKeys; invalidKeys.credentials?.providers[UUID().uuidString] = "unassociated"
+        rejects { try invalidKeys.validate() }
+        invalidKeys = withKeys; invalidKeys.credentials?.search = "invalid\nkey"
+        rejects { try invalidKeys.validate() }
+        invalidKeys = withKeys; invalidKeys.scope = [.bookmarks]
+        rejects { try invalidKeys.validate() }
+        rejects { _ = try store.settingsBackup(launchAtLogin: false, scope: []) }
+        print("PASS: selective encoding/restore preserves omitted categories, v1 remains compatible and invalid keys reject")
+
         // A missing older setting adopts its model default without an export-specific field list.
         var object = try JSONSerialization.jsonObject(with: encoder.encode(backup)) as! [String: Any]
         var oldSettings = object["settings"] as! [String: Any]
@@ -165,6 +226,8 @@ enum BackupSelfCheck {
             rejects { _ = try damaged.settingsBackup(launchAtLogin: false) }
             rejects { try damaged.restoreSettingsBackup(backup, setLaunchAtLogin: { _ in preconditionFailure("No login change") }) }
             precondition(defaults.data(forKey: key) == Data("broken".utf8))
+            let unaffected: Set<BackupScope> = key == "settings" || key.hasPrefix("ai") ? [.bookmarks] : [.ai]
+            _ = try damaged.settingsBackup(launchAtLogin: false, scope: unaffected)
             defaults.set(original, forKey: key)
         }
         var cleared = backup; cleared.search = nil; cleared.layout = [:]
