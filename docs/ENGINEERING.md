@@ -13,7 +13,10 @@
 - 导航入口复用 Browser.goBack/goForward，未提交导航及连续历史操作由 pendingHistoryItem 管理；旧导航失败不得覆盖新状态。
 - 窗口只由主动操作收起，失焦不隐藏。保留多屏位置、可用区域、快速反向动画及系统减少动态效果。
 - 设置可开启「主窗口跟随鼠标显示」，默认关闭；所有唤出入口在鼠标所在屏幕定位并收敛到可用区域，全屏期间不重定位。
+- AppKit 为较高 sheet 抬升父窗口后，会在关闭时动画恢复旧坐标；`Panel.setPlacement` 标记 sheet 期间的显式定位，仅在该 sheet 的 `endSheet` 调用期间由公开的 [`constrainFrameRect(_:to:)`](https://developer.apple.com/documentation/appkit/nswindow/constrainframerect(_:to:)) 约束父窗口保持最新 frame，防止动画先回旧屏。没有显式定位的 sheet 保留系统恢复行为；不在动画结束后移动补偿。回归通过实际「完成」点击观察整个关闭过程的窗口移动通知。
+- WebKit 的导航与新窗口委托统一携带后台打开标志，⌘点击/中键保持当前标签；`WKNavigationAction.buttonNumber` 实际是位掩码，中键为 `1 << 2`（参见 [WebEventFactory](https://github.com/WebKit/WebKit/blob/main/Source/WebKit/Shared/mac/WebEventFactory.mm)），不同于 `NSEvent.buttonNumber == 2`。Option 预览的「在 Perch 中打开」由预览控制器回调创建标签并关闭预览。
 - 使用原生红黄绿及其原有关闭路由，主窗口关闭保留标签。网页和图表预览为独立窗口，⌘W 按 keyWindow 路由。
+- Option 与书签临时浏览共用预览窗口控制器。加入父窗口前设置初始透明度，关闭 AppKit 自动窗口动画，由显式透明度过渡统一负责显示与关闭；遵守减少动态效果，关闭期间立即停止接受操作。淡入回归检查窗口服务器的中间透明度，不能只检查结束值。
 - 管理页复用同一窗口；侧栏调整、顶栏避让和分隔线命中按实际布局计算，不遮挡窗口按钮、标签或输入控件。
 
 验证入口：`make test-web`、`make test-navigation`、`make test-window`、`make test-ui`。网页回归覆盖原生 RootView、整页和嵌套滚动、视口、输入选区、JS 身份、后台离窗及关闭释放。
@@ -27,6 +30,7 @@
 - 回到用户消息只进入编辑状态，保留历史及运行中的请求；取消恢复原草稿，只有发送受理才替换该轮及后续消息。Fork 在受理发送后创建副本，保留原对话。
 - 新对话标题只尝试生成一次，失败回退；历史支持多选、归档、恢复及 Fork。永久删除仅作用于已归档记录，活动会话不能重新插入已删除记录。
 - 历史右键支持重命名与置顶，手动名称优先于未完成的自动标题。置顶独立分组显示在 Chat 上方，保留原始会话来源和时间排序，取消后回原组；归档和 Fork 清除置顶状态。名称及置顶持久化，旧存档默认未置顶。
+- macOS 27 默认隐藏 NSMenuItem 图像，会话菜单显式设置 preferredImageVisibility 为 visible，重命名使用 pencil 图标；旧版继续使用原生默认行为。
 - 阅读位置持久化为消息 ID 与消息内偏移，网页侧栏和完整 Chat 共用。延迟布局按消息锚点校正，不能用固定绝对坐标或强制滚到底部覆盖用户阅读。
 - 消息布局保留已测量高度，Markdown 视图在视口附近加载、离屏释放。普通鼠标滚轮没有 phase，也必须通知阅读记录组件；事件监听随视图移除清理。
 - 思考、搜索、工具和正文状态分别管理。运行中的 phase 不写入历史，不能仅凭累计正文是否为空推断当前状态。
@@ -52,16 +56,16 @@
 ## 数据、签名与安全边界
 
 - 书签、标签、设置、窗口和浏览历史使用 `dev.perch.menubar` UserDefaults；对话及附件使用 `~/Library/Application Support/Perch/Conversations`。损坏值和文件保留原始内容并阻止覆盖，不重置真实数据。
-- 网站密码与 AI Key 分别由 PerchVault 和 PerchAIKeys 管理。AI Key 使用 `dev.perch.menubar.ai` 服务，以 Provider UUID 隔离；密钥不进入 UserDefaults、会话文件、命令参数、日志或临时文件。
+- 网站密码与 AI Key 分别由 PerchVault 和 PerchAIKeys 管理。AI Key 使用 `dev.perch.menubar.ai` 服务，以 Provider UUID 隔离；密钥不进入 UserDefaults、会话文件、命令参数或日志。用户明确勾选导出密钥时允许写入备份及受限临时目录。
 - `~/Library/Application Support/Perch Signing/` 保存稳定本机证书、专用钥匙串与 helper 缓存。不能为修复构建删除它、改用 ad-hoc 签名或重建证书。
 - 钥匙串 helper 验证父进程 bundle ID 与签名证书，凭据只通过管道传递。有意修改 helper 时验证升级访问、不同签名拒绝及旧记录迁移；不相关修改不重建缓存。
 - 安装脚本在已安装 helper 与新包内容不同的时候停止；此类升级需先验证签名和迁移，再安排安装。
 - 安装先暂存并验证新包，再替换；退出超时则中止，替换或签名验证失败恢复旧包。临时回滚包成功后清理；源码构建的本机签名不等于 Developer ID 或公证。
 - 不自动修改系统信任、钥匙串搜索列表或系统权限，不绕过密码访问认证、macOS 访问控制或 TLS 校验，不自动降低到 HTTP。
 - 浏览器导入源库只读，锁定数据库仅在受限临时快照上恢复。保留源隔离和分区 Cookie 跳过行为。
-- 设置备份由 `src/App/Backup.swift` 定义版本化 ZIP，完整编码 BrowserSettings、AI 配置和书签树；新增常规设置只维护原有 Codable 模型，不另列导出字段。布局偏好统一使用 `LayoutPreference` 键，捕获与恢复遍历其全部 case；新增独立配置模型时须接入 SettingsBackup 及 Store 的校验/应用流程。
-- ZIP 只允许单个 `perch-backup.json`，限压缩文件 32 MB、正文 16 MB、书签 50,000 个及 64 层，不将归档路径解压到磁盘。先校验和编码，再注册快捷键与登录项，失败恢复原快捷键，成功后统一写入。损坏的本机配置禁止导入导出覆盖。
-- 备份不含 API Key、密码、Cookie、访问历史、标签或会话；导入配置重新生成凭据 UUID、清除旧账户与环境变量绑定，不读取或删除本机已有密钥。运行请求保持原配置，后续请求需要重新填写 Key。
+- 设置备份由 `src/App/Backup.swift` 定义版本化 ZIP，v2 按 `BackupScope` 只编码勾选的设置、AI 配置和书签，兼容 v1 全量备份；新增常规设置只维护原有 Codable 模型，不另列导出字段。布局偏好统一使用 `LayoutPreference` 键，捕获与恢复遍历其全部 case；新增独立配置模型时须接入 SettingsBackup 及 Store 的校验/应用流程。
+- ZIP 只允许单个 `perch-backup.json`，限压缩文件 32 MB、正文 16 MB、书签 50,000 个及 64 层，不将归档路径解压到磁盘。先校验和编码，再暂存新密钥、注册快捷键与登录项，失败恢复原快捷键并清理暂存密钥，成功后统一写入所选类别。损坏的本机配置禁止被对应类别的导入导出覆盖。
+- AI 密钥默认不导出，勾选后包含已保存的模型和搜索密钥；ZIP 为明文、文件权限 0600，临时目录 0700 且完成后清理。始终不含密码、Cookie、访问历史、标签或会话。导入配置重新生成凭据 UUID、清除旧账户与环境变量绑定，密钥写入新账户且不覆盖或删除本机已有账户。运行请求保持原配置，备份未含的密钥需重新填写。
 - 导入窗口位置由 AppDelegate 立即恢复并适配当前屏幕，全屏或切换期间推迟到退出全屏；等待期间不让窗口移动/缩放通知覆盖导入位置。
 - 真实连接检查只在明确授权后使用 `--ai-connectivity-check`，通过通用环境参数传入地址与变量名，使用隔离配置、内存 Key 和合成内容，不写生产配置。
 
@@ -70,6 +74,8 @@
 - 网页由输入框 @ 主动引用，发送时提取正文并优先选中文字，排除表单、隐藏内容和秘密。HTML 仅经只读 get_page_html 工具按需获取。
 - 追问可使用本对话以前引用且仍匹配的已加载网页；引用编号稳定，不重新编号或重复追加提示。工具不得导航、远程抓取或执行任意 JS。
 - 引用匹配去除凭据、查询和片段，提取快照按完整 URL 校验，读取期间导航需报错。工具记录按供应商协议持久化和回放；历史裁剪保留完整问答与网页引用。
+- 回答选区使用 `AIQuote` 保存消息 ID 与最多 12,000 字的文本快照，归属会话控制器；队列、编辑、取消、保存及导出均携带引用。可引用的可见选区存在时推迟流式 Markdown 替换，清空选区后显示最新正文；隐藏的图表源码选区不阻塞更新。引用经 XML 转义后放入 `quoted_response`，系统指令明确其为参考数据而非指令/已证实事实；三种协议使用同一消息转换。
+- 引用提示词设计依据：[OpenAI Prompt engineering](https://platform.openai.com/docs/guides/prompt-engineering) 与 [Anthropic Prompting best practices](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/claude-prompting-best-practices) 的上下文分隔实践；数据分隔不能保证完全消除提示注入，原有工具权限仍独立校验。
 - 独立文本产物通过三协议共用的 create_text_file(name, content) 登记，仅在完整流结束且 ID 和参数有效后处理。不执行源码、不采用模型指定路径。
 - 保留文件数量、大小和历史预算，同轮同名更新稳定 ID，后续轮次保留原版本。下载排他创建以避让同名，另存为使用 NSSavePanel。
 - 文件版本只关联当前及此前消息，不能泄露后续轮次。表格 CSV 使用 UTF-8 BOM、RFC 引号转义及公式前缀保护，diff 保留计算上限。
@@ -77,12 +83,14 @@
 ## Markdown、图表与资源
 
 - Marked、DOMPurify 和 Mermaid 随应用本地打包，保留第三方许可。Mermaid 按需加载、strict 模式渲染并净化 SVG，未完成或错误图保留源码，旧异步渲染不能覆盖新内容。
+- `chat.js` 使用 Marked 扩展兼容 `**中文句子。**后续中文` 的加粗边界，不改 vendor 或预处理代码/转义文本；背景见 [CommonMark 中文标点讨论](https://talk.commonmark.org/t/bold-failure-in-chinese-sentence-because-of-the-usage-of-chinese-punctuation-is-different-from-english/3478)。来源卡片优先匹配搜索元数据，普通 HTTP(S) 链接使用标题/域名回退，按实际行框定位。搜索列表复用同一原生来源弹窗；正文链接、列表按钮和卡片原链接通过显式回调交给 Store.openReferencedPage，网页菜单与预览同样在 Perch 内打开。
+- Markdown 网页视图进入窗口时与浏览器网页视图一样开启 acceptsMouseMovedEvents。实机已观察到嵌入 SwiftUI 滚动容器的 WebKit 在正确原生命中、DOM 坐标命中链接时仍不更新 DOM 悬停状态；正文引用因此在现有原生事件监听中通过实际鼠标位置和 DOM 命中判定悬停，不拦截鼠标事件，不依赖 WebKit 私有跟踪区 owner。非嵌入网页保留 DOM 悬停，键盘聚焦共用同一引用状态；移动到同一链接不重置 600 毫秒延迟，离开、拖动选择、重绘及滚动清理预览。来源链接保留行内排版，纵向内边距覆盖文字下沿和虚线下划线附近的命中区域。悬停回归使用完整 Panel、RootHostingView 和 RootView，确认窗口命中正文后通过 NSApp.sendEvent 派发连续 NSEvent，验证停留、切换与离开；不能用直接调用 WebKit 跟踪区 owner 或 JavaScript dispatchEvent 代替应用事件路径。
 - 内嵌 WKWebView 不吞掉正文纵向滚轮；图表区域保留 WebKit 缩放，代码和表格保留横向滚动。交互区域按当前可见视口判断，监听按生命周期清理。
 - 图表平移和缩放不改变消息高度，源码切换保留状态；PNG 从完整净化 SVG 导出，不保存平移后的截屏。
 - 图表窗口独立于 Markdown 生命周期，关闭移除桥和引用。HTML/SVG 文件预览使用 nonPersistent WebKit 和 sandbox=allow-scripts，不允许 same-origin、网络、文件系统、弹窗、下载或宿主桥。
 - 主题通过 PerchTheme 同步原生 UI 与应用自身 Markdown/图表，原生标签显式刷新；不重建网页或聊天、不改变阅读位置和图表状态，不向真实网页注入主题。
 - Chat 正文字号由 BrowserSettings 持久化，默认 13 pt，历史标题默认 13 pt；PerchTheme 同步原生文本和 Markdown CSS 变量，其他文字相对正文等比例缩放，行高随文字调整。顶部「AI 聊天」文案固定 13 pt，不随正文字号调整。带来源的历史标题和来源整体垂直居中。更新字号重新排版，不重建内容或清空草稿与选区；图表视口保持独立。
-- 主程序体积优化使用既有编译与符号裁剪方案；Markdown 资源采用 LZMA 无损压缩并缓存解压结果。每次构建重建包内资源目录，避免旧资源残留。
-- ICNS 只无损重压缩 PNG 并验证像素及其他 chunks 不变；不能通过删除自检、图标尺寸、语言或图类型缩小体积。
+- 主程序体积优化使用既有编译与符号裁剪方案，并在 LTO 中额外运行一轮 LLVM [MachineOutliner](https://llvm.org/docs/doxygen/MachineOutliner_8cpp.html) 合并重复机器指令；保留运行时检查、类型元数据、异常展开及全部自检。Markdown 资源采用 LZMA 无损压缩并缓存解压结果。每次构建重建包内资源目录，避免旧资源残留。
+- ICNS 在 zlib 的标准压缩策略中选择最小 PNG 数据，并验证解压字节及其他 chunks 不变；不能通过删除自检、图标尺寸、语言或图类型缩小体积。
 
 验证入口：`build/Perch.app/Contents/MacOS/Perch --ai-markdown-self-test`，字号专项为 `--ai-typography-self-test`，文件专项为 Python 服务的 `--files-only`。通过 `open -W` 启动时，必须核对应用自检完成断言和 FAIL，不能把 open 的退出码或焦点超时视为成功。
