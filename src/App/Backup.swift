@@ -65,9 +65,26 @@ enum LaunchAtLogin {
     }
 }
 
+enum BackupScope: String, Codable, CaseIterable {
+    case settings, ai, bookmarks
+    var title: String {
+        switch self {
+        case .settings: return "设置与布局"
+        case .ai: return "AI 配置"
+        case .bookmarks: return "书签"
+        }
+    }
+}
+
+struct BackupCredentials: Codable {
+    var providers: [String: String] = [:]
+    var search: String?
+    var count: Int { providers.count + (search == nil ? 0 : 1) }
+}
+
 struct SettingsBackup: Codable {
     var format = "dev.perch.settings-bookmarks"
-    var version = 1
+    var version = 2
     var created = Date()
     var settings: BrowserSettings
     var launchAtLogin: Bool
@@ -78,32 +95,50 @@ struct SettingsBackup: Codable {
     var sites: [Site]
     var folders: [BookmarkFolder]
     var imported: [String: [BookmarkNode]]
+    var scope = Set(BackupScope.allCases)
+    var credentials: BackupCredentials?
+    var scopeDescription: String { BackupScope.allCases.filter(scope.contains).map(\.title).joined(separator: "、") }
 
     func validate() throws {
-        guard format == "dev.perch.settings-bookmarks", version == 1 else {
+        guard format == "dev.perch.settings-bookmarks", [1, 2].contains(version), !scope.isEmpty,
+              version != 1 || (scope == Set(BackupScope.allCases) && credentials == nil) else {
             throw PerchError("不支持此备份格式或版本，请使用兼容版本的 Perch。")
         }
-        try settings.validate()
-        for (key, value) in layout {
-            guard let key = LayoutPreference(rawValue: key) else { continue }
-            try key.validate(value)
+        if scope.contains(.settings) {
+            try settings.validate()
+            for (key, value) in layout {
+                guard let key = LayoutPreference(rawValue: key) else { continue }
+                try key.validate(value)
+            }
         }
-        guard !providers.isEmpty, providers.count <= 100,
-              Set(providers.map(\.id)).count == providers.count,
-              Set(providers.map(\.providerID)).count == providers.count,
-              providers.contains(where: { $0.id == selectedProvider }) else {
-            throw PerchError("备份中的 AI 供应商列表无效。")
+        if scope.contains(.ai) {
+            guard !providers.isEmpty, providers.count <= 100,
+                  Set(providers.map(\.id)).count == providers.count,
+                  Set(providers.map(\.providerID)).count == providers.count,
+                  providers.contains(where: { $0.id == selectedProvider }) else {
+                throw PerchError("备份中的 AI 供应商列表无效。")
+            }
+            for provider in providers {
+                // Newly added custom providers may not have an endpoint or models yet.
+                guard (provider.baseURL.isEmpty || provider.endpoint != nil),
+                      !provider.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      provider.providerID.range(of: #"^[a-z][a-z0-9_-]{0,63}$"#, options: .regularExpression) != nil,
+                      provider.models.count <= 10000 else { throw PerchError("备份中的 AI 配置无效。") }
+            }
+            if let search, search.endpoint == nil || search.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                throw PerchError("备份中的搜索配置无效。")
+            }
         }
-        for provider in providers {
-            // Newly added custom providers may not have an endpoint or models yet.
-            guard (provider.baseURL.isEmpty || provider.endpoint != nil),
-                  !provider.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  provider.providerID.range(of: #"^[a-z][a-z0-9_-]{0,63}$"#, options: .regularExpression) != nil,
-                  provider.models.count <= 10000 else { throw PerchError("备份中的 AI 配置无效。") }
+        if let credentials {
+            let accounts = Set(providers.filter { $0.account != nil }.map { $0.id.uuidString })
+            let keys = Array(credentials.providers.values) + (credentials.search.map { [$0] } ?? [])
+            guard scope.contains(.ai), Set(credentials.providers.keys).isSubset(of: accounts),
+                  credentials.search == nil || search != nil,
+                  keys.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 16384 && !$0.contains("\n") && !$0.contains("\r") }) else {
+                throw PerchError("备份中的 AI 密钥或关联配置无效。")
+            }
         }
-        if let search, search.endpoint == nil || search.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            throw PerchError("备份中的搜索配置无效。")
-        }
+        guard scope.contains(.bookmarks) else { return }
         guard sites.count + folders.count <= 50000 else { throw PerchError("备份中的书签过多。") }
         var ids = Set<UUID>()
         for folder in folders {
@@ -148,14 +183,58 @@ struct SettingsBackup: Codable {
 
     func withFreshCredentialIDs() -> Self {
         var copy = self
+        copy.credentials?.providers = [:]
         copy.providers = providers.map { provider in
             var value = provider
             value.id = UUID(); value.legacyAccount = nil; value.keyEnvironment = nil
             if provider.id == selectedProvider { copy.selectedProvider = value.id }
+            if let key = credentials?.providers[provider.id.uuidString] {
+                copy.credentials?.providers[value.id.uuidString] = key
+            }
             return value
         }
         copy.search?.id = UUID(); copy.search?.keyEnvironment = ""
         return copy
+    }
+}
+
+extension SettingsBackup {
+    private enum CodingKeys: String, CodingKey {
+        case format, version, created, scope, settings, launchAtLogin, layout, providers, selectedProvider
+        case search, sites, folders, imported, credentials
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let version = try c.decode(Int.self, forKey: .version)
+        let scope = version == 1 ? Set(BackupScope.allCases) : try c.decode(Set<BackupScope>.self, forKey: .scope)
+        self.init(format: try c.decode(String.self, forKey: .format), version: version,
+            created: try c.decode(Date.self, forKey: .created),
+            settings: scope.contains(.settings) ? try c.decode(BrowserSettings.self, forKey: .settings) : BrowserSettings(),
+            launchAtLogin: scope.contains(.settings) ? try c.decode(Bool.self, forKey: .launchAtLogin) : false,
+            layout: scope.contains(.settings) ? try c.decode([String: LayoutPreference.Value].self, forKey: .layout) : [:],
+            providers: scope.contains(.ai) ? try c.decode([AIConfiguration].self, forKey: .providers) : [],
+            selectedProvider: scope.contains(.ai) ? try c.decode(UUID.self, forKey: .selectedProvider) : UUID(),
+            search: scope.contains(.ai) ? try c.decodeIfPresent(AISearchConfiguration.self, forKey: .search) : nil,
+            sites: scope.contains(.bookmarks) ? try c.decode([Site].self, forKey: .sites) : [],
+            folders: scope.contains(.bookmarks) ? try c.decode([BookmarkFolder].self, forKey: .folders) : [],
+            imported: scope.contains(.bookmarks) ? try c.decode([String: [BookmarkNode]].self, forKey: .imported) : [:],
+            scope: scope, credentials: try c.decodeIfPresent(BackupCredentials.self, forKey: .credentials))
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(format, forKey: .format); try c.encode(version, forKey: .version); try c.encode(created, forKey: .created)
+        if version >= 2 { try c.encode(scope, forKey: .scope) }
+        if scope.contains(.settings) {
+            try c.encode(settings, forKey: .settings); try c.encode(launchAtLogin, forKey: .launchAtLogin)
+            try c.encode(layout, forKey: .layout)
+        }
+        if scope.contains(.ai) {
+            try c.encode(providers, forKey: .providers); try c.encode(selectedProvider, forKey: .selectedProvider)
+            try c.encodeIfPresent(search, forKey: .search); try c.encodeIfPresent(credentials, forKey: .credentials)
+        }
+        if scope.contains(.bookmarks) {
+            try c.encode(sites, forKey: .sites); try c.encode(folders, forKey: .folders); try c.encode(imported, forKey: .imported)
+        }
     }
 }
 
@@ -204,6 +283,7 @@ enum BackupArchive {
         try data.write(to: directory.appendingPathComponent(entry))
         _ = try run("/usr/bin/zip", ["-q", "backup.zip", entry], directory: directory, limit: 4096)
         try Data(contentsOf: directory.appendingPathComponent("backup.zip")).write(to: destination, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
     }
 
     static func read(_ source: URL) throws -> SettingsBackup {

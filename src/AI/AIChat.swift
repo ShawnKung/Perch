@@ -828,11 +828,51 @@ final class AIController: ObservableObject {
     var ready: Bool { !damaged && configuration.endpoint != nil && configuration.models.contains(configuration.model) && hasKey }
     var needsReset: Bool { damaged }
     var canRestoreSettings: Bool { !damaged && !damagedSearch }
+    func backupCredentials() throws -> BackupCredentials {
+        var credentials = BackupCredentials()
+        for provider in providers {
+            if let account = provider.account, let key = try keys.read(account) {
+                credentials.providers[provider.id.uuidString] = key
+            }
+        }
+        credentials.search = try searchConfiguration.flatMap { try keys.read($0.account) }
+        return credentials
+    }
+
+    // Call only with freshly assigned credential IDs. Existing accounts are never overwritten.
+    func withImportedCredentials(_ backup: SettingsBackup, operation: () throws -> Void) throws {
+        var accounts: [String] = []
+        do {
+            if backup.scope.contains(.ai), let credentials = backup.credentials {
+                var values: [(String, String)] = backup.providers.compactMap { provider in
+                    guard let account = provider.account, let key = credentials.providers[provider.id.uuidString] else { return nil }
+                    return (account, key)
+                }
+                if let search = backup.search, let key = credentials.search { values.append((search.account, key)) }
+                for (account, key) in values {
+                    guard try keys.read(account) == nil else { throw PerchError("导入密钥账户已存在，请重新导入。") }
+                    accounts.append(account)
+                    try keys.write(key, account: account)
+                }
+            }
+            try operation()
+        } catch {
+            let original = error
+            var cleanupFailed = false
+            for account in accounts {
+                do { try keys.write(nil, account: account) } catch { cleanupFailed = true }
+            }
+            if cleanupFailed { throw PerchError("导入失败，部分临时 AI 密钥未能清理，请检查钥匙串权限。\(original.localizedDescription)") }
+            throw original
+        }
+    }
+
     func restoreSettings(_ backup: SettingsBackup) {
         providers = backup.providers
         configuration = providers.first(where: { $0.id == backup.selectedProvider }) ?? providers[0]
         searchConfiguration = backup.search
-        keyedProviders = []; hasKey = false; searchHasKey = false
+        keyedProviders = Set(backup.providers.filter { backup.credentials?.providers[$0.id.uuidString] != nil }.map(\.id))
+        hasKey = keyedProviders.contains(configuration.id); searchHasKey = backup.credentials?.search != nil
         settingsError = nil; searchSettingsError = nil
         // Live requests retain their captured configuration; drafts and conversations stay intact.
         selections.removeAll(); selectedModels.removeAll()

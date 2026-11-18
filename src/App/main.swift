@@ -816,59 +816,72 @@ final class Store: ObservableObject {
         }
     }
 
-    private func checkBackupAccess() throws {
-        guard protectedKeys.isDisjoint(with: ["settings", "sites", "bookmarkFolders", "importedBookmarks"]),
-              ai.canRestoreSettings else {
+    private func checkBackupAccess(_ scope: Set<BackupScope>) throws {
+        let keys = Set(scope.contains(.settings) ? ["settings"] : [])
+            .union(scope.contains(.bookmarks) ? ["sites", "bookmarkFolders", "importedBookmarks"] : [])
+        guard protectedKeys.isDisjoint(with: keys), !scope.contains(.ai) || ai.canRestoreSettings else {
             throw PerchError("当前设置或书签数据损坏，已保留原数据。请先备份并修复原始数据。")
         }
     }
 
-    func settingsBackup(launchAtLogin: Bool) throws -> SettingsBackup {
-        try checkBackupAccess()
+    func settingsBackup(launchAtLogin: Bool, scope: Set<BackupScope> = Set(BackupScope.allCases),
+                        includeKeys: Bool = false) throws -> SettingsBackup {
+        try checkBackupAccess(scope)
         var providers = ai.providers
         for index in providers.indices { providers[index].legacyAccount = nil }
         let backup = SettingsBackup(settings: settings, launchAtLogin: launchAtLogin,
             layout: LayoutPreference.capture(defaults), providers: providers,
             selectedProvider: ai.configuration.id, search: ai.searchConfiguration,
-            sites: sites, folders: bookmarkFolders, imported: importedBookmarks)
+            sites: sites, folders: bookmarkFolders, imported: importedBookmarks, scope: scope,
+            credentials: includeKeys && scope.contains(.ai) ? try ai.backupCredentials() : nil)
         try backup.validate()
         return backup
     }
 
     func restoreSettingsBackup(_ backup: SettingsBackup,
                                setLaunchAtLogin: (Bool) throws -> Void = LaunchAtLogin.set) throws {
-        try checkBackupAccess()
+        try checkBackupAccess(backup.scope)
         try backup.validate()
         // Imported UUIDs must never resolve to credentials already trusted on this Mac.
         let backup = backup.withFreshCredentialIDs()
         let encoder = JSONEncoder()
-        let encoded = try [
-            "settings": encoder.encode(backup.settings),
-            "sites": encoder.encode(backup.sites),
-            "bookmarkFolders": encoder.encode(backup.folders),
-            "importedBookmarks": encoder.encode(backup.imported),
-            "aiProviders": encoder.encode(backup.providers)
-        ]
+        var encoded: [String: Data] = [:]
+        if backup.scope.contains(.settings) { encoded["settings"] = try encoder.encode(backup.settings) }
+        if backup.scope.contains(.bookmarks) {
+            encoded["sites"] = try encoder.encode(backup.sites)
+            encoded["bookmarkFolders"] = try encoder.encode(backup.folders)
+            encoded["importedBookmarks"] = try encoder.encode(backup.imported)
+        }
+        if backup.scope.contains(.ai) { encoded["aiProviders"] = try encoder.encode(backup.providers) }
         let search = try backup.search.map { try encoder.encode($0) }
-        try applyHotkeys?(backup.settings)
-        do { try setLaunchAtLogin(backup.launchAtLogin) }
-        catch {
-            let loginError = error
-            do { try applyHotkeys?(settings) }
-            catch { throw PerchError("登录项导入失败，旧快捷键无法恢复，请重新设置。\(loginError.localizedDescription)") }
-            throw loginError
+        try ai.withImportedCredentials(backup) {
+            guard backup.scope.contains(.settings) else { return }
+            try applyHotkeys?(backup.settings)
+            do { try setLaunchAtLogin(backup.launchAtLogin) }
+            catch {
+                let loginError = error
+                do { try applyHotkeys?(settings) }
+                catch { throw PerchError("登录项导入失败，旧快捷键无法恢复，请重新设置。\(loginError.localizedDescription)") }
+                throw loginError
+            }
         }
         // All fallible validation/encoding/system operations finish before changing stored data.
         for (key, data) in encoded { defaults.set(data, forKey: key) }
-        if let search { defaults.set(search, forKey: "aiSearchProvider") }
-        else { defaults.removeObject(forKey: "aiSearchProvider") }
-        defaults.set(backup.selectedProvider.uuidString, forKey: "aiSelectedProvider")
-        defaults.removeObject(forKey: "aiConfiguration")
-        LayoutPreference.restore(backup.layout, to: defaults)
-        sites = backup.sites; bookmarkFolders = backup.folders; importedBookmarks = backup.imported
-        ai.restoreSettings(backup)
-        applySettings(backup.settings)
-        restoreWindowPlacement?()
+        if backup.scope.contains(.ai) {
+            if let search { defaults.set(search, forKey: "aiSearchProvider") }
+            else { defaults.removeObject(forKey: "aiSearchProvider") }
+            defaults.set(backup.selectedProvider.uuidString, forKey: "aiSelectedProvider")
+            defaults.removeObject(forKey: "aiConfiguration")
+            ai.restoreSettings(backup)
+        }
+        if backup.scope.contains(.bookmarks) {
+            sites = backup.sites; bookmarkFolders = backup.folders; importedBookmarks = backup.imported
+        }
+        if backup.scope.contains(.settings) {
+            LayoutPreference.restore(backup.layout, to: defaults)
+            applySettings(backup.settings)
+            restoreWindowPlacement?()
+        }
     }
 
     func navigate(_ text: String) {
