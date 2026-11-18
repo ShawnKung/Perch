@@ -217,8 +217,9 @@ enum AISelfCheck {
             try await wait { element(host, label: phase.title) != nil }
             precondition(element(host, label: "已停止") == nil)
         }
+        var openedSources: [URL] = []
         for (title, view) in [
-            ("搜索完成 · 1 个来源", AnyView(AISearchEvidence(message: message))),
+            ("搜索完成 · 1 个来源", AnyView(AISearchEvidence(message: message, openURL: { openedSources.append($0) }))),
             ("思考过程", AnyView(AIReasoningView(text: "Fixture reasoning")))
         ] {
             host.rootView = AnyView(view.padding(16).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading))
@@ -244,6 +245,26 @@ enum AISelfCheck {
                     }
                     try await wait { expanded() == expected }
                 }
+            }
+            if title == "搜索完成 · 1 个来源" {
+                let header = element(host, label: title)!
+                let frame = (header.value(forKey: "accessibilityFrame") as! NSValue).rectValue
+                let headerPoint = window.convertPoint(fromScreen: NSPoint(x: frame.midX, y: frame.midY))
+                for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                    window.sendEvent(NSEvent.mouseEvent(with: type, location: headerPoint, modifierFlags: [],
+                        timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                        context: nil, eventNumber: 2, clickCount: 1, pressure: 1)!)
+                }
+                try await wait { expanded() && element(host, label: "Fixture source") != nil }
+                let sourceButton = element(host, label: "Fixture source")!
+                let sourceFrame = (sourceButton.value(forKey: "accessibilityFrame") as! NSValue).rectValue
+                let sourcePoint = window.convertPoint(fromScreen: NSPoint(x: sourceFrame.midX, y: sourceFrame.midY))
+                for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                    window.sendEvent(NSEvent.mouseEvent(with: type, location: sourcePoint, modifierFlags: [],
+                        timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                        context: nil, eventNumber: 3, clickCount: 1, pressure: 1)!)
+                }
+                try await wait { openedSources == message.searchSources!.map(\.url) }
             }
         }
         print("PASS: idle and legacy search hints hidden; search and reasoning expand/collapse from arrow, icon, text and trailing row")
@@ -295,7 +316,7 @@ enum AISelfCheck {
             host.rootView = AnyView(ScrollView {
                 VStack(alignment: .leading) {
                     AIReasoningView(text: reasoningText, phase: active ? .thinking : nil)
-                    AIMarkdownView(text: String(repeating: "Outer conversation fixture.\n\n", count: 40))
+                    AIMarkdownView(text: String(repeating: "Outer conversation fixture.\n\n", count: 40), openURL: { _ in })
                 }.padding(16)
             })
         }
@@ -585,6 +606,7 @@ enum AISelfCheck {
         print("PASS: native/standard search, direct HTTP in all protocols, independent keys, sources/usage/history/export, off/idle/error and frozen queue route")
     }
     static func run(baseURL: String) async throws {
+        try await quoteRequests(baseURL: baseURL)
         try await historyManagementUI(baseURL: baseURL)
         setbuf(stdout, nil)
         guard URL(string: baseURL)?.host == "127.0.0.1" else { throw PerchError("AI self-check requires a loopback fixture") }
@@ -1393,7 +1415,8 @@ enum AISelfCheck {
             }
         }
         print("PASS: single image/source switch with current mode on the right, selectable source with corner copy, image menu PNG export, click-to-open, drag, zoom and reset")
-        _ = try await web.callAsyncJavaScript("return await renderMarkdown(text)", arguments: ["text": "```mermaid\nflowchart LR\nA -->\n```"], in: nil, contentWorld: .page)
+        // A selection in the now-hidden diagram source must not pause answer updates.
+        _ = try await web.callAsyncJavaScript("window.quoteEnabled=true; return await renderMarkdown(text)", arguments: ["text": "```mermaid\nflowchart LR\nA -->\n```"], in: nil, contentWorld: .page)
         let incomplete = try await web.callAsyncJavaScript("return !!document.querySelector('#content pre code.language-mermaid') && !!document.querySelector('#content pre button')", arguments: [:], in: nil, contentWorld: .page)
         precondition(incomplete as? Bool == true, "Incomplete Mermaid must preserve its source and copy button")
         let replacement = try await web.callAsyncJavaScript("""
@@ -2273,8 +2296,8 @@ enum AISelfCheck {
         }
         guard let menuRow = table.conversationIDs.firstIndex(of: selectionIDs[0]),
               let menu = table.contextMenu(at: menuRow) else { throw PerchError("History context menu missing") }
-        precondition(menu.items.last?.title == "归档 2 个对话" && table.selectedRowIndexes.count == 2)
-        let copy = menu.items.first!
+        precondition(menu.items.last?.title == "归档 2 个会话" && table.selectedRowIndexes.count == 2)
+        let copy = menu.items.first { $0.title == "复制会话" }!
         let chatTabBeforeFork = store.selected
         let tabsBeforeFork = store.tabs.count
         _ = copy.target?.perform(copy.action!)
@@ -2303,7 +2326,7 @@ enum AISelfCheck {
         archiveTable.makeMenu = { archiveController.menu($0) }; archiveController.refresh()
         let archiveRow = archiveTable.conversationIDs.firstIndex(where: { $0 != nil })!
         let archivedMenu = archiveTable.contextMenu(at: archiveRow)!
-        precondition(archivedMenu.items.last?.title == "彻底删除对话")
+        precondition(archivedMenu.items.last?.title == "彻底删除会话")
         let restoreItem = archivedMenu.items.first { $0.title == "恢复对话" }!
         _ = restoreItem.target?.perform(restoreItem.action!)
         precondition(store.ai.archivedConversations.count == selectedIDs.count - 1)

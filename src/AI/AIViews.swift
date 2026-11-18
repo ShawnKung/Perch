@@ -674,6 +674,7 @@ struct AISearchEvidence: View {
     @ObservedObject private var theme = PerchTheme.shared
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let message: AIMessage
+    let openURL: (URL) -> Void
     @State private var expanded = false
     static func isVisible(_ message: AIMessage) -> Bool {
         if message.searchSources?.isEmpty == false { return true }
@@ -688,14 +689,15 @@ struct AISearchEvidence: View {
                 if expanded {
                 VStack(alignment: .leading, spacing: 6) {
                 ForEach(message.searchSources ?? []) { source in
-                    Link(destination: source.url) {
+                    Button { openURL(source.url) } label: {
                         Text(source.title).font(.system(size: theme.chatFontSize(relativeTo: 11))).foregroundStyle(Style.muted)
                             .underline(true, pattern: .dash, color: Style.muted.opacity(0.65))
                             .lineLimit(2).multilineTextAlignment(.leading)
                             .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain).tint(Style.muted)
-                    .help(source.url.host.map { $0 + "\n" + (source.excerpt ?? "来源未提供摘要") } ?? source.title)
+                    .background(AICitationHoverAnchor(source: source, openURL: openURL))
                 }
                 if message.searchSources?.isEmpty != false {
                     Text("暂无搜索来源").font(.system(size: theme.chatFontSize(relativeTo: 11))).foregroundStyle(Style.muted)
@@ -1151,13 +1153,26 @@ struct AIChatSidebar: View {
                                     ForEach(message.attachments) { file in
                                         Label(file.name, systemImage: file.isImage ? "photo" : "doc.text").font(.system(size: theme.chatFontSize(relativeTo: 10))).foregroundStyle(Style.accent)
                                     }
-                                    AISearchEvidence(message: message)
+                                    AISearchEvidence(message: message, openURL: store.openReferencedPage)
+                                    if let quote = message.quote {
+                                        Label {
+                                            Text(quote.text).lineLimit(4).textSelection(.enabled)
+                                        } icon: { Image(systemName: "quote.opening") }
+                                        .font(.system(size: theme.chatDetailFontSize)).foregroundStyle(Style.muted)
+                                        .padding(8).frame(maxWidth: .infinity, alignment: .leading)
+                                        .background(Style.sidebar, in: RoundedRectangle(cornerRadius: 7))
+                                    }
                                     if message.role == "assistant" && (message.reasoning?.isEmpty == false || (busy && session.messages.last?.id == message.id)) {
                                         AIReasoningView(text: message.reasoning ?? "", phase: busy && session.messages.last?.id == message.id ? session.phase ?? .waiting : nil,
                                                         hasBody: !message.text.isEmpty)
                                     }
                                     if !(busy && session.messages.last?.id == message.id) && message.text.isEmpty && message.reasoning?.isEmpty != false && (message.generatedFiles ?? []).isEmpty && message.clarification == nil { Text("已停止").font(.system(size: theme.chatDetailFontSize)).foregroundStyle(Style.muted) }
-                                    else if !message.text.isEmpty && message.role == "assistant" { AIMarkdownView(text: message.text, sources: message.searchSources ?? []) }
+                                    else if !message.text.isEmpty && message.role == "assistant" {
+                                        AIMarkdownView(text: message.text, sources: message.searchSources ?? [], openURL: store.openReferencedPage,
+                                            quote: canEdit ? { selected in
+                                                if ai.quoteSelection(selected, messageID: message.id, tab: tab) { focusComposer = UUID() }
+                                            } : nil)
+                                    }
                                     else if !message.text.isEmpty { Text(message.text).font(.system(size: theme.chatFontSize)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true).frame(maxWidth: .infinity, alignment: .leading) }
                                     ForEach(message.generatedFiles ?? []) { file in
                                         AIGeneratedFileCard(file: file, versions: session.fileVersions(name: file.name, through: message.id))
@@ -1274,6 +1289,16 @@ struct AIChatSidebar: View {
                     }
                     sendQueue
                     VStack(alignment: .leading, spacing: 8) {
+                    if let quote = ai.draftQuotes[tab] {
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: "quote.opening").foregroundStyle(Style.accent)
+                            Text(quote.text).lineLimit(3).frame(maxWidth: .infinity, alignment: .leading).help(quote.text)
+                            Button { ai.draftQuotes[tab] = nil } label: { Image(systemName: "xmark") }
+                                .buttonStyle(.plain).arrowCursor().help("移除回答引用").accessibilityLabel("移除回答引用")
+                        }.font(.system(size: theme.chatDetailFontSize)).padding(8)
+                            .background(Style.mint, in: RoundedRectangle(cornerRadius: 7))
+                            .accessibilityElement(children: .contain).accessibilityLabel("引用的回答")
+                    }
                     ForEach(ai.draftClosedReferences[tab] ?? []) { reference in
                         HStack(spacing: 5) {
                             Image(systemName: "globe").foregroundStyle(Style.accent)
@@ -1446,8 +1471,9 @@ struct AIChatSidebar: View {
         if ai.send(input.wrappedValue, tab: tab, browser: nil, usePage: false, attachments: ai.draftFiles[tab] ?? [], pages: pages,
                    availablePageProvider: { [weak store] in store?.loadedReferencePages ?? [] },
                    origin: !fullPage && store.browser != nil ? .web : .chat,
-                   sidebarURL: fullPage ? nil : store.currentPageURL) {
+                   sidebarURL: fullPage ? nil : store.currentPageURL, quote: ai.draftQuotes[tab]) {
             ai.drafts[tab] = ""; ai.draftFiles[tab] = []; ai.draftReferences[tab] = []; ai.draftClosedReferences[tab] = []
+            ai.draftQuotes[tab] = nil
             fileError = nil; mention = nil
         }
     }

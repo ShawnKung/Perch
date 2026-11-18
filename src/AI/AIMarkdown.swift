@@ -26,7 +26,7 @@ private struct AICitationPreviewContent: View {
 
 final class AICitationPreview: NSObject, NSPopoverDelegate {
     let popover = NSPopover()
-    var openURL: (URL) -> Void = { NSWorkspace.shared.open($0) }
+    var openURL: ((URL) -> Void)?
     private var showTask: Task<Void, Never>?
     private var closeTask: Task<Void, Never>?
     private var sourceURL: URL?
@@ -36,7 +36,7 @@ final class AICitationPreview: NSObject, NSPopoverDelegate {
         super.init()
         popover.behavior = .semitransient; popover.delegate = self
     }
-    func enter(source: AISearchSource, rect: NSRect, web: WKWebView) {
+    func enter(source: AISearchSource, rect: NSRect, web: NSView) {
         guard ["http", "https"].contains(source.url.scheme?.lowercased() ?? ""),
               source.url.user == nil, source.url.password == nil else { close(); return }
         closeTask?.cancel()
@@ -54,7 +54,7 @@ final class AICitationPreview: NSObject, NSPopoverDelegate {
             self.popover.contentViewController = host
             self.popover.contentSize = host.view.fittingSize
             self.popover.animates = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-            self.popover.show(relativeTo: rect, of: web, preferredEdge: .maxY)
+            self.popover.show(relativeTo: rect.intersection(web.visibleRect), of: web, preferredEdge: .maxY)
         }
     }
     func leave(url: URL) {
@@ -68,7 +68,7 @@ final class AICitationPreview: NSObject, NSPopoverDelegate {
     }
     func openOriginal() {
         guard let sourceURL, popover.isShown else { return }
-        openURL(sourceURL); close()
+        openURL?(sourceURL); close()
     }
     private func scheduleClose() {
         closeTask?.cancel()
@@ -91,16 +91,58 @@ final class AICitationPreview: NSObject, NSPopoverDelegate {
     deinit { showTask?.cancel(); closeTask?.cancel(); popover.close() }
 }
 
+struct AICitationHoverAnchor: NSViewRepresentable {
+    let source: AISearchSource
+    let openURL: (URL) -> Void
+    final class Anchor: NSView {
+        let preview = AICitationPreview()
+        var source: AISearchSource?
+        private var tracking: NSTrackingArea?
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            if let tracking { removeTrackingArea(tracking) }
+            let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+                                      owner: self, userInfo: nil)
+            addTrackingArea(area); tracking = area
+        }
+        override func mouseEntered(with event: NSEvent) {
+            if let source { preview.enter(source: source, rect: bounds, web: self) }
+        }
+        override func mouseExited(with event: NSEvent) {
+            if let source { preview.leave(url: source.url) }
+        }
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if window == nil { preview.close() }
+        }
+    }
+    func makeNSView(context: Context) -> Anchor { Anchor() }
+    func updateNSView(_ view: Anchor, context: Context) {
+        if view.source != source { view.preview.close() }
+        view.source = source; view.preview.openURL = openURL
+    }
+    static func dismantleNSView(_ view: Anchor, coordinator: ()) { view.preview.close() }
+}
+
 final class AIMarkdownWebView: WKWebView {
     var mermaidLoaded = false
     var diagramRects: [NSRect] = []
-    private var scrollMonitor: Any?
+    private var eventMonitor: Any?
+    private var citationMouseInside = false
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        if let scrollMonitor { NSEvent.removeMonitor(scrollMonitor); self.scrollMonitor = nil }
+        window?.acceptsMouseMovedEvents = true
+        if let eventMonitor { NSEvent.removeMonitor(eventMonitor); self.eventMonitor = nil }
+        citationMouseInside = false
         guard window != nil else { return }
-        scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel, .mouseMoved, .mouseExited,
+            .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]) { [weak self] event in
             guard let self, let window = self.window else { return event }
+            if event.type != .scrollWheel {
+                self.updateCitationHover(with: event)
+                return event
+            }
             let screenPoint = NSEvent.mouseLocation
             guard NSWindow.windowNumber(at: screenPoint, belowWindowWithWindowNumber: 0) == window.windowNumber else { return event }
             let point = window.convertPoint(fromScreen: screenPoint)
@@ -116,18 +158,31 @@ final class AIMarkdownWebView: WKWebView {
             super.scrollWheel(with: event)
         }
     }
-    deinit { if let scrollMonitor { NSEvent.removeMonitor(scrollMonitor) } }
+    deinit { if let eventMonitor { NSEvent.removeMonitor(eventMonitor) } }
+    private func updateCitationHover(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let hovering = event.type == .mouseMoved || event.type == .mouseExited
+        let inside = hovering && event.window === window && isContentHit(at: point)
+        guard inside || citationMouseInside else { return }
+        citationMouseInside = inside
+        // Embedded WebKit can miss DOM hover updates despite a correct native hit.
+        let y = isFlipped ? point.y : bounds.height - point.y
+        callAsyncJavaScript("window.updateCitationHover?.(x,y);",
+            arguments: ["x": inside ? point.x as Any : NSNull(), "y": inside ? y as Any : NSNull()],
+            in: nil, in: .page, completionHandler: nil)
+    }
+    private func isContentHit(at point: NSPoint) -> Bool {
+        guard !isHiddenOrHasHiddenAncestor, bounds.intersection(visibleRect).contains(point),
+              let window, let content = window.contentView else { return false }
+        let windowPoint = convert(point, to: nil)
+        let parentPoint = content.superview?.convert(windowPoint, from: nil) ?? windowPoint
+        guard let hit = content.hitTest(parentPoint) else { return false }
+        return hit === self || hit.isDescendant(of: self)
+    }
     @discardableResult
     func forwardVerticalScroll(_ event: NSEvent, at point: NSPoint) -> Bool {
-        guard !isHiddenOrHasHiddenAncestor, bounds.intersection(visibleRect).contains(point),
+        guard isContentHit(at: point),
               abs(event.scrollingDeltaY) >= abs(event.scrollingDeltaX) else { return false }
-        // Local monitors must respect the window's hit testing, including overlays.
-        if let window, let content = window.contentView {
-            let windowPoint = convert(point, to: nil)
-            let parentPoint = content.superview?.convert(windowPoint, from: nil) ?? windowPoint
-            guard let hit = content.hitTest(parentPoint),
-                  hit === self || hit.isDescendant(of: self) else { return false }
-        }
         let pagePoint = NSPoint(x: point.x, y: isFlipped ? point.y : bounds.height - point.y)
         guard !diagramRects.contains(where: { $0.contains(pagePoint) }) else { return false }
         var parent = superview
@@ -147,6 +202,8 @@ final class AIMarkdownWebView: WKWebView {
 struct AIMarkdownView: View {
     let text: String
     var sources: [AISearchSource] = []
+    let openURL: (URL) -> Void
+    var quote: ((String) -> Void)?
     @State private var height: CGFloat = 40
     static func asset(_ name: String) -> String? {
         let filename = name == "mermaid.js" ? "mermaid.lzma" : name + ".lzma"
@@ -160,7 +217,8 @@ struct AIMarkdownView: View {
     }()
     private static let mermaidSource = asset("mermaid.js") ?? ""
     private static let tableSource = asset("tables.js") ?? ""
-    static func render(_ text: String, web: WKWebView, sources: [AISearchSource] = []) {
+    private static let chatSource = asset("chat.js") ?? ""
+    static func render(_ text: String, web: WKWebView, sources: [AISearchSource] = [], quoteEnabled: Bool = false) {
         Task { @MainActor in
             PerchTheme.shared.update(web)
             let needsMermaid = text.contains("mermaid") && (web as? AIMarkdownWebView)?.mermaidLoaded != true
@@ -178,8 +236,10 @@ struct AIMarkdownView: View {
                       fontFamily:'-apple-system,sans-serif',fontSize:'13px'},flowchart:{htmlLabels:false}});
                 }
                 window.citationSources = sources;
+                window.quoteEnabled = quoteEnabled;
                 return await renderMarkdown(text);
                 """, arguments: ["text": text, "source": needsMermaid ? mermaidSource : "",
+                    "quoteEnabled": quoteEnabled,
                     "colors": PerchTheme.shared.selection.webColors,
                     "sources": sources.map { ["title": $0.title, "url": $0.url.absoluteString, "excerpt": $0.excerpt ?? ""] }], in: nil, contentWorld: .page)
                 if needsMermaid { (web as? AIMarkdownWebView)?.mermaidLoaded = true }
@@ -214,17 +274,23 @@ struct AIMarkdownView: View {
         .table-tools{display:flex;flex-wrap:wrap;gap:6px;padding-top:5px} .table-tools button,th button{font:calc(var(--perch-chat-font-size,13px) * 11 / 13) -apple-system;color:var(--perch-accent);border:1px solid var(--perch-line);border-radius:5px;background:white;padding:3px 7px;cursor:pointer}
         th button{border:0;background:none;text-align:left;padding:0;width:100%;font:inherit;font-weight:600}
         th[aria-sort=ascending]::after{content:' ↑'} th[aria-sort=descending]::after{content:' ↓'}
-        .source-citation{font-size:calc(var(--perch-chat-font-size,13px) * 11 / 13);color:#68776d;text-decoration:underline dashed;text-underline-offset:3px}
+        .source-citation{font-size:calc(var(--perch-chat-font-size,13px) * 11 / 13);padding:3px 0;color:#68776d;text-decoration:underline dashed;text-underline-offset:3px}
+        #quote-selection{position:fixed;z-index:1000;border:1px solid var(--perch-line);border-radius:7px;background:white;color:var(--perch-accent);padding:5px 10px;font:12px -apple-system;box-shadow:0 2px 8px #0002;cursor:pointer}
         th,td{border:1px solid var(--perch-line);padding:6px 8px;text-align:left} th{background:var(--perch-mint)} hr{border:0;border-top:1px solid var(--perch-line)}
         input[type=checkbox]{accent-color:var(--perch-accent)} img{max-width:100%}
         \(AIDiagram.assets.style)
         </style></head><body><div id="content"></div>
         <script>\(marked)</script><script>\(purify)</script><script>\(AIDiagram.assets.script)</script>
-        <script>\(tableSource)</script><script>
+        <script>\(tableSource)</script><script>\(chatSource)</script><script>
+        window.nativeCitationHover = \(embedded ? "true" : "false");
         let renderRevision = 0, diagramID = 0;
         window.renderMarkdown = async text => {
           const revision = ++renderRevision;
           const root = document.getElementById('content');
+          if (window.answerSelection?.()) {
+            window.pendingMarkdown = text; return;
+          }
+          window.pendingMarkdown = null;
           window.webkit.messageHandlers.markdown.postMessage({citation:{action:'clear'}});
           root.innerHTML = DOMPurify.sanitize(marked.parse(text, {gfm:true, breaks:true}), {USE_PROFILES:{html:true}, FORBID_TAGS:['style','form','iframe','img'], FORBID_ATTR:['style']});
           window.updateDiagramBounds?.();
@@ -275,6 +341,10 @@ struct AIMarkdownView: View {
         var height: Binding<CGFloat>
         var text = ""
         var sources: [AISearchSource] = []
+        var quote: ((String) -> Void)?
+        var openURL: ((URL) -> Void)? {
+            didSet { citationPreview.openURL = openURL }
+        }
         var loaded = false
         weak var container: MarkdownContainer?
         weak var scroll: NSScrollView?
@@ -305,7 +375,9 @@ struct AIMarkdownView: View {
                     scroll.contentView.postsBoundsChangedNotifications = true
                     observers.append(NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification,
                         object: scroll.contentView, queue: .main) { [weak self] _ in
-                            self?.citationPreview.close(); self?.scheduleVisibility()
+                            self?.citationPreview.close()
+                            self?.web?.evaluateJavaScript("window.updateCitationHover?.(null,null);", completionHandler: nil)
+                            self?.scheduleVisibility()
                         })
                     if let document = scroll.documentView {
                         document.postsFrameChangedNotifications = true
@@ -332,6 +404,12 @@ struct AIMarkdownView: View {
                     self.unloadTask = nil
                     if !self.nearViewport() { self.unload() }
                 }
+            }
+            if let web, loaded {
+                let rect = web.visibleRect
+                let top = web.isFlipped ? rect.minY : web.bounds.height - rect.maxY
+                web.callAsyncJavaScript("window.quoteViewport={top,bottom};window.updateQuoteSelection?.();",
+                    arguments: ["top": top, "bottom": top + rect.height], in: nil, in: .page, completionHandler: nil)
             }
         }
         func nearViewport() -> Bool {
@@ -361,10 +439,16 @@ struct AIMarkdownView: View {
         }
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
             guard let body = message.body as? [String: Any] else { return }
+            if message.frameInfo.isMainFrame, let selected = body["quote"] as? String,
+               !selected.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, selected.count <= 12000 {
+                quote?(selected)
+            }
             if let citation = body["citation"] as? [String: Any], message.frameInfo.isMainFrame {
                 if citation["action"] as? String == "clear" { citationPreview.close() }
                 else if let address = citation["url"] as? String,
-                        let source = sources.first(where: { $0.url.absoluteString == address }) {
+                        let url = URLInput.parse(address, search: false) {
+                    let source = sources.first(where: { $0.url.absoluteString == address })
+                        ?? AISearchSource(title: String((citation["title"] as? String ?? url.host ?? address).prefix(512)), url: url)
                     if citation["action"] as? String == "leave" { citationPreview.leave(url: source.url) }
                     else if citation["action"] as? String == "enter", let web = message.webView,
                             let x = citation["x"] as? Double, let y = citation["y"] as? Double,
@@ -418,11 +502,12 @@ struct AIMarkdownView: View {
         }
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             PerchTheme.shared.update(webView)
-            loaded = true; AIMarkdownView.render(text, web: webView, sources: sources)
+            loaded = true; AIMarkdownView.render(text, web: webView, sources: sources, quoteEnabled: quote != nil)
+            scheduleVisibility()
         }
         func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
             if navigationAction.navigationType == .linkActivated, let url = navigationAction.request.url {
-                if ["http", "https"].contains(url.scheme?.lowercased() ?? "") { NSWorkspace.shared.open(url) }
+                if let safeURL = URLInput.parse(url.absoluteString, search: false) { openURL?(safeURL) }
                 decisionHandler(.cancel)
             } else { decisionHandler(.allow) }
         }
@@ -434,10 +519,12 @@ struct AIMarkdownView: View {
         override func setFrameSize(_ newSize: NSSize) { super.setFrameSize(newSize); refresh?() }
         override func setFrameOrigin(_ newOrigin: NSPoint) { super.setFrameOrigin(newOrigin); refresh?() }
     }
-    var body: some View { SizedMarkdown(text: text, sources: sources, height: $height).frame(height: height) }
+    var body: some View { SizedMarkdown(text: text, sources: sources, openURL: openURL, quote: quote, height: $height).frame(height: height) }
     struct SizedMarkdown: NSViewRepresentable {
         let text: String
         var sources: [AISearchSource] = []
+        let openURL: (URL) -> Void
+        var quote: ((String) -> Void)?
         @Binding var height: CGFloat
         func makeCoordinator() -> Coordinator { Coordinator(height: $height) }
         func makeNSView(context: Context) -> MarkdownContainer {
@@ -445,15 +532,22 @@ struct AIMarkdownView: View {
             context.coordinator.container = view
             context.coordinator.text = text
             context.coordinator.sources = sources
+            context.coordinator.openURL = openURL
+            context.coordinator.quote = quote
             view.refresh = { [weak coordinator = context.coordinator] in coordinator?.scheduleVisibility() }
             return view
         }
         func updateNSView(_ view: MarkdownContainer, context: Context) {
-            if context.coordinator.text != text || context.coordinator.sources != sources {
+            let quoteChanged = (context.coordinator.quote != nil) != (quote != nil)
+            context.coordinator.quote = quote
+            context.coordinator.openURL = openURL
+            if context.coordinator.text != text || context.coordinator.sources != sources || quoteChanged {
                 context.coordinator.text = text
                 context.coordinator.sources = sources
                 context.coordinator.citationPreview.close()
-                if context.coordinator.loaded, let web = context.coordinator.web { AIMarkdownView.render(text, web: web, sources: sources) }
+                if context.coordinator.loaded, let web = context.coordinator.web {
+                    AIMarkdownView.render(text, web: web, sources: sources, quoteEnabled: quote != nil)
+                }
             }
             context.coordinator.scheduleVisibility()
         }
