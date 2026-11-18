@@ -1988,6 +1988,55 @@ final class LayoutSelfCheck {
         print("PASS: native library picker preserves the same 780x580 window and paper background through all \(LibraryPage.allCases.count) pages")
         store.library = nil
         await settle()
+        let originalFrame = panel.frame
+        func closeSettings() {
+            guard let current = panel.attachedSheet, let content = current.contentView,
+                  let done = themeButton(content, label: "完成"),
+                  let buttonFrame = (done.value(forKey: "accessibilityFrame") as? NSValue)?.rectValue else {
+                preconditionFailure("Settings must expose its Done button")
+            }
+            current.makeKeyAndOrderFront(nil)
+            let point = current.convertPoint(fromScreen: NSPoint(x: buttonFrame.midX, y: buttonFrame.midY))
+            for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                NSApp.sendEvent(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
+                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: current.windowNumber,
+                    context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!)
+            }
+        }
+        let screens = NSScreen.screens.map(\.visibleFrame)
+        for (index, bounds) in screens.enumerated() {
+            let small = NSRect(x: bounds.minX + 90, y: bounds.minY + 1, width: 700, height: 552)
+            panel.setFrame(small, display: true)
+            await settle()
+            let beforeSheet = panel.frame
+            store.library = .settings
+            await settle()
+            closeSettings()
+            await settle()
+            precondition(panel.attachedSheet == nil && panel.frame == beforeSheet,
+                         "An unmoved tall sheet must retain AppKit's ordinary parent restoration")
+            store.library = .settings
+            await settle()
+            let destination = screens[(index + 1) % screens.count]
+            panel.setPlacement(NSRect(origin: NSPoint(x: destination.minX + 120, y: destination.minY + 160),
+                                      size: panel.frame.size), display: true)
+            await settle()
+            let moved = panel.frame
+            var dismissalFrames: [NSRect] = []
+            let observer = NotificationCenter.default.addObserver(forName: NSWindow.didMoveNotification,
+                object: panel, queue: nil) { notification in
+                    dismissalFrames.append((notification.object as! NSWindow).frame)
+                }
+            closeSettings()
+            await settle()
+            NotificationCenter.default.removeObserver(observer)
+            precondition(panel.attachedSheet == nil && panel.frame == moved,
+                         "Closing a tall sheet must preserve the latest explicit window placement")
+            precondition(dismissalFrames.allSatisfy { $0 == moved },
+                         "The entire sheet dismissal must stay on the destination, without moving back first")
+        }
+        panel.setFrame(originalFrame, display: true)
+        print("PASS: actual Done clicks restore unmoved parents and keep relocated parents stationary throughout dismissal across \(screens.count) screens")
         try! store.saveSettings(initial)
         print("PASS: settings open without numeric focus; actual clicks retain input focus inside the field, blur on whitespace and save the decimal")
     }
