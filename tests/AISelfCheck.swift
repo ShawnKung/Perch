@@ -148,7 +148,7 @@ enum AISelfCheck {
         precondition(decoded.generatedFiles == nil)
         let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 420, height: 240), styleMask: [.titled], backing: .buffered, defer: false)
         let host = NSHostingView(rootView: AIGeneratedFileCard(file: example!).padding(20).background(Style.paper))
-        NSApp.accessibilitySetValue(true, forAttribute: NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface"))
+        SelfTests.prepareAccessibility()
         window.contentView = host; window.makeKeyAndOrderFront(nil)
         defer { window.orderOut(nil); window.contentView = nil }
         try await Task.sleep(nanoseconds: 250_000_000)
@@ -196,7 +196,7 @@ enum AISelfCheck {
         precondition(AISearchEvidence.isVisible(message))
         message.searchStatus = "搜索完成"
         message.searchSources = [AISearchSource(title: "Fixture source", url: URL(string: "https://fixture.invalid/source")!)]
-        NSApp.accessibilitySetValue(true, forAttribute: NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface"))
+        SelfTests.prepareAccessibility()
         let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 360, height: 300),
                               styleMask: [.titled], backing: .buffered, defer: false)
         let host = NSHostingView(rootView: AnyView(EmptyView()))
@@ -1703,8 +1703,7 @@ enum AISelfCheck {
     static func composerUI(baseURL: String) async throws {
         try await historyManagementUI(baseURL: baseURL)
         composerReturnChecks()
-        // SwiftUI otherwise leaves its accessibility tree empty without an external screen reader.
-        NSApp.accessibilitySetValue(true, forAttribute: NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface"))
+        SelfTests.prepareAccessibility()
         let suite = "dev.perch.ai.composer-ui.\(UUID())"
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
