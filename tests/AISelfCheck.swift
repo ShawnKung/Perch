@@ -649,7 +649,7 @@ enum AISelfCheck {
         precondition(ai.save(other, key: "synthetic-key"))
         ai.select(original)
         let chosen = UUID()
-        ai.selections[chosen] = other.id; ai.selectedModels[chosen] = "alternate"
+        ai.selectModel("alternate", provider: other.id, tab: chosen)
         precondition(ai.provider(for: chosen).id == other.id && ai.model(for: chosen) == "alternate" && ai.ready(for: chosen))
         ai.deleteProvider(other.id)
         precondition(ai.provider(for: chosen).id == original && ai.model(for: chosen) == "fixture")
@@ -1544,6 +1544,69 @@ enum AISelfCheck {
         window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
         return window
     }
+    static func conversationPreferences() throws {
+        let suite = "dev.perch.ai.preferences.\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("perch-ai-preferences-\(UUID())")
+        defer {
+            defaults.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let legacy = AISession(messages: [AIMessage(role: "user", text: "Legacy")])
+        let second = AISession(messages: [AIMessage(role: "user", text: "Second")])
+        let owner = UUID(), otherOwner = UUID(), legacyAlias = UUID()
+        let file = directory.appendingPathComponent("conversations.json")
+        try JSONEncoder().encode(AIConversationArchive(conversations: [legacy.id: legacy, second.id: second],
+            tabs: [owner: legacy.id, legacyAlias: legacy.id, otherOwner: second.id])).write(to: file)
+        let ai = AIController(defaults: defaults, conversationDirectory: directory)
+        var provider = AIConfiguration(provider: .custom, baseURL: "https://fixture.invalid/v1", model: "first")
+        provider.models = ["first", "second"]
+        precondition(ai.save(provider, key: "synthetic-key"))
+        ai.addProvider(.custom)
+        var otherProvider = ai.configuration
+        otherProvider.baseURL = provider.baseURL; otherProvider.model = "first"; otherProvider.models = provider.models
+        precondition(ai.save(otherProvider, key: "synthetic-key"))
+        ai.selectModel("second", provider: provider.id, tab: owner)
+        ai.selectModel("first", provider: otherProvider.id, tab: otherOwner)
+        var restored = AIController(defaults: defaults, conversationDirectory: directory)
+        precondition(restored.model(for: owner) == "second" && restored.model(for: otherOwner) == "first")
+        precondition(restored.provider(for: owner).id == provider.id && restored.provider(for: otherOwner).id == otherProvider.id)
+        precondition(restored.provider(for: legacyAlias).id == provider.id && restored.model(for: legacyAlias) == "second")
+        ai.selectModel("first", provider: provider.id, tab: owner)
+        restored = AIController(defaults: defaults, conversationDirectory: directory)
+        precondition(restored.model(for: owner) == "first" && restored.model(for: legacyAlias) == "first",
+                     "Selecting without sending must save immediately across legacy duplicate owners")
+
+        let draft = ai.newChatOwner(context: AIController.homeID, previous: owner)
+        let page = UUID()
+        let attachment = AIAttachment(name: "draft.txt", data: Data("fixture".utf8), text: "fixture", mime: nil)
+        ai.drafts[draft] = "尚未发送\n多行草稿 🙂"
+        ai.draftFiles[draft] = [attachment]
+        ai.draftReferences[draft] = [page]
+        ai.draftClosedReferences[draft] = [AIPageReference(title: "Closed", url: URL(string: "https://fixture.invalid/"))]
+        ai.draftQuotes[draft] = AIQuote(messageID: UUID(), text: "Quoted fixture")
+        ai.selectModel("second", provider: provider.id, tab: draft)
+        ai.setSearchEnabled(false, tab: draft)
+        ai.saveConversations()
+        precondition(ai.newChatOwner(context: AIController.homeID, previous: otherOwner) == draft)
+        precondition(ai.activeConversations.count == 2, "Unsent drafts must stay out of history")
+        restored = AIController(defaults: defaults, conversationDirectory: directory)
+        precondition(restored.newChatOwner(context: AIController.homeID, previous: owner) == draft)
+        precondition(restored.drafts[draft] == ai.drafts[draft] && restored.draftFiles[draft]?.first?.data == attachment.data)
+        precondition(restored.draftReferences[draft] == [page] && restored.draftClosedReferences[draft]?.first?.title == "Closed")
+        precondition(restored.draftQuotes[draft]?.text == "Quoted fixture" && restored.model(for: draft) == "second")
+        precondition(!restored.searchEnabled(for: draft) && restored.activeConversations.count == 2)
+        let sidebar = restored.newChatOwner(context: page, previous: otherOwner)
+        precondition(sidebar != draft && restored.newChatOwner(context: page, previous: owner) == sidebar)
+        let resumed = restored.resumeConversation(legacy.id, tab: UUID())
+        precondition(restored.sessions[resumed]?.id == legacy.id && restored.model(for: resumed) == "first")
+        restored.selectModel("missing", provider: provider.id, tab: owner)
+        precondition(restored.model(for: owner) == "first")
+        let stored = try String(contentsOf: file)
+        precondition(!stored.contains("synthetic-key"))
+        print("PASS: legacy archives/duplicate owners, immediate per-chat model persistence, unsent draft restart with attachments/references/quotes/search and separate sidebar drafts")
+    }
     static func composerReturnChecks() {
         var draft = ""
         var acceptsSend = true
@@ -2351,11 +2414,79 @@ enum AISelfCheck {
                      "Chat group plus must receive the click")
         let tabCountBeforeNew = store.tabs.count
         let tabBeforeNew = store.selected
-        plus.performClick(nil)
-        try await wait { store.ai.sessions[store.chatOwner] == nil }
-        let newOwner = store.chatOwner
+        func mouseClick(_ view: NSView) {
+            let point = view.convert(NSPoint(x: view.bounds.midX, y: view.bounds.midY), to: nil)
+            for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                NSApp.sendEvent(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
+                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                    context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!)
+            }
+        }
+        func currentPlus() -> NSButton? {
+            table.view(atColumn: 0, row: 0, makeIfNecessary: true)?.subviews.compactMap { $0 as? NSButton }.first
+        }
+        func clickPlus() async throws {
+            table.scrollRowToVisible(0)
+            try await wait {
+                historyRoot.layoutSubtreeIfNeeded()
+                guard let button = currentPlus() else { return false }
+                return button.window === window && table.visibleRect.contains(button.convert(button.bounds, to: table))
+            }
+            let button = currentPlus()!, group = button.superview!
+            let point = button.convert(NSPoint(x: button.bounds.midX, y: button.bounds.midY), to: group.superview)
+            precondition(group.hitTest(point) === button)
+            mouseClick(button)
+        }
+        let priorFocus = (editor(in: historyRoot)?.delegate as? AIComposerInput.Coordinator)?.focusRequest
+        try await clickPlus()
+        try await wait { store.ai.sessions[store.chatOwner]?.messages.isEmpty == true }
+        var newOwner = store.chatOwner
         precondition(newOwner != forkOwner && store.tabs.count == tabCountBeforeNew && store.selected == tabBeforeNew)
-        precondition(store.ai.drafts[newOwner] == "" && store.ai.pendingEdits[newOwner] == nil)
+        precondition((store.ai.drafts[newOwner] ?? "").isEmpty && store.ai.pendingEdits[newOwner] == nil)
+        try await wait {
+            guard let input = editor(in: historyRoot), let coordinator = input.delegate as? AIComposerInput.Coordinator else { return false }
+            return coordinator.focusRequest != priorFocus && input.string.isEmpty
+        }
+        let draftInput = editor(in: historyRoot)!
+        window.makeFirstResponder(draftInput)
+        draftInput.insertText("加号未发送的草稿 🙂", replacementRange: NSRange(location: 0, length: draftInput.string.utf16.count))
+        try await wait { store.ai.drafts[newOwner] == "加号未发送的草稿 🙂" }
+        let draftFile = AIAttachment(name: "unsent.txt", data: Data("FILE-4729".utf8), text: "FILE-4729", mime: nil)
+        store.ai.draftFiles[newOwner] = [draftFile]
+        var pickerConfiguration = config
+        pickerConfiguration.models = ["fixture", "alternate"]
+        precondition(store.ai.save(pickerConfiguration))
+        click(accessibilityElement(in: historyRoot, label: "选择模型")!)
+        func alternateButton() -> NSObject? {
+            NSApp.windows.compactMap(\.contentView).lazy.compactMap { accessibilityElement(in: $0, label: "alternate") }.first
+        }
+        try await wait { alternateButton() != nil }
+        click(alternateButton()!)
+        try await wait { store.ai.model(for: newOwner) == "alternate" }
+        store.openChat(owner: editOwner)
+        try await wait {
+            table.selectedRowIndexes.compactMap { table.conversationIDs[$0] } == [store.ai.sessions[editOwner]!.id]
+        }
+        try await clickPlus()
+        try await wait {
+            store.chatOwner == newOwner && editor(in: historyRoot)?.string == "加号未发送的草稿 🙂"
+        }
+        precondition(store.ai.draftFiles[newOwner]?.first?.id == draftFile.id && store.ai.model(for: newOwner) == "alternate")
+        try await clickPlus()
+        precondition(store.chatOwner == newOwner && store.ai.drafts[newOwner] == "加号未发送的草稿 🙂")
+        print("PASS: native plus mouse clicks return to the unsent draft with text, attachment and model selected through the picker")
+        store.ai.selectModel("fixture", provider: config.id, tab: newOwner)
+        click(accessibilityElement(in: historyRoot, label: "发送")!)
+        try await wait { store.ai.sessions[newOwner]?.messages.isEmpty == false && store.ai.drafts[newOwner] == "" }
+        try await wait { store.ai.sessions[newOwner]?.requestID == nil }
+        precondition(store.ai.sessions[newOwner]?.error == nil && store.ai.sessions[newOwner]?.messages.last?.text.isEmpty == false)
+        try await clickPlus()
+        let sentOwner = newOwner
+        try await wait { store.chatOwner != sentOwner }
+        newOwner = store.chatOwner
+        precondition(store.ai.sessions[newOwner]?.messages.isEmpty == true && (store.ai.drafts[newOwner] ?? "").isEmpty)
+        precondition((store.ai.draftFiles[newOwner] ?? []).isEmpty && store.ai.model(for: newOwner) == "fixture")
+        print("PASS: accepted send consumes the new-chat draft; the next native plus starts a fresh draft")
         precondition(store.ai.sessions[editOwner]!.messages.map(\.id) == preservedIDs)
         let hoverRow = table.conversationIDs.firstIndex { $0 == store.ai.sessions[editOwner]?.id }!
         let hoverCell = table.view(atColumn: 0, row: hoverRow, makeIfNecessary: true) as! AIHistoryCell

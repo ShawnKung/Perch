@@ -293,9 +293,11 @@ struct AISession: Codable, Identifiable {
     var readingPosition: AIReadingPosition?
     var searchChoice: AISearchChoice?
     var searchEnabled: Bool?
+    var providerID: UUID?
+    var model: String?
     var title: String { summaryTitle ?? String(messages.first?.text.prefix(20) ?? "新对话") }
     // A request cannot resume after the application exits.
-    enum CodingKeys: String, CodingKey { case id, updated, messages, error, origin, summaryTitle, titleAttempted, isArchived, isPinned, webPageURLs, pageReferences, readingPosition, searchChoice, searchEnabled }
+    enum CodingKeys: String, CodingKey { case id, updated, messages, error, origin, summaryTitle, titleAttempted, isArchived, isPinned, webPageURLs, pageReferences, readingPosition, searchChoice, searchEnabled, providerID, model }
     mutating func finishActivity(searchStatus: String) {
         phase = nil
         if let index = messages.indices.last, messages[index].role == "assistant",
@@ -348,6 +350,17 @@ struct AISession: Codable, Identifiable {
 struct AIConversationArchive: Codable {
     var conversations: [UUID: AISession]
     var tabs: [UUID: UUID]
+    var drafts: [UUID: AIChatDraft]?
+    var newChatOwners: [UUID: UUID]?
+}
+
+struct AIChatDraft: Codable {
+    var session: AISession?
+    var text: String
+    var files: [AIAttachment]
+    var references: [UUID]
+    var closedReferences: [AIPageReference]
+    var quote: AIQuote?
 }
 
 // Never forward a bearer token through an endpoint redirect.
@@ -664,17 +677,16 @@ final class AIController: ObservableObject {
     @Published private(set) var searchHasKey = false
     @Published private(set) var searchSettingsError: String?
     private var damagedSearch = false
-    @Published var selections: [UUID: UUID] = [:]
-    @Published var selectedModels: [UUID: String] = [:]
     @Published private(set) var sessions: [UUID: AISession] = [:]
     private var readingPositions: [UUID: AIReadingPosition] = [:]
     @Published private(set) var conversations: [UUID: AISession] = [:]
     @Published private(set) var storageError: String?
-    @Published var drafts: [UUID: String] = [:]
-    @Published var draftQuotes: [UUID: AIQuote] = [:]
-    @Published var draftFiles: [UUID: [AIAttachment]] = [:]
-    @Published var draftReferences: [UUID: [UUID]] = [:]
-    @Published var draftClosedReferences: [UUID: [AIPageReference]] = [:]
+    @Published var drafts: [UUID: String] = [:] { didSet { scheduleConversationSave() } }
+    @Published var draftQuotes: [UUID: AIQuote] = [:] { didSet { scheduleConversationSave() } }
+    @Published var draftFiles: [UUID: [AIAttachment]] = [:] { didSet { scheduleConversationSave() } }
+    @Published var draftReferences: [UUID: [UUID]] = [:] { didSet { scheduleConversationSave() } }
+    @Published var draftClosedReferences: [UUID: [AIPageReference]] = [:] { didSet { scheduleConversationSave() } }
+    private var newChatOwners: [UUID: UUID] = [:]
     struct QueuedMessage: Identifiable {
         let id = UUID()
         let sessionID: UUID
@@ -753,6 +765,13 @@ final class AIController: ObservableObject {
                     conversations = archive.conversations
                     for id in Array(conversations.keys) { conversations[id]?.finishActivity(searchStatus: "搜索已中断") }
                     for (tab, id) in archive.tabs { sessions[tab] = conversations[id] }
+                    for (owner, draft) in archive.drafts ?? [:] {
+                        if let session = draft.session { sessions[owner] = session }
+                        drafts[owner] = draft.text; draftFiles[owner] = draft.files
+                        draftReferences[owner] = draft.references; draftClosedReferences[owner] = draft.closedReferences
+                        draftQuotes[owner] = draft.quote
+                    }
+                    newChatOwners = archive.newChatOwners ?? [:]
                 } catch {
                     damagedArchive = true
                     storageError = "对话记录无法读取，原文件已保留。请在保存目录中备份并检查。"
@@ -805,7 +824,18 @@ final class AIController: ObservableObject {
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                     attributes: [.posixPermissions: 0o700])
-            let archive = AIConversationArchive(conversations: conversations, tabs: sessions.mapValues(\.id))
+            let owners = Set(sessions.keys).union(drafts.keys).union(draftFiles.keys)
+                .union(draftReferences.keys).union(draftClosedReferences.keys).union(draftQuotes.keys)
+            let savedDrafts = Dictionary(uniqueKeysWithValues: owners.map { owner in
+                let edit = pendingEdits[owner]
+                return (owner, AIChatDraft(session: sessions[owner]?.messages.isEmpty == true ? sessions[owner] : nil,
+                    text: edit?.draft ?? drafts[owner] ?? "", files: edit?.files ?? draftFiles[owner] ?? [],
+                    references: edit?.references ?? draftReferences[owner] ?? [],
+                    closedReferences: edit?.closedReferences ?? draftClosedReferences[owner] ?? [],
+                    quote: edit != nil ? edit?.quote : draftQuotes[owner]))
+            })
+            let archive = AIConversationArchive(conversations: conversations, tabs: sessions.mapValues(\.id),
+                                                drafts: savedDrafts, newChatOwners: newChatOwners)
             let data = try JSONEncoder().encode(archive)
             let file = directory.appendingPathComponent("conversations.json")
             try data.write(to: file, options: .atomic)
@@ -893,7 +923,6 @@ final class AIController: ObservableObject {
         hasKey = keyedProviders.contains(configuration.id); searchHasKey = backup.credentials?.search != nil
         settingsError = nil; searchSettingsError = nil
         // Live requests retain their captured configuration; drafts and conversations stay intact.
-        selections.removeAll(); selectedModels.removeAll()
     }
     private func refreshKey() {
         do {
@@ -924,11 +953,29 @@ final class AIController: ObservableObject {
         defaults.set(id.uuidString, forKey: "aiSelectedProvider")
     }
     func provider(for tab: UUID) -> AIConfiguration {
-        providers.first(where: { $0.id == selections[tab] }) ?? configuration
+        providers.first(where: { $0.id == sessions[tab]?.providerID }) ?? configuration
     }
     func model(for tab: UUID) -> String {
         let value = provider(for: tab)
-        return selectedModels[tab].flatMap { value.models.contains($0) ? $0 : nil } ?? value.model
+        guard sessions[tab]?.providerID == value.id else { return value.model }
+        return sessions[tab]?.model.flatMap { value.models.contains($0) ? $0 : nil } ?? value.model
+    }
+    func selectModel(_ model: String, provider id: UUID, tab: UUID) {
+        guard providers.contains(where: { $0.id == id && $0.models.contains(model) }) else { return }
+        if sessions[tab] == nil { sessions[tab] = AISession() }
+        updateConversations([sessions[tab]!.id]) { session in
+            session.providerID = id; session.model = model
+        }
+    }
+    func newChatOwner(context: UUID, previous: UUID) -> UUID {
+        if let owner = newChatOwners[context], sessions[owner]?.messages.isEmpty == true { return owner }
+        let owner = sessions[previous]?.messages.isEmpty != false ? previous : UUID()
+        if sessions[owner] == nil {
+            sessions[owner] = AISession(providerID: provider(for: previous).id, model: model(for: previous))
+        }
+        newChatOwners[context] = owner
+        saveConversations()
+        return owner
     }
     func ready(for tab: UUID) -> Bool {
         let value = provider(for: tab)
@@ -1037,7 +1084,6 @@ final class AIController: ObservableObject {
             if let account = value.account { try keys.write(nil, account: account) }
             providers.removeAll { $0.id == id }
             if configuration.id == id { configuration = providers[0] }
-            selections = selections.filter { $0.value != id }
             try persist(); refreshKey()
         } catch { settingsError = error.localizedDescription }
     }
@@ -1276,16 +1322,8 @@ final class AIController: ObservableObject {
         ] { conversations[session.id] = session }
     }
     func retainTabs(_ ids: Set<UUID>) {
-        // Session owners outlive their views, including completed chats with drafts or paused queues.
-        let owners = ids.union(sessions.keys)
-        selections = selections.filter { owners.contains($0.key) }
-        selectedModels = selectedModels.filter { owners.contains($0.key) }
-        drafts = drafts.filter { owners.contains($0.key) }
-        draftQuotes = draftQuotes.filter { owners.contains($0.key) }
-        draftFiles = draftFiles.filter { owners.contains($0.key) }
-        draftReferences = draftReferences.filter { owners.contains($0.key) }.mapValues { $0.filter { ids.contains($0) } }
-        draftClosedReferences = draftClosedReferences.filter { owners.contains($0.key) }
-        pendingEdits = pendingEdits.filter { owners.contains($0.key) }
+        // Sessions and unsent drafts outlive their views; only live page references depend on tabs.
+        draftReferences = draftReferences.mapValues { $0.filter { ids.contains($0) } }
     }
     func models(for value: AIConfiguration, key supplied: String) async throws -> [String] {
         guard let url = value.modelsURL, let account = value.account else { throw PerchError("请先填写有效的 API 地址。") }
@@ -1580,6 +1618,9 @@ final class AIController: ObservableObject {
         }
         let requestID = UUID()
         var session = sessions[tab] ?? AISession()
+        if session.providerID == nil {
+            session.providerID = configuration.id; session.model = model
+        }
         let shouldSummarize = session.titleAttempted != true && session.summaryTitle == nil && session.messages.isEmpty
         session.titleAttempted = true
         if session.origin == nil { session.origin = origin }

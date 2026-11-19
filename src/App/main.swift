@@ -654,16 +654,13 @@ final class Store: ObservableObject {
     }
     func newChat() {
         let previous = chatOwner
-        let owner = ai.sessions[previous] == nil ? previous : UUID()
-        ai.selections[owner] = ai.selections[previous]
-        ai.selectedModels[owner] = ai.selectedModels[previous]
+        let context = isChatPage || browser == nil ? AIController.homeID : selected ?? AIController.homeID
+        let owner = ai.newChatOwner(context: context, previous: previous)
         if let index = tabs.firstIndex(where: { $0.id == selected }) {
             if isChatPage { tabs[index].chatOwner = owner }
             else { tabs[index].aiOwner = owner }
             persistTabs()
         }
-        ai.drafts[owner] = ""; ai.draftFiles[owner] = []
-        ai.draftReferences[owner] = []; ai.draftClosedReferences[owner] = []
         if aiVisible { referenceCurrentPage() }
         if !isChatPage && browser == nil { openChat(owner: owner) }
     }
