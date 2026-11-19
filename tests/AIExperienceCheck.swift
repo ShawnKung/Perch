@@ -189,7 +189,7 @@ extension AISelfCheck {
     }
 
     static func typographyUI() async throws {
-        NSApp.accessibilitySetValue(true, forAttribute: NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface"))
+        SelfTests.prepareAccessibility()
         let originalSize = PerchTheme.shared.chatFontSize
         let originalTheme = PerchTheme.shared.selection
         let suite = "dev.perch.typography.\(UUID())"
@@ -1132,7 +1132,7 @@ extension AISelfCheck {
     }
 
     static func followupControlsChecks() async throws {
-        NSApp.accessibilitySetValue(true, forAttribute: NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface"))
+        SelfTests.prepareAccessibility()
         var sent = 0, added = 0
         let text = "Fixture next step"
         let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 400, height: 180),

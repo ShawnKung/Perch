@@ -352,6 +352,12 @@ struct AIConversationArchive: Codable {
     var tabs: [UUID: UUID]
     var drafts: [UUID: AIChatDraft]?
     var newChatOwners: [UUID: UUID]?
+    var newChatModel: AIModelSelection?
+}
+
+struct AIModelSelection: Codable {
+    var providerID: UUID
+    var model: String
 }
 
 struct AIChatDraft: Codable {
@@ -687,6 +693,7 @@ final class AIController: ObservableObject {
     @Published var draftReferences: [UUID: [UUID]] = [:] { didSet { scheduleConversationSave() } }
     @Published var draftClosedReferences: [UUID: [AIPageReference]] = [:] { didSet { scheduleConversationSave() } }
     private var newChatOwners: [UUID: UUID] = [:]
+    private var newChatModel: AIModelSelection?
     struct QueuedMessage: Identifiable {
         let id = UUID()
         let sessionID: UUID
@@ -772,6 +779,7 @@ final class AIController: ObservableObject {
                         draftQuotes[owner] = draft.quote
                     }
                     newChatOwners = archive.newChatOwners ?? [:]
+                    newChatModel = archive.newChatModel
                 } catch {
                     damagedArchive = true
                     storageError = "对话记录无法读取，原文件已保留。请在保存目录中备份并检查。"
@@ -835,7 +843,7 @@ final class AIController: ObservableObject {
                     quote: edit != nil ? edit?.quote : draftQuotes[owner]))
             })
             let archive = AIConversationArchive(conversations: conversations, tabs: sessions.mapValues(\.id),
-                                                drafts: savedDrafts, newChatOwners: newChatOwners)
+                                                drafts: savedDrafts, newChatOwners: newChatOwners, newChatModel: newChatModel)
             let data = try JSONEncoder().encode(archive)
             let file = directory.appendingPathComponent("conversations.json")
             try data.write(to: file, options: .atomic)
@@ -953,16 +961,23 @@ final class AIController: ObservableObject {
         defaults.set(id.uuidString, forKey: "aiSelectedProvider")
     }
     func provider(for tab: UUID) -> AIConfiguration {
-        providers.first(where: { $0.id == sessions[tab]?.providerID }) ?? configuration
+        let session = sessions[tab]
+        let id = session?.providerID ?? (session?.messages.isEmpty != false ? newChatModel?.providerID : nil)
+        return providers.first(where: { $0.id == id }) ?? configuration
     }
     func model(for tab: UUID) -> String {
         let value = provider(for: tab)
-        guard sessions[tab]?.providerID == value.id else { return value.model }
-        return sessions[tab]?.model.flatMap { value.models.contains($0) ? $0 : nil } ?? value.model
+        let session = sessions[tab]
+        let selected = session?.providerID == value.id ? session?.model :
+            (session?.messages.isEmpty != false && newChatModel?.providerID == value.id ? newChatModel?.model : nil)
+        return selected.flatMap { value.models.contains($0) ? $0 : nil } ?? value.model
     }
     func selectModel(_ model: String, provider id: UUID, tab: UUID) {
         guard providers.contains(where: { $0.id == id && $0.models.contains(model) }) else { return }
         if sessions[tab] == nil { sessions[tab] = AISession() }
+        if sessions[tab]?.messages.isEmpty == true {
+            newChatModel = AIModelSelection(providerID: id, model: model)
+        }
         updateConversations([sessions[tab]!.id]) { session in
             session.providerID = id; session.model = model
         }
@@ -971,7 +986,7 @@ final class AIController: ObservableObject {
         if let owner = newChatOwners[context], sessions[owner]?.messages.isEmpty == true { return owner }
         let owner = sessions[previous]?.messages.isEmpty != false ? previous : UUID()
         if sessions[owner] == nil {
-            sessions[owner] = AISession(providerID: provider(for: previous).id, model: model(for: previous))
+            sessions[owner] = AISession(providerID: provider(for: owner).id, model: model(for: owner))
         }
         newChatOwners[context] = owner
         saveConversations()

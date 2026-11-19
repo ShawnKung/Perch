@@ -6,8 +6,17 @@ import WebKit
 import SwiftUI
 import Security
 import Carbon
+import ApplicationServices
 
 enum SelfTests {
+    @MainActor
+    static func prepareAccessibility() {
+        // A self AX request initializes SwiftUI's accessibility tree without a screen reader.
+        var role: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(AXUIElementCreateApplication(getpid()), kAXRoleAttribute as CFString, &role)
+        precondition(result == .success, "Self accessibility initialization failed: \(result.rawValue)")
+    }
+
     static func addressSuggestions() throws {
         let sites = (0..<1179).map { Site(title: "Bookmark \($0)", address: "https://b\($0).invalid/content") }
         let history = (0..<10000).map { Visit(title: "Content \($0)", address: "https://c\($0).invalid/content", date: Date()) }
@@ -1889,7 +1898,7 @@ final class LayoutSelfCheck {
         precondition(LibraryPage.allCases.map(\.rawValue) == ["常规", "AI", "书签与历史", "密码", "导入导出"],
                      "Manager tabs must keep the requested labels and order")
         precondition(!(sheet.firstResponder is NSTextView), "Opening settings must not auto-focus numeric input")
-        NSApp.accessibilitySetValue(true, forAttribute: NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface"))
+        SelfTests.prepareAccessibility()
         func themeButton(_ node: Any, label: String) -> NSObject? {
             guard let object = node as? NSObject else { return nil }
             if object.responds(to: NSSelectorFromString("accessibilityLabel")),
@@ -2383,7 +2392,7 @@ final class LayoutSelfCheck {
             var calls = 0
             func windowShouldClose(_ sender: NSWindow) -> Bool { calls += 1; return false }
         }
-        NSApp.accessibilitySetValue(true, forAttribute: NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface"))
+        SelfTests.prepareAccessibility()
         func element(_ node: Any) -> NSObject? {
             guard let value = node as? NSObject else { return nil }
             if value.responds(to: NSSelectorFromString("accessibilityLabel")),
