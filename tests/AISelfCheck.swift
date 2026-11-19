@@ -1579,6 +1579,8 @@ enum AISelfCheck {
                      "Selecting without sending must save immediately across legacy duplicate owners")
 
         let draft = ai.newChatOwner(context: AIController.homeID, previous: owner)
+        precondition(ai.provider(for: draft).id == otherProvider.id && ai.model(for: draft) == "first",
+                     "Without a new-chat preference, new chats use the configured default, not the previous conversation")
         let page = UUID()
         let attachment = AIAttachment(name: "draft.txt", data: Data("fixture".utf8), text: "fixture", mime: nil)
         ai.drafts[draft] = "尚未发送\n多行草稿 🙂"
@@ -1599,13 +1601,37 @@ enum AISelfCheck {
         precondition(!restored.searchEnabled(for: draft) && restored.activeConversations.count == 2)
         let sidebar = restored.newChatOwner(context: page, previous: otherOwner)
         precondition(sidebar != draft && restored.newChatOwner(context: page, previous: owner) == sidebar)
+        precondition(restored.provider(for: sidebar).id == provider.id && restored.model(for: sidebar) == "second",
+                     "A new chat must restore its own last selection across restart")
         let resumed = restored.resumeConversation(legacy.id, tab: UUID())
         precondition(restored.sessions[resumed]?.id == legacy.id && restored.model(for: resumed) == "first")
+        precondition(restored.configuration.id == otherProvider.id && restored.configuration.model == "first",
+                     "Chat model selections must not change provider settings")
+        restored.selectModel("first", provider: otherProvider.id, tab: otherOwner)
+        precondition(restored.newChatOwner(context: AIController.homeID, previous: otherOwner) == draft
+                     && restored.provider(for: draft).id == provider.id && restored.model(for: draft) == "second",
+                     "Returning to an existing unsent draft must preserve its own model")
+        let next = restored.newChatOwner(context: UUID(), previous: resumed)
+        precondition(restored.provider(for: next).id == provider.id && restored.model(for: next) == "second",
+                     "Changing an existing conversation must not change the new-chat preference")
+        let unopened = UUID()
+        precondition(restored.provider(for: unopened).id == provider.id && restored.model(for: unopened) == "second",
+                     "The initial blank chat must use the new-chat preference before an owner is registered")
         restored.selectModel("missing", provider: provider.id, tab: owner)
         precondition(restored.model(for: owner) == "first")
+        precondition(restored.configuration.id == otherProvider.id && restored.configuration.model == "first",
+                     "Invalid model choices must not change provider settings")
         let stored = try String(contentsOf: file)
         precondition(!stored.contains("synthetic-key"))
-        print("PASS: legacy archives/duplicate owners, immediate per-chat model persistence, unsent draft restart with attachments/references/quotes/search and separate sidebar drafts")
+        var reduced = provider
+        reduced.models = ["first"]
+        precondition(restored.save(reduced))
+        precondition(restored.model(for: UUID()) == "first", "Removed new-chat models must fall back to a valid provider default")
+        restored.deleteProvider(provider.id)
+        let fallback = UUID()
+        precondition(restored.provider(for: fallback).id == restored.configuration.id
+                     && restored.model(for: fallback) == restored.configuration.model)
+        print("PASS: legacy archives/duplicate owners, independent per-chat/new-chat model persistence and unsent draft restart with attachments/references/quotes/search")
     }
     static func composerReturnChecks() {
         var draft = ""
@@ -2480,12 +2506,15 @@ enum AISelfCheck {
         try await wait { store.ai.sessions[newOwner]?.messages.isEmpty == false && store.ai.drafts[newOwner] == "" }
         try await wait { store.ai.sessions[newOwner]?.requestID == nil }
         precondition(store.ai.sessions[newOwner]?.error == nil && store.ai.sessions[newOwner]?.messages.last?.text.isEmpty == false)
+        store.ai.selectModel("alternate", provider: config.id, tab: newOwner)
         try await clickPlus()
         let sentOwner = newOwner
         try await wait { store.chatOwner != sentOwner }
         newOwner = store.chatOwner
         precondition(store.ai.sessions[newOwner]?.messages.isEmpty == true && (store.ai.drafts[newOwner] ?? "").isEmpty)
         precondition((store.ai.draftFiles[newOwner] ?? []).isEmpty && store.ai.model(for: newOwner) == "fixture")
+        precondition(store.ai.model(for: sentOwner) == "alternate",
+                     "The fresh chat and the sent conversation must retain independent model choices")
         print("PASS: accepted send consumes the new-chat draft; the next native plus starts a fresh draft")
         precondition(store.ai.sessions[editOwner]!.messages.map(\.id) == preservedIDs)
         let hoverRow = table.conversationIDs.firstIndex { $0 == store.ai.sessions[editOwner]?.id }!
