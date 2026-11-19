@@ -737,7 +737,7 @@ struct AIModelPicker: View {
                                 ForEach(models(value), id: \.self) { model in
                                     let selected = ai.provider(for: tab).id == value.id && ai.model(for: tab) == model
                                     Button {
-                                        ai.selections[tab] = value.id; ai.selectedModels[tab] = model; dismiss()
+                                        ai.selectModel(model, provider: value.id, tab: tab); dismiss()
                                     } label: {
                                         HStack(spacing: 8) {
                                             Text(model).lineLimit(1).truncationMode(.middle)

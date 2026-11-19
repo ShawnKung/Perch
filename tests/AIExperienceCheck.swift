@@ -639,6 +639,11 @@ extension AISelfCheck {
             precondition(ai.send("Background fixture " + runB, tab: ownerB, browser: nil, usePage: false))
             let b = ai.sessions[ownerB]!.id, requestB = ai.sessions[ownerB]!.requestID!
             ai.drafts[ownerB] = "B unfinished draft"
+            var changedModel = config
+            changedModel.models = ["fixture", "alternate"]
+            precondition(ai.save(changedModel))
+            ai.selectModel("alternate", provider: config.id, tab: ownerA)
+            precondition(ai.sessions[ownerA]?.requestID == requestA)
             // Exercise history's real mouse handler in each phase, including returning before completion.
             for (phase, expected) in [("waiting", AIResponsePhase.thinking), ("thinking", .answering)] {
                 try await choose(a)
@@ -671,6 +676,8 @@ extension AISelfCheck {
             precondition(ai.sessions[ownerA]?.messages[1].text == "第一段 \(runA) 完成 \(runA)")
             precondition(ai.sessions[ownerB]?.requestID == requestB && ai.drafts[ownerB] == "B unfinished draft")
             try await finish(queued, ownerA)
+            precondition(ai.model(for: ownerA) == "alternate", "Completing frozen requests must not overwrite the latest model choice")
+            ai.selectModel("fixture", provider: config.id, tab: ownerA)
             try await wait { cell(a)?.progress == nil }
             let idle = cell(a)!
             idle.setHovered(false, animated: false); idle.layoutSubtreeIfNeeded()

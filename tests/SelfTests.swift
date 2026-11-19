@@ -79,6 +79,7 @@ enum SelfTests {
     @MainActor
     static func run() throws {
         try BackupSelfCheck.run()
+        try AISelfCheck.conversationPreferences()
         try addressSuggestions()
         try databaseSnapshot()
         let source = NSRect(x: 0, y: 25, width: 1440, height: 875)
