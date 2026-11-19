@@ -429,9 +429,16 @@ final class Store: ObservableObject {
             parts?.user = nil; parts?.password = nil; parts?.query = nil; parts?.fragment = nil
             ai.referenceClosed(page.id, reference: AIPageReference(title: page.title, url: parts?.url))
         }
-        ai.retainTabs(Set(tabs.map(\.id) + tabs.compactMap(\.chatOwner) + tabs.compactMap(\.aiOwner) + [AIController.homeID]))
+        let retained = tabs + tabGroups.flatMap { $0.hiddenTabs ?? [] }
+        ai.retainTabs(Set(retained.map(\.id) + retained.compactMap(\.chatOwner) + retained.compactMap(\.aiOwner) + [AIController.homeID]))
     } }
     @Published var history: [Visit] = [] { didSet { suggestionRevision &+= 1 } }
+    @Published var tabGroups: [TabGroup] = []
+    var openTabGroups: [TabGroup] { tabGroups.filter { !$0.hidden } }
+    func tabs(inGroup id: UUID) -> [Tab] {
+        tabGroups.first { $0.id == id }?.hiddenTabs ?? tabs.filter { $0.groupID == id }
+    }
+    var tabRows: [TabListRow] { TabListRow.rows(tabs: tabs, groups: openTabGroups, selected: selected) }
     @Published var importedBookmarks: [String: [BookmarkNode]] = [:] { didSet { suggestionRevision &+= 1 } }
     @Published private(set) var suggestionRevision = 0
     let addressSuggestionSearch = AddressSuggestionSearch()
@@ -512,15 +519,27 @@ final class Store: ObservableObject {
         let restoredSelection = defaults.string(forKey: "selectedTab").flatMap(UUID.init(uuidString:))
         let chatTab = restoredTabs.first { $0.chatOwner != nil && $0.id == restoredSelection } ??
             restoredTabs.first { $0.chatOwner != nil }
+        tabGroups = restore([TabGroup].self, key: "tabGroups") ?? []
+        do { try TabGroup.validateStoredTabs(tabGroups) }
+        catch {
+            protectedKeys.insert("tabGroups"); tabGroups = []
+            notice = "标签组数据无法读取，已保留原数据。\(error.localizedDescription)"
+        }
         tabs = restoredTabs.filter { $0.chatOwner == nil || $0.id == chatTab?.id }
-        ai.classifyWebConversations(owners: Set(tabs.filter { !$0.address.isEmpty && $0.chatOwner == nil }.map { $0.aiOwner ?? $0.id }))
+        // Tabs and group metadata form one logical snapshot; preserve both if either cannot be decoded.
+        if protectedKeys.contains("tabs") || protectedKeys.contains("tabGroups") {
+            protectedKeys.formUnion(["tabs", "tabGroups"])
+        }
+        normalizeTabGroups()
+        let savedPages = tabs + tabGroups.flatMap { $0.hiddenTabs ?? [] }
+        ai.classifyWebConversations(owners: Set(savedPages.filter { !$0.address.isEmpty && $0.chatOwner == nil }.map { $0.aiOwner ?? $0.id }))
         for tab in tabs { icons[tab.id] = FaviconCache.image(for: tab.address, defaults: defaults) }
         history = restore([Visit].self, key: "history") ?? []
         importedBookmarks = restore([String: [BookmarkNode]].self, key: "importedBookmarks") ?? [:]
         bookmarkFolders = restore([BookmarkFolder].self, key: "bookmarkFolders") ?? []
         if let raw = defaults.string(forKey: "selectedTab"), let id = UUID(uuidString: raw), tabs.contains(where: { $0.id == id }) {
             selected = id
-            activate(id)
+            activate(id, select: false)
         }
         if tabs.count != restoredTabs.count { persistTabs() }
     }
@@ -559,6 +578,8 @@ final class Store: ObservableObject {
 
     func activate(_ id: UUID, select: Bool = true) {
         guard let tab = tabs.first(where: { $0.id == id }) else { return }
+        if select, selected != id, let groupID = tab.groupID, let index = tabGroups.firstIndex(where: { $0.id == groupID }),
+           tabGroups[index].collapsed { tabGroups[index].collapsed = false }
         if icons[id] == nil { icons[id] = FaviconCache.image(for: tab.address, defaults: defaults) }
         if browsers[id] == nil, let url = URLInput.parse(tab.address, search: false) {
             let view = Browser(url: url, userAgent: settings.userAgent,
@@ -626,12 +647,14 @@ final class Store: ObservableObject {
     }
 
     func newTab(address: String = "", title: String = "新标签页", after: UUID? = nil, select: Bool = true) {
-        let tab = Tab(title: title == "新标签页" ? URL(string: address)?.host ?? title : title, address: address)
+        var tab = Tab(title: title == "新标签页" ? URL(string: address)?.host ?? title : title, address: address)
         if let after, let index = tabs.firstIndex(where: { $0.id == after }) {
+            tab.groupID = tabs[index].groupID
             tabs.insert(tab, at: tabs[index].pinned ? tabs.filter(\.pinned).count : index + 1)
         } else { tabs.append(tab) }
         activate(tab.id, select: select)
         if select && address.isEmpty { pendingAddressFocus = tab.id }
+        persistTabs()
     }
 
     @Published var chatHistoryVisible = true
@@ -707,20 +730,29 @@ final class Store: ObservableObject {
     }
 
     func close(_ id: UUID) {
-        guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
-        homeAddressDrafts[id] = nil
-        var closed = tabs[index]
-        if closed.chatOwner == nil { closed.aiOwner = closed.aiOwner ?? closed.id }
-        tabs.remove(at: index)
-        recentlyClosed.append(closed)
-        recentlyClosed = Array(recentlyClosed.suffix(20))
-        if let browser = browsers.removeValue(forKey: id) {
-            browser.passwordBridge.dismiss(); browser.favicon.reset(); browser.webView.stopLoading()
-            browser.webView.removeFromSuperview()
+        closeTabs([id], remember: true)
+    }
+
+    private func closeTabs(_ ids: Set<UUID>, remember: Bool) {
+        guard let index = tabs.firstIndex(where: { ids.contains($0.id) }) else { return }
+        let removed = tabs.filter { ids.contains($0.id) }
+        tabs.removeAll { ids.contains($0.id) }
+        normalizeTabGroups()
+        for var closed in removed {
+            if remember {
+                homeAddressDrafts[closed.id] = nil
+                if closed.chatOwner == nil { closed.aiOwner = closed.aiOwner ?? closed.id }
+                recentlyClosed.append(closed)
+            }
+            if let browser = browsers.removeValue(forKey: closed.id) {
+                browser.passwordBridge.dismiss(); browser.favicon.reset(); browser.webView.stopLoading()
+                browser.webView.removeFromSuperview()
+            }
+            icons.removeValue(forKey: closed.id)
         }
-        icons.removeValue(forKey: id)
-        if selected == id {
-            selected = nil
+        recentlyClosed = Array(recentlyClosed.suffix(20))
+        if let selected, ids.contains(selected) {
+            self.selected = nil
             if !tabs.isEmpty { activate(tabs[min(index, tabs.count - 1)].id) }
         }
         persistTabs()
@@ -732,12 +764,17 @@ final class Store: ObservableObject {
             activate(existing.id); return
         }
         tab.id = UUID()
-        tabs.append(tab); sortPinned(); activate(tab.id)
+        if let groupID = tab.groupID, let last = tabs.lastIndex(where: { $0.groupID == groupID }) {
+            tabs.insert(tab, at: last + 1)
+        } else { tab.groupID = nil; tabs.append(tab) }
+        sortPinned(); activate(tab.id)
     }
 
     func pin(_ id: UUID) {
         guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
-        tabs[index].pinned.toggle(); sortPinned(); persistTabs()
+        tabs[index].pinned.toggle()
+        tabs[index].groupID = nil
+        sortPinned(); normalizeTabGroups(); persistTabs()
     }
 
     private func sortPinned() { tabs = tabs.filter(\.pinned) + tabs.filter { !$0.pinned } }
@@ -746,9 +783,7 @@ final class Store: ObservableObject {
         guard id != target, let source = tabs.firstIndex(where: { $0.id == id }),
               let destination = tabs.firstIndex(where: { $0.id == target }),
               tabs[source].pinned == tabs[destination].pinned else { return }
-        let tab = tabs.remove(at: source)
-        tabs.insert(tab, at: tabs.firstIndex(where: { $0.id == target })! + (after ? 1 : 0))
-        persistTabs()
+        moveTab(id, to: destination + (after ? 1 : 0), groupID: tabs[destination].groupID)
     }
 
     func canMove(_ id: UUID, to insertion: Int) -> Bool {
@@ -758,16 +793,172 @@ final class Store: ObservableObject {
     }
 
     func move(_ id: UUID, to insertion: Int) {
-        guard canMove(id, to: insertion), let source = tabs.firstIndex(where: { $0.id == id }) else { return }
-        let tab = tabs.remove(at: source)
-        tabs.insert(tab, at: insertion - (source < insertion ? 1 : 0))
+        moveTab(id, to: insertion, groupID: nil)
+    }
+
+    // One ordered tab collection owns group membership. Headers are a projection, never browser tabs.
+    func normalizeTabGroups() {
+        var seen = Set<UUID>()
+        tabGroups = tabGroups.filter { seen.insert($0.id).inserted }
+        let valid = Set(openTabGroups.map(\.id))
+        var ordered = tabs
+        for index in ordered.indices {
+            if ordered[index].pinned || ordered[index].groupID.map({ !valid.contains($0) }) == true {
+                ordered[index].groupID = nil
+            }
+        }
+        var emitted = Set<UUID>(), result: [Tab] = []
+        for tab in ordered {
+            if let id = tab.groupID {
+                if emitted.insert(id).inserted { result += ordered.filter { $0.groupID == id } }
+            } else { result.append(tab) }
+        }
+        tabs = result.filter(\.pinned) + result.filter { !$0.pinned }
+        tabGroups.removeAll { !$0.hidden && !emitted.contains($0.id) }
+    }
+
+    @discardableResult func createTabGroup(_ id: UUID) -> UUID? {
+        guard let index = tabs.firstIndex(where: { $0.id == id }), !tabs[index].pinned else { return nil }
+        let group = TabGroup()
+        // Detach at the boundary of the old group before creating a new one.
+        moveTab(id, to: index, groupID: nil)
+        guard let newIndex = tabs.firstIndex(where: { $0.id == id }) else { return nil }
+        tabGroups.append(group)
+        tabs[newIndex].groupID = group.id
+        normalizeTabGroups(); persistTabs()
+        return group.id
+    }
+
+    func editTabGroup(_ id: UUID, name: String? = nil, color: TabGroupColor? = nil) {
+        guard let index = tabGroups.firstIndex(where: { $0.id == id }) else { return }
+        if let name { tabGroups[index].name = name }
+        if let color { tabGroups[index].color = color }
         persistTabs()
+    }
+
+    func toggleTabGroup(_ id: UUID) {
+        guard let index = tabGroups.firstIndex(where: { $0.id == id }) else { return }
+        tabGroups[index].collapsed.toggle(); persistTabs()
+    }
+
+    func ungroup(_ id: UUID) {
+        if tabGroups.first(where: { $0.id == id })?.hidden == true { openTabGroup(id) }
+        for index in tabs.indices where tabs[index].groupID == id { tabs[index].groupID = nil }
+        tabGroups.removeAll { $0.id == id }
+        for index in recentlyClosed.indices where recentlyClosed[index].groupID == id { recentlyClosed[index].groupID = nil }
+        normalizeTabGroups(); persistTabs()
+    }
+
+    func hideTabGroup(_ id: UUID) {
+        guard let index = tabGroups.firstIndex(where: { $0.id == id }), !tabGroups[index].hidden else { return }
+        let members = tabs(inGroup: id).map { tab in
+            var saved = tab
+            if let browser = browsers[tab.id], !browser.address.isEmpty {
+                saved.address = browser.address
+                if !browser.title.isEmpty { saved.title = browser.title }
+            }
+            return saved
+        }
+        guard !members.isEmpty else { return }
+        tabGroups[index].hiddenTabs = members
+        // Preserve the snapshot before close normalizes the open collection.
+        closeTabs(Set(members.map(\.id)), remember: false)
+        persistTabs()
+    }
+
+    func openTabGroup(_ id: UUID, tabID: UUID? = nil) {
+        guard let group = tabGroups.first(where: { $0.id == id }) else { return }
+        if let saved = group.hiddenTabs {
+            // The app has one full Chat page; restoring its saved owner replaces the current Chat page.
+            if saved.contains(where: { $0.chatOwner != nil }), let chat = tabs.first(where: { $0.chatOwner != nil }) {
+                close(chat.id)
+            }
+            guard let index = tabGroups.firstIndex(where: { $0.id == id }) else { return }
+            var restored = saved
+            var selection = tabID
+            for offset in restored.indices {
+                if tabs.contains(where: { $0.id == restored[offset].id }) {
+                    let original = restored[offset].id
+                    restored[offset].id = UUID()
+                    if selection == original { selection = restored[offset].id }
+                }
+                restored[offset].pinned = false; restored[offset].groupID = id
+            }
+            tabs.append(contentsOf: restored)
+            tabGroups[index].hiddenTabs = nil
+            tabGroups[index].collapsed = false
+            normalizeTabGroups()
+            if let member = restored.first(where: { $0.id == selection }) ?? restored.first { activate(member.id) }
+        } else {
+            if let index = tabGroups.firstIndex(where: { $0.id == id }) { tabGroups[index].collapsed = false }
+            if let member = tabs.first(where: { $0.groupID == id && $0.id == tabID }) ??
+                tabs.first(where: { $0.groupID == id }) { activate(member.id) }
+        }
+        persistTabs()
+    }
+
+    func deleteTabGroup(_ id: UUID) {
+        hideTabGroup(id)
+        let members = tabs(inGroup: id)
+        for tab in members { homeAddressDrafts[tab.id] = nil }
+        tabGroups.removeAll { $0.id == id }
+        for index in recentlyClosed.indices where recentlyClosed[index].groupID == id { recentlyClosed[index].groupID = nil }
+        let retained = tabs + tabGroups.flatMap { $0.hiddenTabs ?? [] }
+        ai.retainTabs(Set(retained.map(\.id) + retained.compactMap(\.chatOwner) + retained.compactMap(\.aiOwner) + [AIController.homeID]))
+        persistTabs()
+    }
+
+    func newTab(inGroup id: UUID) {
+        guard let last = tabs.last(where: { $0.groupID == id }) else { return }
+        newTab(after: last.id)
+    }
+
+    // Insertion is in the original collection. Ungrouped drops snap to a group boundary.
+    func previewMovingTab(_ id: UUID, to insertion: Int, groupID: UUID?) -> [Tab]? {
+        guard canMove(id, to: insertion), let source = tabs.firstIndex(where: { $0.id == id }),
+              groupID == nil || (!tabs[source].pinned && openTabGroups.contains { $0.id == groupID }) else { return nil }
+        var result = tabs
+        var tab = result.remove(at: source)
+        tab.groupID = groupID
+        var destination = insertion - (source < insertion ? 1 : 0)
+        if let groupID {
+            let members = result.indices.filter { result[$0].groupID == groupID }
+            if let first = members.first, let last = members.last { destination = min(max(destination, first), last + 1) }
+        } else if destination > 0, destination < result.count,
+                  let split = result[destination].groupID, result[destination - 1].groupID == split {
+            destination = result.firstIndex { $0.groupID == split }!
+        }
+        result.insert(tab, at: destination)
+        return result
+    }
+
+    func moveTab(_ id: UUID, to insertion: Int, groupID: UUID?) {
+        guard let result = previewMovingTab(id, to: insertion, groupID: groupID) else { return }
+        tabs = result; normalizeTabGroups(); persistTabs()
+    }
+
+    func previewMovingGroup(_ id: UUID, to insertion: Int) -> [Tab]? {
+        let members = tabs.filter { $0.groupID == id }
+        guard !members.isEmpty, (tabs.filter(\.pinned).count...tabs.count).contains(insertion) else { return nil }
+        var result = tabs.filter { $0.groupID != id }
+        var destination = insertion - tabs.prefix(insertion).filter { $0.groupID == id }.count
+        if destination > 0, destination < result.count,
+           let split = result[destination].groupID, result[destination - 1].groupID == split {
+            destination = result.firstIndex { $0.groupID == split }!
+        }
+        result.insert(contentsOf: members, at: destination)
+        return result
+    }
+
+    func moveTabGroup(_ id: UUID, to insertion: Int) {
+        guard let result = previewMovingGroup(id, to: insertion) else { return }
+        tabs = result; persistTabs()
     }
 
     func closeOthers(_ id: UUID, below: Bool = false) {
         guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
         let ids = tabs.enumerated().filter { $0.element.id != id && !$0.element.pinned && (!below || $0.offset > index) }.map { $0.element.id }
-        ids.forEach(close)
+        ids.forEach { close($0) }
     }
 
     func reload(_ id: UUID) { activate(id); browser?.webView.reload() }
@@ -786,6 +977,7 @@ final class Store: ObservableObject {
 
     private func persistTabs() {
         persist(tabs, key: "tabs")
+        persist(tabGroups, key: "tabGroups")
         defaults.set(selected?.uuidString, forKey: "selectedTab")
     }
 
@@ -831,7 +1023,7 @@ final class Store: ObservableObject {
 
     private func checkBackupAccess(_ scope: Set<BackupScope>) throws {
         let keys = Set(scope.contains(.settings) ? ["settings"] : [])
-            .union(scope.contains(.bookmarks) ? ["sites", "bookmarkFolders", "importedBookmarks"] : [])
+            .union(scope.contains(.bookmarks) ? ["sites", "bookmarkFolders", "importedBookmarks", "tabs", "tabGroups"] : [])
         guard protectedKeys.isDisjoint(with: keys), !scope.contains(.ai) || ai.canRestoreSettings else {
             throw PerchError("当前设置或书签数据损坏，已保留原数据。请先备份并修复原始数据。")
         }
@@ -845,7 +1037,11 @@ final class Store: ObservableObject {
         let backup = SettingsBackup(settings: settings, launchAtLogin: launchAtLogin,
             layout: LayoutPreference.capture(defaults), providers: providers,
             selectedProvider: ai.configuration.id, search: ai.searchConfiguration,
-            sites: sites, folders: bookmarkFolders, imported: importedBookmarks, scope: scope,
+            sites: sites, folders: bookmarkFolders, imported: importedBookmarks,
+            tabGroups: tabGroups.map { group in
+                var saved = group; saved.hiddenTabs = tabs(inGroup: group.id)
+                return saved
+            }, scope: scope,
             credentials: includeKeys && scope.contains(.ai) ? try ai.backupCredentials() : nil)
         try backup.validate()
         return backup
@@ -864,6 +1060,12 @@ final class Store: ObservableObject {
             encoded["sites"] = try encoder.encode(backup.sites)
             encoded["bookmarkFolders"] = try encoder.encode(backup.folders)
             encoded["importedBookmarks"] = try encoder.encode(backup.imported)
+            if let groups = backup.tabGroups {
+                encoded["tabGroups"] = try encoder.encode(groups)
+                encoded["tabs"] = try encoder.encode(tabs.map { tab in
+                    var page = tab; page.groupID = nil; return page
+                })
+            }
         }
         if backup.scope.contains(.ai) { encoded["aiProviders"] = try encoder.encode(backup.providers) }
         let search = try backup.search.map { try encoder.encode($0) }
@@ -889,6 +1091,10 @@ final class Store: ObservableObject {
         }
         if backup.scope.contains(.bookmarks) {
             sites = backup.sites; bookmarkFolders = backup.folders; importedBookmarks = backup.imported
+            if let groups = backup.tabGroups {
+                tabGroups = groups
+                for index in tabs.indices { tabs[index].groupID = nil }
+            }
         }
         if backup.scope.contains(.settings) {
             LayoutPreference.restore(backup.layout, to: defaults)
@@ -1758,7 +1964,8 @@ struct RootView: View {
                 let controlsInset = Self.controlsInset(tabSidebarWidth)
                 let topBarHeight = Self.topBarHeight(chat: store.isChatPage)
                 HStack(spacing: 0) {
-                    TabSidebar(store: store, compact: sidebarCollapsed, topBarHeight: topBarHeight)
+                    TabSidebar(store: store, compact: sidebarCollapsed, expansion: sidebarCollapsed ? 0 : 1,
+                               topBarHeight: topBarHeight)
                         .frame(width: tabSidebarWidth)
                         .clipped()
                     SidebarResizeHandle(changed: { translation in
@@ -2630,7 +2837,7 @@ if CommandLine.arguments.contains("--scroll-self-test") {
 } else if CommandLine.arguments.contains("--ui-self-test") || CommandLine.arguments.contains("--ui-preview") {
     let app = NSApplication.shared
     // A CLI-launched test needs its own foreground identity while the installed menu-bar app is running.
-    app.setActivationPolicy(CommandLine.arguments.contains("--ui-self-test") ? .regular : .accessory)
+    app.setActivationPolicy(CommandLine.arguments.contains("--ui-self-test") || CommandLine.arguments.contains("--verify-preview") ? .regular : .accessory)
     Task { @MainActor in
         setbuf(stdout, nil)
         // Activate only after AppKit has finished launching the CLI process.

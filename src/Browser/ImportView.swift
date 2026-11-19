@@ -186,6 +186,9 @@ struct ImportPage: View {
                     details.append("登录时启动将设为\(backup.launchAtLogin ? "开启" : "关闭")。")
                 }
                 if backup.scope.contains(.bookmarks) { details.append("替换个人书签和浏览器导入书签，共 \(count) 个书签。") }
+                if let groups = backup.tabGroups, backup.scope.contains(.bookmarks) {
+                    details.append("替换 \(groups.count) 个标签组并保存为隐藏目录；已有打开页面保留并解除旧分组。")
+                }
                 if backup.scope.contains(.ai) {
                     details.append("替换 \(backup.providers.count) 个 AI 供应商及搜索配置，导入 \(backup.credentials?.count ?? 0) 个密钥；未包含的密钥需重新填写。")
                 }

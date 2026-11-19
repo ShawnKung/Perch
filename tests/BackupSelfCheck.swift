@@ -60,6 +60,39 @@ enum BackupSelfCheck {
         precondition(!json.contains("synthetic-key-only") && !json.contains("synthetic-search-key-only"))
         print("PASS: ZIP roundtrip preserves full settings, layout, providers, folder IDs/order and empty folders without keys")
 
+        store.newTab(title: "已保存的标签")
+        let groupID = store.createTabGroup(store.tabs[0].id)!
+        store.editTabGroup(groupID, name: "工作", color: .cyan)
+        store.hideTabGroup(groupID)
+        let groupBackup = try store.settingsBackup(launchAtLogin: false, scope: [.bookmarks])
+        let groupZIP = directory.appendingPathComponent("groups.zip")
+        try BackupArchive.write(groupBackup, to: groupZIP)
+        let decodedGroups = try BackupArchive.read(groupZIP)
+        precondition(decodedGroups.tabGroups?.first?.hiddenTabs?.first?.title == "已保存的标签")
+        store.openTabGroup(groupID)
+        let openIDs = store.tabs.map(\.id)
+        try store.restoreSettingsBackup(decodedGroups, setLaunchAtLogin: { _ in })
+        precondition(store.tabs.map(\.id) == openIDs && store.tabs.allSatisfy { $0.groupID == nil })
+        precondition(store.tabGroups.count == 1 && store.tabGroups[0].hidden && store.tabGroups[0].id != groupID)
+        precondition(Store(defaults: defaults).tabGroups[0].hidden)
+        let importedGroup = store.tabGroups[0].id
+        store.openTabGroup(importedGroup)
+        precondition(store.tabs.count == 2 && Set(store.tabs.map(\.id)).count == 2)
+        var invalidGroup = decodedGroups
+        invalidGroup.tabGroups![0].hiddenTabs![0].address = "javascript:alert(1)"
+        rejects { try invalidGroup.validate() }
+        invalidGroup = decodedGroups
+        invalidGroup.tabGroups![0].hiddenTabs!.append(invalidGroup.tabGroups![0].hiddenTabs![0])
+        rejects { try invalidGroup.validate() }
+        var v2 = groupBackup; v2.version = 2
+        let oldGroups = try JSONDecoder().decode(SettingsBackup.self, from: encoder.encode(v2))
+        precondition(oldGroups.tabGroups == nil)
+        let currentGroups = store.tabGroups
+        try store.restoreSettingsBackup(oldGroups, setLaunchAtLogin: { _ in })
+        precondition(store.tabGroups == currentGroups)
+        store.deleteTabGroup(importedGroup)
+        print("PASS: saved group ZIP roundtrip, fresh IDs, hidden import, open-page preservation, v2 compatibility and invalid member rejection")
+
         var withKeys = try store.settingsBackup(launchAtLogin: true, includeKeys: true)
         precondition(withKeys.credentials?.providers[provider.id.uuidString] == "synthetic-key-only")
         precondition(withKeys.credentials?.search == "synthetic-search-key-only")

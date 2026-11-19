@@ -112,20 +112,26 @@ private struct SidebarChromeShape: Shape {
     }
 }
 
-struct TabSidebar: View {
+struct TabSidebar: View, Animatable {
     @ObservedObject private var theme = PerchTheme.shared
     @ObservedObject var store: Store
     var compact = false
+    var expansion: CGFloat = 1
     var topBarHeight: CGFloat = 44
+    var animatableData: CGFloat {
+        get { expansion }
+        set { expansion = newValue }
+    }
     var body: some View {
         let palette = theme.selection
         GeometryReader { geometry in
             let availableHeight = max(0, geometry.size.height - 122)
-            let contentHeight = CGFloat(store.tabs.count) * TabSelectionRow.rowHeight
+            let contentHeight = CGFloat(store.tabRows.count) * TabSelectionRow.rowHeight
             VStack(alignment: .leading, spacing: 4) {
-                NativeTabList(store: store, compact: compact)
+                NativeTabList(store: store, compact: compact, expansion: expansion)
                     .frame(height: min(contentHeight, availableHeight))
-                    .padding(.horizontal, -2)
+                    .padding(.leading, -2 - TabListContainer.railGutter)
+                    .padding(.trailing, -2)
                     .padding(.top, 38)
                 Button { store.newTab() } label: {
                     Image(systemName: "plus").font(.system(size: 17, weight: .medium))
@@ -148,8 +154,8 @@ struct TabSidebar: View {
                 }.buttonStyle(.plain).foregroundStyle(Style.muted)
                     .help("设置 ⌘,").accessibilityLabel("设置")
             }
-            .animation(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil : .easeInOut(duration: 0.18),
-                       value: store.tabs.count)
+            .animation(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil : .easeInOut(duration: 0.2),
+                       value: store.tabRows)
             .padding(.bottom, 4)
         }.padding(.horizontal, 8).padding(.top, 12)
             .frame(maxHeight: .infinity).background {

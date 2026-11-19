@@ -88,6 +88,7 @@ enum SelfTests {
     @MainActor
     static func run() throws {
         try BackupSelfCheck.run()
+        try savedTabGroups()
         try AISelfCheck.conversationPreferences()
         try addressSuggestions()
         try databaseSnapshot()
@@ -466,6 +467,78 @@ enum SelfTests {
         previewBrowser.webView.stopLoading()
         print("PASS: temporary bookmark browser URL validation, nonpersistent test session and tab/history isolation")
         try imports()
+    }
+    @MainActor static func savedTabGroups() throws {
+        let suite = "dev.perch.saved-groups." + UUID().uuidString
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = Store(defaults: defaults)
+        store.newTab(title: "一"); store.newTab(title: "二"); store.newTab(title: "外部")
+        let ids = store.tabs.map(\.id)
+        let group = store.createTabGroup(ids[0])!
+        store.moveTab(ids[1], to: 1, groupID: group)
+        store.editTabGroup(group, name: "资料", color: .purple)
+        store.activate(ids[1])
+        store.hideTabGroup(group)
+        precondition(store.tabs.map(\.id) == [ids[2]] && store.selected == ids[2])
+        precondition(store.tabs(inGroup: group).map(\.id) == Array(ids.prefix(2)))
+        precondition(store.openTabGroups.isEmpty && store.tabRows == [.tab(ids[2])] && store.recentlyClosed.isEmpty)
+        store.normalizeTabGroups()
+        let restored = Store(defaults: defaults)
+        precondition(restored.tabGroups.first?.hidden == true && restored.tabGroups.first?.color == .purple)
+        precondition(restored.tabs(inGroup: group).map(\.title) == ["一", "二"])
+        restored.openTabGroup(group, tabID: ids[1])
+        precondition(restored.selected == ids[1] && restored.tabs.filter { $0.groupID == group }.map(\.id) == Array(ids.prefix(2)))
+        restored.openTabGroup(group)
+        precondition(restored.tabs.count == 3 && !restored.tabGroups[0].hidden)
+        restored.newTab(after: ids[1])
+        let added = restored.selected!
+        restored.close(ids[0])
+        precondition(restored.tabs(inGroup: group).map(\.id) == [ids[1], added])
+        restored.hideTabGroup(group)
+        restored.ungroup(group)
+        precondition(restored.tabGroups.isEmpty && restored.tabs.count == 3 && restored.tabs.allSatisfy { $0.groupID == nil })
+        let deleted = restored.createTabGroup(ids[1])!
+        restored.moveTab(added, to: restored.tabs.count, groupID: deleted)
+        restored.deleteTabGroup(deleted)
+        precondition(restored.tabs.count == 1 && restored.tabGroups.isEmpty)
+        precondition(Store(defaults: defaults).tabGroups.isEmpty)
+        restored.openChat(owner: UUID())
+        let chatID = restored.selected!, chatOwner = restored.chatOwner
+        let chatGroup = restored.createTabGroup(chatID)!
+        restored.hideTabGroup(chatGroup)
+        restored.openChat(owner: UUID())
+        restored.openTabGroup(chatGroup)
+        precondition(restored.tabs.filter { $0.chatOwner != nil }.map(\.id) == [chatID] && restored.chatOwner == chatOwner)
+        restored.deleteTabGroup(chatGroup)
+        restored.newTab(address: "http://127.0.0.1:9/before")
+        let webID = restored.selected!, webGroup = restored.createTabGroup(webID)!
+        restored.cachedBrowser(for: webID)!.address = "http://127.0.0.1:9/current"
+        restored.cachedBrowser(for: webID)!.title = "当前网页"
+        restored.hideTabGroup(webGroup)
+        precondition(restored.tabs(inGroup: webGroup).first?.address == "http://127.0.0.1:9/current" &&
+                     restored.tabs(inGroup: webGroup).first?.title == "当前网页" && restored.cachedBrowser(for: webID) == nil)
+        restored.deleteTabGroup(webGroup)
+        // Missing hiddenTabs remains a normal open group in older installations.
+        defaults.set(try JSONEncoder().encode([Tab(id: ids[0], title: "旧标签", address: "", groupID: group)]), forKey: "tabs")
+        defaults.set(Data("""
+            [{"id":"\(group.uuidString)","name":"旧分组","color":"blue","collapsed":true}]
+            """.utf8), forKey: "tabGroups")
+        let legacy = Store(defaults: defaults)
+        precondition(!legacy.tabGroups[0].hidden && legacy.tabGroups[0].collapsed && legacy.tabs[0].groupID == group)
+        let before = defaults.data(forKey: "tabs")
+        let corrupt = Data("{broken".utf8)
+        defaults.set(corrupt, forKey: "tabGroups")
+        let broken = Store(defaults: defaults)
+        broken.newTab(); broken.normalizeTabGroups()
+        precondition(defaults.data(forKey: "tabs") == before && defaults.data(forKey: "tabGroups") == corrupt)
+        let invalid = [TabGroup(id: group, hiddenTabs: [Tab(title: "损坏归属", address: "", groupID: UUID())])]
+        let invalidData = try JSONEncoder().encode(invalid)
+        defaults.set(invalidData, forKey: "tabGroups")
+        let invalidStore = Store(defaults: defaults)
+        invalidStore.newTab()
+        precondition(defaults.data(forKey: "tabs") == before && defaults.data(forKey: "tabGroups") == invalidData)
+        print("PASS: saved groups hide without closed-tab copies, survive restart, reopen once, sync members, dissolve/delete and preserve legacy/corrupt snapshots")
     }
     static func databaseSnapshot() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("perch-locked-fixture-\(UUID().uuidString)")
@@ -935,7 +1008,7 @@ final class BookmarkTestDrag: NSObject, NSDraggingInfo {
     var animatesToDestination = false
     var numberOfValidItemsForDrop = 1
     var springLoadingHighlight: NSSpringLoadingHighlight { .none }
-    init(board: NSPasteboard, table: BookmarkOutline) {
+    init(board: NSPasteboard, table: NSView) {
         draggingPasteboard = board; draggingSource = table; draggingDestinationWindow = table.window
     }
     func slideDraggedImage(to screenPoint: NSPoint) {}
@@ -975,6 +1048,14 @@ final class LayoutSelfCheck {
         Task { @MainActor in
             if preview {
                 await settle()
+                if CommandLine.arguments.contains("--verify-sidebar-animation") {
+                    await verifySidebarAnimation()
+                    print("PASS: ordinary icons stay fixed; group icons, highlights and rendered rails animate together through reversal")
+                    fflush(stdout)
+                }
+                if CommandLine.arguments.contains("--verify-group-transition") {
+                    await verifyGroupTransition()
+                }
                 if CommandLine.arguments.contains("--compact") && CommandLine.arguments.contains("--verify-preview") {
                     verify(width: 32)
                     print("PASS: collapsed tab icon and highlight centers align")
@@ -1069,6 +1150,21 @@ final class LayoutSelfCheck {
                             try? png.write(to: FileManager.default.temporaryDirectory.appendingPathComponent("perch-drag-gap.png"))
                         }
                     }
+                } else if CommandLine.arguments.contains("--preview-saved-groups") {
+                    let group = store.createTabGroup(store.tabs[0].id)!
+                    store.editTabGroup(group, name: "隐藏资料", color: .purple)
+                    store.moveTab(store.tabs[1].id, to: 1, groupID: group)
+                    store.hideTabGroup(group)
+                    let open = store.createTabGroup(store.tabs[0].id)!
+                    store.editTabGroup(open, name: "打开工作", color: .blue)
+                    store.library = .bookmarks
+                    await settle()
+                    if CommandLine.arguments.contains("--verify-preview") { await verifySavedGroupManager(group) }
+                } else if CommandLine.arguments.contains("--preview-groups") {
+                    let group = store.createTabGroup(store.tabs[0].id)!
+                    store.editTabGroup(group, name: "CICD")
+                    store.moveTab(store.tabs[1].id, to: 1, groupID: group)
+                    if CommandLine.arguments.contains("--verify-preview") { await verifyTabGroups() }
                 } else if CommandLine.arguments.contains("--preview-bookmarks") {
                     let leaf = BookmarkNode(title: "示例书签", address: "https://example.com")
                     store.importedBookmarks["Chrome"] = [BookmarkNode(title: "书签栏", children: [leaf, BookmarkNode(title: "空目录", children: [])])]
@@ -1137,6 +1233,448 @@ final class LayoutSelfCheck {
         return find(panel.contentView!)!
     }
     func settle() async { try? await Task.sleep(nanoseconds: 350_000_000) }
+    func verifyTabGroups() async {
+        // Keep assertion locations available in the stripped release executable used by UI checks.
+        func precondition(_ condition: @autoclosure () -> Bool, _ message: String = "", line: UInt = #line) {
+            if !condition() { fputs("FAIL: tab groups line \(line): \(message)\n", stderr); exit(1) }
+        }
+        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+        panel.focusWindow()
+        await settle()
+        let savedTabs = store.tabs, savedGroups = store.tabGroups, savedSelection = store.selected
+        let savedClosed = store.recentlyClosed
+        store.tabs = (0..<4).map { Tab(title: "分组合成标签 \($0 + 1)", address: "") }
+        store.tabGroups = []
+        let ids = store.tabs.map(\.id)
+        let group = store.createTabGroup(ids[0])!
+        store.editTabGroup(group, name: "CICD", color: .blue)
+        store.moveTab(ids[1], to: 1, groupID: group)
+        store.activate(ids[1])
+        await settle()
+        let table = table()
+        let coordinator = table.delegate as! NativeTabList.Coordinator
+        precondition(table.ids == [group, ids[0], ids[1], ids[2], ids[3]])
+        let groupCell = table.view(atColumn: 0, row: 0, makeIfNecessary: true) as! TabGroupCell
+        let groupedRow = table.rowView(atRow: 1, makeIfNecessary: true) as! TabSelectionRow
+        precondition(groupedRow.groupColor != nil && groupedRow.extraLeadingInset == 7)
+        let point = groupCell.convert(NSPoint(x: groupCell.bounds.midX, y: groupCell.bounds.midY), to: nil)
+        func click(_ location: NSPoint) {
+            panel.focusWindow()
+            let up = NSEvent.mouseEvent(with: .leftMouseUp, location: location, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber,
+                context: nil, eventNumber: 1, clickCount: 1, pressure: 0)!
+            NSApp.postEvent(up, atStart: true)
+            panel.sendEvent(NSEvent.mouseEvent(with: .leftMouseDown, location: location, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber,
+                context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!)
+        }
+        func clickHeader() { click(point) }
+        panel.focusWindow()
+        clickHeader()
+        await settle()
+        precondition(store.tabGroups[0].collapsed && table.ids == [group, ids[1], ids[2], ids[3]] &&
+                     store.selected == ids[1] && store.tabs.filter { $0.groupID == group }.map(\.id) == [ids[0], ids[1]],
+                     "Collapse must display the active tab below its group without changing selection or membership")
+        precondition((table.rowView(atRow: 1, makeIfNecessary: true) as? TabSelectionRow)?.groupColor == nil,
+                     "The temporary active tab must appear outside the group rail")
+        click(table.convert(NSPoint(x: 20, y: table.rect(ofRow: 1).midY), to: nil))
+        await settle()
+        precondition(store.tabGroups[0].collapsed, "Clicking the already active outside row must not expand its group")
+        let restored = Store(defaults: defaults)
+        precondition(restored.tabGroups.first?.name == "CICD" && restored.tabGroups.first?.color == .blue &&
+                     restored.tabGroups.first?.collapsed == true && restored.tabs.filter { $0.groupID == group }.count == 2)
+        await settle()
+        let otherPoint = table.convert(NSPoint(x: 20, y: table.rect(ofRow: 2).midY), to: nil)
+        click(otherPoint)
+        await settle()
+        precondition(store.selected == ids[2] && table.ids == [group, ids[2], ids[3]] &&
+                     store.tabs.first { $0.id == ids[1] }?.groupID == group,
+                     "Switching away must remove only the temporary row")
+        clickHeader()
+        await settle()
+        precondition(!store.tabGroups[0].collapsed && table.ids.count == 5)
+        NSApp.sendEvent(NSEvent.mouseEvent(with: .rightMouseDown, location: point, modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber,
+            context: nil, eventNumber: 2, clickCount: 1, pressure: 1)!)
+        await settle()
+        precondition(coordinator.editor?.isShown == true, "Right-click must open the native group editor")
+        if let view = coordinator.editor?.contentViewController?.view,
+           let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+            view.cacheDisplay(in: view.bounds, to: bitmap)
+            try? bitmap.representation(using: .png, properties: [:])?.write(
+                to: FileManager.default.temporaryDirectory.appendingPathComponent("perch-group-editor.png"))
+        }
+        if let editor = coordinator.editor?.contentViewController?.view.window?.firstResponder as? NSTextView {
+            editor.insertText("发布", replacementRange: NSRange(location: 0, length: editor.string.utf16.count))
+            await settle()
+            precondition(store.tabGroups[0].name == "发布", "Native text editing must save the group name")
+        } else { preconditionFailure("Group editor must focus its name field") }
+        coordinator.editor?.close()
+        await settle()
+        store.toggleTabGroup(group)
+        store.activate(ids[1])
+        await settle()
+        precondition(!store.tabGroups[0].collapsed && store.selected == ids[1])
+
+        let board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        let drag = BookmarkTestDrag(board: board, table: table)
+        func begin(_ id: UUID) {
+            board.clearContents(); board.setString(id.uuidString, forType: .string)
+            table.beginDrag(at: table.ids.firstIndex(of: id)!)
+        }
+        func move(_ point: NSPoint) -> NSDragOperation {
+            drag.draggingLocation = table.convert(point, to: nil)
+            return coordinator.tableView(table, validateDrop: drag, proposedRow: 0, proposedDropOperation: .above)
+        }
+        func drop() -> Bool { coordinator.tableView(table, acceptDrop: drag, row: 0, dropOperation: .above) }
+        begin(ids[2])
+        precondition(move(NSPoint(x: 20, y: 18)) == .move)
+        await settle()
+        precondition(store.tabs.first { $0.id == ids[2] }?.groupID == nil &&
+                     coordinator.tabs.first { $0.id == ids[2] }?.groupID == group,
+                     "Drag preview must join the target without writing persisted membership")
+        store.tabs[2].title = "拖动时标题更新"
+        await settle()
+        precondition(coordinator.tabs.first { $0.id == ids[2] }?.groupID == group)
+        table.endDragPreview()
+        await settle()
+        precondition(table.ids == [group, ids[0], ids[1], ids[2], ids[3]])
+        begin(ids[2]); _ = move(NSPoint(x: 20, y: 18))
+        precondition(drop())
+        await settle()
+        precondition(store.tabs.first { $0.id == ids[2] }?.groupID == group)
+        begin(ids[2]); _ = move(NSPoint(x: 20, y: CGFloat(table.ids.count) * 36 + 4))
+        precondition(drop())
+        await settle()
+        precondition(store.tabs.last?.id == ids[2] && store.tabs.last?.groupID == nil)
+        begin(ids[0])
+        let ownRowY = CGFloat(table.ids.firstIndex(of: ids[0])!) * 36 + 18
+        _ = move(NSPoint(x: 3, y: ownRowY))
+        precondition(coordinator.tabs.first { $0.id == ids[0] }?.groupID == nil,
+                     "Horizontal dragging into the gutter must leave the group even from the source row")
+        table.endDragPreview()
+        await settle()
+        let second = store.createTabGroup(ids[3])!
+        store.editTabGroup(second, name: "资料", color: .purple)
+        await settle()
+        begin(ids[1])
+        let secondY = CGFloat(table.ids.firstIndex(of: second)!) * 36 + 18
+        _ = move(NSPoint(x: 20, y: secondY))
+        precondition(drop())
+        await settle()
+        precondition(store.tabs.first { $0.id == ids[1] }?.groupID == second)
+        store.toggleTabGroup(group)
+        await settle()
+        begin(ids[2]); _ = move(NSPoint(x: 20, y: 18))
+        precondition(drop())
+        await settle()
+        precondition(store.tabGroups.first { $0.id == group }!.collapsed &&
+                     !table.ids.contains(ids[2]), "Dropping into a collapsed header preserves its collapsed state")
+        store.toggleTabGroup(group)
+        await settle()
+        begin(group)
+        _ = move(NSPoint(x: 20, y: CGFloat(table.ids.count) * 36 + 4))
+        await settle()
+        precondition(!table.ids.contains(ids[0]) && !store.tabGroups.first { $0.id == group }!.collapsed,
+                     "Whole-group drag collapse is only a presentation state")
+        table.endDragPreview()
+        await settle()
+        precondition(table.ids.contains(ids[0]) && table.ids.first == group)
+        begin(group); _ = move(NSPoint(x: 20, y: CGFloat(table.ids.count) * 36 + 4))
+        precondition(drop())
+        await settle()
+        precondition(store.tabs.suffix(2).allSatisfy { $0.groupID == group } && table.ids.contains(ids[0]))
+        store.pin(ids[0])
+        await settle()
+        begin(ids[0])
+        precondition(move(NSPoint(x: 20, y: CGFloat(table.ids.count) * 36)) == [])
+        table.endDragPreview()
+        precondition(store.tabs[0].groupID == nil && store.tabs[0].pinned)
+        store.newTab(inGroup: second)
+        let added = store.selected!
+        precondition(store.tabs.first { $0.id == added }?.groupID == second)
+        store.close(added); store.reopen()
+        precondition(store.tabs.first { $0.id == store.selected }?.groupID == second)
+        await settle()
+        for compact in [false, true] {
+            defaults.set(compact, forKey: "sidebarHidden")
+            await settle()
+            for row in table.ids.indices {
+                if let cell = table.view(atColumn: 0, row: row, makeIfNecessary: true) as? TabCell {
+                    precondition(table.convert(cell.icon.bounds, from: cell.icon).maxX <= table.bounds.maxX + 1)
+                    if compact, let selection = table.rowView(atRow: row, makeIfNecessary: true) as? TabSelectionRow {
+                        precondition(selection.extraLeadingInset == 0 &&
+                                     abs(cell.icon.frame.midX - cell.bounds.midX) < 0.5,
+                                     "Compact grouped icons and selection backgrounds must share the rail center")
+                        if store.tabs.first(where: { $0.id == table.ids[row] })?.groupID != nil {
+                            let container = table.enclosingScrollView!.superview as! TabListContainer
+                            let highlightLeft = container.convert(selection.bounds, from: selection).minX + selection.horizontalInset
+                            precondition(highlightLeft - TabListContainer.railGutter >= 2,
+                                         "A 2pt rail in the left gutter must retain a gap before the highlight")
+                        }
+                    }
+                }
+            }
+            if let root = panel.contentView, let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds) {
+                root.cacheDisplay(in: root.bounds, to: bitmap)
+                try? bitmap.representation(using: .png, properties: [:])?.write(
+                    to: FileManager.default.temporaryDirectory.appendingPathComponent(compact ? "perch-groups-compact.png" : "perch-groups-expanded.png"))
+                for row in table.ids.indices {
+                    guard let header = table.view(atColumn: 0, row: row, makeIfNecessary: true) as? TabGroupCell else { continue }
+                    func color(_ x: CGFloat) -> NSColor {
+                        let point = header.convert(NSPoint(x: x, y: header.bounds.midY), to: root)
+                        return bitmap.colorAt(x: Int(point.x * CGFloat(bitmap.pixelsWide) / root.bounds.width),
+                            y: Int((root.isFlipped ? point.y : root.bounds.height - point.y) *
+                                   CGFloat(bitmap.pixelsHigh) / root.bounds.height))!.usingColorSpace(.deviceRGB)!
+                    }
+                    for (outside, inside) in [(CGFloat(1), CGFloat(3)), (header.bounds.width - 1, header.bounds.width - 3)] {
+                        let a = color(outside), b = color(inside)
+                        precondition(abs(a.redComponent - b.redComponent) + abs(a.greenComponent - b.greenComponent) +
+                                     abs(a.blueComponent - b.blueComponent) > 0.2,
+                                     "Group button edges must match the tab highlight's 2pt horizontal inset")
+                    }
+                }
+                for row in 1..<coordinator.rows.count {
+                    guard case .tab(let current) = coordinator.rows[row],
+                          case .tab(let previous) = coordinator.rows[row - 1],
+                          let groupID = store.tabs.first(where: { $0.id == current })?.groupID,
+                          store.tabs.first(where: { $0.id == previous })?.groupID == groupID else { continue }
+                    let lineX: CGFloat = compact ? -2 : 3
+                    let samples: [CGFloat] = [0.25, 0.75, 1.25, 1.75]
+                    for x in samples.map({ lineX + $0 }) {
+                        for offset: CGFloat in [-0.75, -0.25, 0.25, 0.75] {
+                            let point = table.convert(NSPoint(x: x, y: table.rect(ofRow: row).minY + offset), to: root)
+                            let pixelX = Int(point.x * CGFloat(bitmap.pixelsWide) / root.bounds.width)
+                            let pixelY = Int((root.isFlipped ? point.y : root.bounds.height - point.y) *
+                                             CGFloat(bitmap.pixelsHigh) / root.bounds.height)
+                            let actual = bitmap.colorAt(x: pixelX, y: pixelY)!.usingColorSpace(.deviceRGB)!
+                            // Compare in the captured display color space, not against the model's sRGB value.
+                            let color = bitmap.colorAt(x: pixelX, y: pixelY - 8)!.usingColorSpace(.deviceRGB)!
+                            let background = bitmap.colorAt(x: pixelX + 5, y: pixelY - 8)!.usingColorSpace(.deviceRGB)!
+                            precondition(abs(color.redComponent - background.redComponent) +
+                                         abs(color.greenComponent - background.greenComponent) > 0.2,
+                                         "The sampled column must contain the group line, not sidebar whitespace")
+                            precondition(abs(actual.redComponent - color.redComponent) < 0.025 &&
+                                         abs(actual.greenComponent - color.greenComponent) < 0.025 &&
+                                         abs(actual.blueComponent - color.blueComponent) < 0.025,
+                                         "Group line join: compact=\(compact), row=\(row), pixel=(\(pixelX),\(pixelY)), actual=\(actual), expected=\(color)")
+                        }
+                    }
+                }
+            }
+            let active = store.selected!
+            let membership = store.tabs.map(\.groupID)
+            store.toggleTabGroup(second)
+            await settle()
+            let headerRow = table.ids.firstIndex(of: second)!
+            precondition(table.ids[headerRow + 1] == active &&
+                         (table.rowView(atRow: headerRow + 1, makeIfNecessary: true) as? TabSelectionRow)?.groupColor == nil &&
+                         store.tabs.map(\.groupID) == membership && store.tabGroups.first { $0.id == second }!.collapsed,
+                         "Both sidebar widths must show the active tab outside its collapsed group")
+            store.selected = nil
+            await settle()
+            precondition(!table.ids.contains(active) && store.tabs.map(\.groupID) == membership,
+                         "Returning home must remove the temporary row without moving the tab")
+            store.activate(active)
+            await settle()
+            precondition(!store.tabGroups.first { $0.id == second }!.collapsed &&
+                         table.ids.filter { $0 == active }.count == 1,
+                         "Reactivating a hidden grouped tab must restore one regular grouped row")
+        }
+        defaults.set(false, forKey: "sidebarHidden")
+        store.ungroup(second)
+        store.deleteTabGroup(group)
+        await settle()
+        precondition(!store.tabGroups.contains { $0.id == group || $0.id == second })
+        store.tabs = savedTabs; store.tabGroups = savedGroups; store.selected = savedSelection
+        store.recentlyClosed = savedClosed
+        await settle()
+        print("PASS: group header event path, colors, persistence, collapse/select, native drag validation/acceptance into/out/across groups, cancellation, whole-group moves, pin boundary, reopen and compact layout")
+    }
+    func verifySavedGroupManager(_ group: UUID) async {
+        func check(_ condition: @autoclosure () -> Bool, _ message: String) {
+            if !condition() { fputs("FAIL: saved group manager: \(message)\n", stderr); exit(1) }
+        }
+        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+        panel.sheets.first?.makeKeyAndOrderFront(nil)
+        SelfTests.prepareAccessibility()
+        await settle()
+        var visited = Set<ObjectIdentifier>()
+        func children(_ object: NSObject) -> [Any] {
+            let views: [Any] = (object as? NSView)?.subviews ?? []
+            for key in ["accessibilityChildren", "accessibilityRows", "accessibilityVisibleRows"] {
+                if object.responds(to: NSSelectorFromString(key)),
+                   let values = object.value(forKey: key) as? [Any], !values.isEmpty { return views + values }
+            }
+            return views
+        }
+        func element(_ node: Any, label: String) -> NSObject? {
+            guard let object = node as? NSObject, visited.insert(ObjectIdentifier(object)).inserted else { return nil }
+            if object.responds(to: NSSelectorFromString("accessibilityLabel")),
+               object.responds(to: NSSelectorFromString("accessibilityPerformPress")),
+               object.value(forKey: "accessibilityLabel") as? String == label { return object }
+            for child in children(object) {
+                if let button = element(child, label: label) { return button }
+            }
+            return nil
+        }
+        func press(_ root: NSView, _ label: String) async {
+            visited.removeAll()
+            guard let button = element(root, label: label) else {
+                visited.removeAll()
+                func labels(_ node: Any) -> [String] {
+                    guard let object = node as? NSObject, visited.insert(ObjectIdentifier(object)).inserted else { return [] }
+                    let own = object.responds(to: NSSelectorFromString("accessibilityLabel")) ?
+                        (object.value(forKey: "accessibilityLabel") as? String).map { [$0] } ?? [] : []
+                    return own + children(object).flatMap(labels)
+                }
+                fputs("Visible labels: \(labels(root))\n", stderr)
+                if let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds) {
+                    root.cacheDisplay(in: root.bounds, to: bitmap)
+                    try? bitmap.representation(using: .png, properties: [:])?.write(to:
+                        FileManager.default.temporaryDirectory.appendingPathComponent("perch-saved-group-failure.png"))
+                }
+                fputs("FAIL: saved group button missing: \(label)\n", stderr); exit(1)
+            }
+            _ = button.perform(NSSelectorFromString("accessibilityPerformPress"))
+            await settle()
+        }
+        func find(_ root: NSView) -> BookmarkOutline? {
+            (root as? BookmarkOutline) ?? root.subviews.lazy.compactMap(find).first
+        }
+        func clickScope(_ root: NSView, _ label: String, trailing: Bool) async {
+            visited.removeAll()
+            guard let button = element(root, label: label),
+                  let frame = (button.value(forKey: "accessibilityFrame") as? NSValue)?.rectValue,
+                  let window = root.window else {
+                fputs("FAIL: saved group sidebar geometry: \(label)\n", stderr); exit(1)
+            }
+            check(frame.width > 100, "Sidebar buttons must span the row")
+            let point = window.convertPoint(fromScreen: NSPoint(x: trailing ? frame.maxX - 2 : frame.minX + 2, y: frame.midY))
+            NSApp.postEvent(NSEvent.mouseEvent(with: .leftMouseUp, location: point, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                context: nil, eventNumber: 1, clickCount: 1, pressure: 0)!, atStart: true)
+            NSApp.sendEvent(NSEvent.mouseEvent(with: .leftMouseDown, location: point, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!)
+            await settle()
+        }
+        func clickOpen(_ table: BookmarkOutline, row: Int) async {
+            let cell = table.view(atColumn: 0, row: row, makeIfNecessary: true) as! BookmarkCell
+            let window = table.window!
+            window.makeKeyAndOrderFront(nil)
+            let point = cell.openButton.convert(NSPoint(x: cell.openButton.bounds.midX, y: cell.openButton.bounds.midY), to: nil)
+            let hit = window.contentView?.hitTest(window.contentView!.superview?.convert(point, from: nil) ?? point)
+            var ancestor = hit
+            while let view = ancestor, view !== cell.openButton { ancestor = view.superview }
+            check(ancestor != nil, "Open button must receive the event across its visible bounds")
+            NSApp.postEvent(NSEvent.mouseEvent(with: .leftMouseUp, location: point, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                context: nil, eventNumber: 1, clickCount: 1, pressure: 0)!, atStart: true)
+            window.sendEvent(NSEvent.mouseEvent(with: .leftMouseDown, location: point, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!)
+            await settle()
+        }
+        let sheet = panel.sheets.first!, root = sheet.contentView!
+        visited.removeAll()
+        check(element(root, label: "全部标签组") == nil, "The redundant all-groups entry must be absent")
+        await clickScope(root, "隐藏资料", trailing: true)
+        let list = find(root)!
+        let coordinator = list.dataSource as! NativeBookmarks.Coordinator
+        check(list.numberOfRows == 2 && coordinator.roots.allSatisfy { $0.groupID == group && $0.site != nil },
+              "Clicking the trailing blank area must open the saved group's tabs")
+        await clickScope(root, "个人书签", trailing: true)
+        check(coordinator.roots.allSatisfy { $0.groupID == nil }, "Other sidebar rows must also accept trailing clicks")
+        await clickScope(root, "隐藏资料", trailing: false)
+        check(list.numberOfRows == 2 && coordinator.roots.allSatisfy { $0.groupID == group },
+              "The leading edge must also open the saved group's tabs")
+        let menu = coordinator.menu(0)!
+        check(menu.items.map(\.title) == ["打开标签页", "复制网址"],
+              "Saved tab menus must expose their own tab actions")
+        if let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds) {
+            root.cacheDisplay(in: root.bounds, to: bitmap)
+            try? bitmap.representation(using: .png, properties: [:])?.write(to:
+                FileManager.default.temporaryDirectory.appendingPathComponent("perch-saved-groups.png"))
+        }
+        let members = store.tabs(inGroup: group).map(\.id)
+        await clickOpen(list, row: 1)
+        check(store.library == nil && store.selected == members[1], "A saved tab click must restore and select that tab")
+        check(store.tabs.filter { $0.groupID == group }.map(\.id) == members, "Restoring a saved tab must reopen its group once")
+        let tabCoordinator = table().delegate as! NativeTabList.Coordinator
+        tabCoordinator.editGroup(group)
+        await settle()
+        let editor = tabCoordinator.editor!.contentViewController!.view
+        check(editor.bounds.width <= 250, "The group menu must keep its compact width")
+        check(editor.bounds.height < 235, "The group menu must reduce vertical whitespace")
+        visited.removeAll()
+        let hoverButton = element(editor, label: "隐藏分组")!
+        let hoverFrame = (hoverButton.value(forKey: "accessibilityFrame") as! NSValue).rectValue
+        let hoverWindow = editor.window!
+        let hoverPoint = hoverWindow.convertPoint(fromScreen: NSPoint(x: hoverFrame.maxX - 12, y: hoverFrame.midY))
+        func backgroundSample(at location: NSPoint) -> NSColor {
+            let bitmap = editor.bitmapImageRepForCachingDisplay(in: editor.bounds)!
+            editor.cacheDisplay(in: editor.bounds, to: bitmap)
+            let point = editor.convert(location, from: nil)
+            let x = Int(point.x / editor.bounds.width * CGFloat(bitmap.pixelsWide))
+            let y = Int((editor.isFlipped ? point.y : editor.bounds.height - point.y) / editor.bounds.height * CGFloat(bitmap.pixelsHigh))
+            return bitmap.colorAt(x: x, y: y)!.usingColorSpace(.deviceRGB)!
+        }
+        func move(_ point: NSPoint, in window: NSWindow) async {
+            NSApp.sendEvent(NSEvent.mouseEvent(with: .mouseMoved, location: point, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                context: nil, eventNumber: 1, clickCount: 0, pressure: 0)!)
+            await settle()
+        }
+        func hoverRegions(_ view: NSView) -> [TabGroupMenuHoverView] {
+            (view as? TabGroupMenuHoverView).map { [$0] } ?? view.subviews.flatMap(hoverRegions)
+        }
+        let regions = hoverRegions(editor)
+        check(regions.count == TabGroupColor.allCases.count + 4 && hoverWindow.acceptsMouseMovedEvents,
+              "Every menu button must have a native hover region and the popover must accept mouse moves")
+        check(regions.allSatisfy { region in
+            region.trackingAreas.contains { $0.options.contains(.activeAlways) &&
+                $0.rect == region.bounds.intersection(region.visibleRect) }
+        }, "Popover tracking must stay within each button's bounds and work independently of key-window status")
+        await move(.zero, in: panel)
+        let idleBackground = backgroundSample(at: hoverPoint)
+        await move(hoverPoint, in: hoverWindow)
+        let hoveredBackground = backgroundSample(at: hoverPoint)
+        check(abs(hoveredBackground.alphaComponent - idleBackground.alphaComponent) +
+              abs(hoveredBackground.redComponent - idleBackground.redComponent) > 0.04,
+              "A mouse move over the menu's blank area must visibly paint its hover background")
+        check(regions.filter(\.hovered).count == 1, "Only the button under the pointer may be highlighted")
+        for region in regions {
+            let point = region.convert(NSPoint(x: region.bounds.midX, y: region.bounds.midY), to: nil)
+            await move(point, in: hoverWindow)
+            check(region.hovered && regions.filter(\.hovered).count == 1,
+                  "Moving between action rows and colors must transfer the hover state")
+            check(region.hitTest(.zero) == nil, "Decorative hover tracking must not intercept clicks")
+        }
+        store.editTabGroup(group, name: "悬停时更新名称")
+        await settle()
+        check(hoverRegions(editor).filter(\.hovered).count == 1, "An editor redraw must preserve its hover state")
+        await move(.zero, in: panel)
+        let restoredBackground = backgroundSample(at: hoverPoint)
+        check(hoverRegions(editor).allSatisfy { !$0.hovered } &&
+              abs(restoredBackground.alphaComponent - idleBackground.alphaComponent) < 0.01 &&
+              abs(restoredBackground.redComponent - idleBackground.redComponent) < 0.01,
+              "Leaving the popover must clear both hover state and rendered highlight")
+        store.editTabGroup(group, name: "隐藏资料")
+        await clickScope(editor, "隐藏分组", trailing: true)
+        check(!table().ids.contains(group) && store.tabGroups.first { $0.id == group }?.hidden == true,
+              "The native editor hide action must remove the whole group from the sidebar")
+        store.library = .bookmarks
+        await settle()
+        await press(panel.sheets.first!.contentView!, "隐藏资料")
+        check(find(panel.sheets.first!.contentView!)!.numberOfRows == members.count,
+              "The hidden group must remain accessible in the manager")
+        await press(panel.sheets.first!.contentView!, "打开分组")
+        check(store.library == nil && store.tabs.filter { $0.groupID == group }.count == members.count,
+              "The manager reopen button must restore one group without duplicate tabs")
+        print("PASS: saved group directories, whole-row clicks, native menu hover event/pixel checks, color/row transitions, redraw/exit cleanup, editor hide and manager reopen")
+    }
     func verifyBookmarks() async {
         let initialSites = store.sites
         let initialFolders = store.bookmarkFolders
@@ -2058,6 +2596,7 @@ final class LayoutSelfCheck {
         }
         await settle()
         if defaults.bool(forKey: "sidebarHidden") { verify(width: 32) }
+        await verifySidebarAnimation()
         await verifyHomeFocusRestoration()
         await verifyAddressComposition()
         await verifyWebContextMenu()
@@ -2172,6 +2711,7 @@ final class LayoutSelfCheck {
         await settle()
         print("PASS: original-row pointer preview and single-tab no-op drag restore visible content")
         print("PASS: native row insertion preview in both directions, middle slot, stable hidden content during metadata changes and cancellation")
+        await verifyTabGroups()
         NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
         panel.focusWindow()
         check(panel.shouldHideForStatusClick(), "Focusing the panel must establish status-click intent")
@@ -2386,6 +2926,148 @@ final class LayoutSelfCheck {
         print("PASS: native menu shortcuts for reload, forced reload, page zoom, find and tab switching")
         await verifySettingsFocus()
         print("PASS: real root layout keeps sidebar width through tab insert/remove/reorder/reopen; rounded rows, icon rail and inactive-window activation")
+    }
+    private func verifyGroupTransition() async {
+        func check(_ condition: @autoclosure () -> Bool, _ message: String) {
+            if !condition() { fputs("FAIL: group transition: \(message)\n", stderr); exit(1) }
+        }
+        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+        panel.focusWindow()
+        let savedTabs = store.tabs, savedGroups = store.tabGroups, savedSelection = store.selected
+        let compact = defaults.bool(forKey: "sidebarHidden")
+        defaults.set(false, forKey: "sidebarHidden")
+        store.tabs = (0..<5).map { Tab(title: "展开裁切 \($0)", address: "") }
+        store.tabGroups = []
+        let outside = store.tabs[0].id
+        let members = store.tabs.dropFirst().map(\.id)
+        let group = store.createTabGroup(members[0])!
+        store.editTabGroup(group, color: .blue)
+        for id in members.dropFirst() { store.moveTab(id, to: store.tabs.count, groupID: group) }
+        store.activate(outside)
+        store.toggleTabGroup(group)
+        await settle()
+        var intermediateFrames = 0
+        for expanding in [true, false, true, false] {
+            let list = table()
+            let row = list.ids.firstIndex(of: group)!
+            let header = list.view(atColumn: 0, row: row, makeIfNecessary: true)!
+            let point = header.convert(NSPoint(x: header.bounds.midX, y: header.bounds.midY), to: nil)
+            NSApp.postEvent(NSEvent.mouseEvent(with: .leftMouseUp, location: point, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber,
+                context: nil, eventNumber: 1, clickCount: 1, pressure: 0)!, atStart: true)
+            NSApp.sendEvent(NSEvent.mouseEvent(with: .leftMouseDown, location: point, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber,
+                context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!)
+            for _ in 0..<16 {
+                try? await Task.sleep(nanoseconds: 16_000_000)
+                let container = list.enclosingScrollView!.superview as! TabListContainer
+                check(container.layer?.masksToBounds == true, "Animated tab content must be clipped at the native viewport")
+                let root = panel.contentView!
+                let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds)!
+                root.cacheDisplay(in: root.bounds, to: bitmap)
+                func color(_ point: NSPoint) -> NSColor {
+                    bitmap.colorAt(x: Int(point.x * CGFloat(bitmap.pixelsWide) / root.bounds.width),
+                        y: Int((root.isFlipped ? point.y : root.bounds.height - point.y) *
+                               CGFloat(bitmap.pixelsHigh) / root.bounds.height))!.usingColorSpace(.deviceRGB)!
+                }
+                let reference = color(header.convert(NSPoint(x: 6, y: header.bounds.midY), to: root))
+                let below = color(container.convert(NSPoint(x: 7, y: container.bounds.maxY + 8), to: root))
+                check(abs(reference.redComponent - below.redComponent) +
+                      abs(reference.greenComponent - below.greenComponent) +
+                      abs(reference.blueComponent - below.blueComponent) > 0.2,
+                      "The group rail must not paint below the viewport onto the moving new-tab button")
+                if expanding && container.bounds.height > 74 && container.bounds.height < 214 {
+                    intermediateFrames += 1
+                    if intermediateFrames == 1 {
+                        try? bitmap.representation(using: .png, properties: [:])?.write(to:
+                            FileManager.default.temporaryDirectory.appendingPathComponent("perch-group-opening.png"))
+                    }
+                }
+            }
+            check(store.tabGroups.first { $0.id == group }?.collapsed == !expanding,
+                  "The actual group header event must toggle its expansion")
+        }
+        check(intermediateFrames > 1, "Clipping must be sampled while the group is opening, not only at its endpoints")
+        store.tabs = savedTabs; store.tabGroups = savedGroups; store.selected = savedSelection
+        defaults.set(compact, forKey: "sidebarHidden")
+        await settle()
+        print("PASS: group opening/closing header events, intermediate viewport clipping and no rail over the new-tab button")
+    }
+    private func verifySidebarAnimation() async {
+        func precondition(_ condition: @autoclosure () -> Bool, _ message: String, line: UInt = #line) {
+            if !condition() { fputs("FAIL: sidebar animation line \(line): \(message)\n", stderr); exit(1) }
+        }
+        let initialCompact = defaults.bool(forKey: "sidebarHidden")
+        let savedTabs = store.tabs, savedGroups = store.tabGroups, savedSelection = store.selected
+        let groupedID = store.tabs[0].id
+        let group = store.createTabGroup(groupedID)!
+        store.moveTab(store.tabs[1].id, to: 1, groupID: group)
+        defaults.set(false, forKey: "sidebarHidden")
+        await settle()
+        let id = store.tabs.first { $0.groupID == nil }!.id
+        func iconX(_ id: UUID) -> CGFloat {
+            let list = table()
+            let row = list.ids.firstIndex(of: id)!
+            let cell = list.view(atColumn: 0, row: row, makeIfNecessary: true) as! TabCell
+            return cell.icon.convert(cell.icon.bounds, to: panel.contentView!).midX
+        }
+        let initialX = iconX(id)
+        var widths: [CGFloat] = []
+        var groupedPositions: [CGFloat] = []
+        var railPositions: [CGFloat] = []
+        // Six samples reverse before the 220ms transition ends; sixteen finish it.
+        for (compact, samples) in [(true, 16), (false, 16), (true, 6), (false, 6), (true, 16), (false, 16)] {
+            var captured = false
+            defaults.set(compact, forKey: "sidebarHidden")
+            for _ in 0..<samples {
+                try? await Task.sleep(nanoseconds: 16_000_000)
+                let x = iconX(id)
+                precondition(abs(x - initialX) < 0.5,
+                             "Sidebar animation must keep the icon fixed: expected \(initialX), got \(x)")
+                let list = table()
+                let container = list.enclosingScrollView!.superview as! TabListContainer
+                let progress = container.expansion
+                let row = list.ids.firstIndex(of: groupedID)!
+                let selection = list.rowView(atRow: row, makeIfNecessary: true) as! TabSelectionRow
+                let groupedX = iconX(groupedID)
+                precondition(abs(groupedX - initialX - 10 * progress) < 0.5 &&
+                             abs(selection.extraLeadingInset - 7 * progress) < 0.01,
+                             "Grouped icon and highlight insets must follow the same displayed expansion progress")
+                let rail = container.railRect(container.rails.first!.rows, table: list)
+                groupedPositions.append(groupedX)
+                railPositions.append(rail.minX)
+                widths.append(list.enclosingScrollView!.frame.width)
+                if !captured && progress > 0.2 && progress < 0.8 {
+                    let root = panel.contentView!
+                    let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds)!
+                    root.cacheDisplay(in: root.bounds, to: bitmap)
+                    func color(_ point: NSPoint) -> NSColor {
+                        bitmap.colorAt(x: Int(point.x * CGFloat(bitmap.pixelsWide) / root.bounds.width),
+                            y: Int((root.isFlipped ? point.y : root.bounds.height - point.y) *
+                                   CGFloat(bitmap.pixelsHigh) / root.bounds.height))!.usingColorSpace(.deviceRGB)!
+                    }
+                    let header = list.view(atColumn: 0, row: list.ids.firstIndex(of: group)!, makeIfNecessary: true)!
+                    let reference = color(header.convert(NSPoint(x: 6, y: 8), to: root))
+                    let child = container.convert(list.rect(ofRow: row), from: list)
+                    let actual = color(container.convert(NSPoint(x: rail.midX, y: child.midY), to: root))
+                    precondition(abs(actual.redComponent - reference.redComponent) < 0.025 &&
+                                 abs(actual.greenComponent - reference.greenComponent) < 0.025 &&
+                                 abs(actual.blueComponent - reference.blueComponent) < 0.025,
+                                 "The group rail must actually render at its intermediate animated position")
+                    captured = true
+                }
+            }
+        }
+        if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            precondition(widths.contains { $0 > 40 && $0 < 190 },
+                         "Icon positions must be sampled during a running sidebar width animation")
+            precondition(groupedPositions.contains { $0 > initialX + 1 && $0 < initialX + 9 } &&
+                         railPositions.contains { $0 > 1.5 && $0 < 5.5 },
+                         "Grouped icons and rails must pass through intermediate positions instead of jumping")
+        }
+        store.tabs = savedTabs; store.tabGroups = savedGroups; store.selected = savedSelection
+        defaults.set(initialCompact, forKey: "sidebarHidden")
+        await settle()
     }
     private func verifyWindowControlsLayout(handle: SidebarResizeHandle.ResizeView) async {
         final class CloseProbe: NSObject, NSWindowDelegate {
