@@ -1759,8 +1759,15 @@ struct HomeScreen: View {
                             ForEach(shortcuts) { site in
                                 Button { store.open(site) } label: {
                                     HStack(spacing: 12) {
-                                        Image(systemName: site.symbol).font(.system(size: 20))
-                                            .frame(width: 32).foregroundStyle(Style.accent)
+                                        Group {
+                                            if let icon = store.cachedFavicon(site.address) {
+                                                Image(nsImage: icon).resizable().scaledToFit()
+                                                    .frame(width: 20, height: 20)
+                                            } else {
+                                                Image(systemName: site.symbol).font(.system(size: 20))
+                                                    .foregroundStyle(Style.accent)
+                                            }
+                                        }.frame(width: 32).accessibilityHidden(true)
                                         VStack(alignment: .leading, spacing: 5) {
                                             Text(site.title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
                                             Text(URL(string: site.address)?.host ?? site.address)
