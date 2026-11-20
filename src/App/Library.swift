@@ -118,15 +118,15 @@ struct TabSidebar: View, Animatable {
     var compact = false
     var expansion: CGFloat = 1
     var topBarHeight: CGFloat = 44
-    var animatableData: CGFloat {
-        get { expansion }
-        set { expansion = newValue }
+    var contentHeight: CGFloat
+    var animatableData: AnimatablePair<CGFloat, CGFloat> {
+        get { AnimatablePair(expansion, contentHeight) }
+        set { expansion = newValue.first; contentHeight = newValue.second }
     }
     var body: some View {
         let palette = theme.selection
         GeometryReader { geometry in
             let availableHeight = max(0, geometry.size.height - 122)
-            let contentHeight = CGFloat(store.tabRows.count) * TabSelectionRow.rowHeight
             VStack(alignment: .leading, spacing: 4) {
                 NativeTabList(store: store, compact: compact, expansion: expansion)
                     .frame(height: min(contentHeight, availableHeight))
@@ -154,9 +154,6 @@ struct TabSidebar: View, Animatable {
                 }.buttonStyle(.plain).foregroundStyle(Style.muted)
                     .help("设置 ⌘,").accessibilityLabel("设置")
             }
-            .animation(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil :
-                .easeInOut(duration: TabListContainer.groupAnimationDuration),
-                       value: store.tabRows)
             .padding(.bottom, 4)
         }.padding(.horizontal, 8).padding(.top, 12)
             .frame(maxHeight: .infinity).background {

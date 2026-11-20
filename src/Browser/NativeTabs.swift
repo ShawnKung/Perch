@@ -49,6 +49,15 @@ final class TabTable: NSTableView {
             (rowView(atRow: index, makeIfNecessary: false) as? TabSelectionRow)?.setPointerHovered(false)
         }
     }
+    func refreshHover() {
+        guard !animatingRows, !animatingGroups, let window else { return }
+        let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        clearHover()
+        guard visibleRect.contains(point) else { return }
+        let index = row(at: point)
+        guard index >= 0 else { return }
+        (view(atColumn: 0, row: index, makeIfNecessary: false) as? TabCell)?.setHovered(true, animated: false)
+    }
     override func mouseDown(with event: NSEvent) {
         let index = row(at: convert(event.locationInWindow, from: nil))
         pressedID = ids.indices.contains(index) ? ids[index] : nil
@@ -272,8 +281,30 @@ final class TabScrollView: NSScrollView {
     }
 }
 
+final class TabWipeAnimation: NSAnimation {
+    private let from: CGFloat
+    private let to: CGFloat
+    private let changed: @MainActor (CGFloat, Bool) -> Void
+    @MainActor init(from: CGFloat, to: CGFloat, changed: @escaping @MainActor (CGFloat, Bool) -> Void) {
+        self.from = from; self.to = to; self.changed = changed
+        super.init(duration: TabListContainer.groupAnimationDuration, animationCurve: .easeInOut)
+        animationBlockingMode = .nonblocking
+        frameRate = Float(NSScreen.main?.maximumFramesPerSecond ?? 60)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override var runLoopModesForAnimating: [RunLoop.Mode]? { [.common] }
+    override var currentProgress: NSAnimation.Progress {
+        get { super.currentProgress }
+        set {
+            super.currentProgress = newValue
+            let value = from + (to - from) * CGFloat(currentValue)
+            MainActor.assumeIsolated { changed(value, newValue == 1) }
+        }
+    }
+}
+
 final class TabGroupRailView: NSView {
-    @objc dynamic var progress: CGFloat = 0 { didSet {
+    var progress: CGFloat = 0 { didSet {
         needsDisplay = true
         if progress != oldValue { changed?() }
     } }
@@ -284,11 +315,18 @@ final class TabGroupRailView: NSView {
     var retainedMemberHeight: CGFloat = 0
     var expansion: CGFloat = 1 { didSet { needsDisplay = true } }
     var color = NSColor.clear { didSet { needsDisplay = true } }
+    private var wipeAnimation: TabWipeAnimation?
     override var isFlipped: Bool { true }
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
-    override class func defaultAnimation(forKey key: NSAnimatablePropertyKey) -> Any? {
-        if key == "progress" { return CABasicAnimation() }
-        return super.defaultAnimation(forKey: key)
+    deinit { wipeAnimation?.stop() }
+    func animate(to target: CGFloat, animated: Bool) {
+        wipeAnimation?.stop()
+        if !animated { wipeAnimation = nil; progress = target; return }
+        wipeAnimation = TabWipeAnimation(from: progress, to: target) { [weak self] value, finished in
+            self?.progress = value
+            if finished { self?.wipeAnimation = nil }
+        }
+        wipeAnimation?.start()
     }
     var lineRect: NSRect {
         let inset = 5 + expansion * (TabSelectionRow.rowHeight - 5)
@@ -299,6 +337,38 @@ final class TabGroupRailView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         color.setFill()
         NSBezierPath(roundedRect: lineRect, xRadius: 1, yRadius: 1).fill()
+    }
+}
+
+final class TabRowWipe: NSView {
+    let tab: Tab
+    let position: Int
+    let following: UUID?
+    var closing: Bool
+    var transition = 0
+    var finished = false
+    var progress: CGFloat { didSet { if progress != oldValue { changed?() } } }
+    var changed: (() -> Void)?
+    private var wipeAnimation: TabWipeAnimation?
+    init(tab: Tab, position: Int, following: UUID? = nil, closing: Bool, height: CGFloat) {
+        self.tab = tab; self.position = position; self.following = following; self.closing = closing
+        progress = closing ? height / TabSelectionRow.rowHeight : 0
+        super.init(frame: .zero)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    deinit { wipeAnimation?.stop() }
+    func animate(to target: CGFloat, completion: @escaping @MainActor () -> Void) {
+        wipeAnimation?.stop()
+        transition += 1
+        finished = false
+        let revision = transition
+        wipeAnimation = TabWipeAnimation(from: progress, to: target) { [weak self] value, finished in
+            guard let self, self.transition == revision else { return }
+            self.progress = value
+            if finished { self.wipeAnimation = nil; completion() }
+        }
+        wipeAnimation?.start()
     }
 }
 
@@ -346,27 +416,22 @@ final class TabListContainer: NSView {
         let ids = Set(rails.map(\.id))
         for id in Array(railViews.keys) where !ids.contains(id) { railViews.removeValue(forKey: id)?.removeFromSuperview() }
         self.rails = rails
-        let duration = animated && window != nil && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ?
-            Self.groupAnimationDuration : 0
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = duration
-            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            for rail in rails {
-                let view: TabGroupRailView
-                if let existing = railViews[rail.id] { view = existing }
-                else {
-                    view = TabGroupRailView()
-                    view.rowOrigin = CGFloat(rail.rows.lowerBound) * TabSelectionRow.rowHeight
-                    railViews[rail.id] = view
-                    addSubview(view, positioned: .above, relativeTo: scroll)
-                }
-                view.retainedMemberHeight = rail.retained ? TabSelectionRow.rowHeight : 0
-                view.color = rail.color
-                view.expansion = expansion
-                if view.expanded != rail.expanded {
-                    view.expanded = rail.expanded
-                    view.animator().progress = rail.expanded ? 1 : 0
-                }
+        let animate = animated && window != nil && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        for rail in rails {
+            let view: TabGroupRailView
+            if let existing = railViews[rail.id] { view = existing }
+            else {
+                view = TabGroupRailView()
+                view.rowOrigin = CGFloat(rail.rows.lowerBound) * TabSelectionRow.rowHeight
+                railViews[rail.id] = view
+                addSubview(view, positioned: .above, relativeTo: scroll)
+            }
+            view.retainedMemberHeight = rail.retained ? TabSelectionRow.rowHeight : 0
+            view.color = rail.color
+            view.expansion = expansion
+            if view.expanded != rail.expanded {
+                view.expanded = rail.expanded
+                view.animate(to: rail.expanded ? 1 : 0, animated: animate)
             }
         }
         layoutRails()
@@ -453,9 +518,19 @@ final class TabCell: NSTableCellView {
                                   owner: self)
         addTrackingArea(tracking!)
     }
-    override func mouseEntered(with event: NSEvent) { setHovered(true) }
-    override func mouseExited(with event: NSEvent) { setHovered(false) }
-    func setHovered(_ value: Bool, animated: Bool = true) {
+    override func mouseEntered(with event: NSEvent) {
+        guard let table = enclosingScrollView?.documentView as? TabTable,
+              !table.animatingRows, !table.animatingGroups else { return }
+        setHovered(true)
+    }
+    override func mouseExited(with event: NSEvent) {
+        guard let table = enclosingScrollView?.documentView as? TabTable,
+              !table.animatingRows, !table.animatingGroups else { return }
+        setHovered(false)
+    }
+    func setHovered(_ value: Bool, animated: Bool = true, force: Bool = false) {
+        (superview as? TabSelectionRow)?.setPointerHovered(value)
+        guard hovered != value || force else { return }
         if value, let table = enclosingScrollView?.documentView as? TabTable {
             table.clearHover(except: self)
         }
@@ -496,6 +571,8 @@ final class TabCell: NSTableCellView {
     }
 
     func configure(_ tab: Tab, image: NSImage?, compact: Bool, expansion: CGFloat? = nil, dragPlaceholder: Bool = false) {
+        let compactChanged = self.compact != compact
+        let identityChanged = closeButton.identifier?.rawValue != tab.id.uuidString
         content.isHidden = dragPlaceholder
         setGroupExpansion(tab.groupID == nil ? 0 : (expansion ?? (compact ? 0 : 1)))
         if self.compact != compact {
@@ -505,7 +582,8 @@ final class TabCell: NSTableCellView {
             let revision = layoutRevision
             self.compact = compact
             titleClip.setAccessibilityHidden(compact)
-            let details = [pin, closeButton]
+            // The close button's visibility is owned by setHovered, including during sidebar transitions.
+            let details = [pin]
             if animate {
                 details.forEach { $0.isHidden = false }
                 NSAnimationContext.runAnimationGroup { context in
@@ -530,11 +608,13 @@ final class TabCell: NSTableCellView {
         pinWidth.constant = tab.pinned ? 9 : 0
         closeButton.identifier = NSUserInterfaceItemIdentifier(tab.id.uuidString)
         closeButton.toolTip = "关闭 \(tab.title)"
-        setHovered(hovered, animated: false)
+        setHovered(identityChanged ? false : hovered, animated: false, force: compactChanged)
         toolTip = tab.title + "\n" + tab.address
     }
     func setGroupExpansion(_ expansion: CGFloat) {
-        iconLeading.constant = 9 + 10 * expansion
+        let inset = 9 + 10 * expansion
+        guard abs(iconLeading.constant - inset) > 0.0001 else { return }
+        iconLeading.constant = inset
         layoutSubtreeIfNeeded()
     }
     func dragImage() -> NSImage {
@@ -789,7 +869,8 @@ struct NativeTabList: NSViewRepresentable {
 
     @MainActor final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         var store: Store
-        var tabs: [Tab] = []
+        var tabs: [Tab] = [] { didSet { tabByID = Dictionary(uniqueKeysWithValues: tabs.map { ($0.id, $0) }) } }
+        private var tabByID: [UUID: Tab] = [:]
         var rows: [TabListRow] = []
         var compact = false
         var expansion: CGFloat = 1
@@ -803,12 +884,31 @@ struct NativeTabList: NSViewRepresentable {
         private var groupDropValid = false
         private weak var table: TabTable?
         private var wipeRows: [Int: (view: TabGroupRailView, offset: Int, count: Int)] = [:]
+        private var rowWipes: [UUID: TabRowWipe] = [:]
+        private var rowIndexes: [UUID: Int] = [:]
+        private var rowHeights: [CGFloat] = []
+        private var wipeUpdatePending = false
+        private var lastTabs: [Tab]?
+        private var lastGroups: [TabGroup] = []
+        private var lastIcons: [UUID: NSImage] = [:]
+        private var lastSelection: UUID?
+        private var lastExpansion: CGFloat = -1
         private(set) var editor: NSPopover?
         init(store: Store) { self.store = store }
         func update(_ table: TabTable, compact: Bool, theme: ThemeColor) {
             updating = true
             defer { updating = false }
             self.table = table
+            // SwiftUI also calls this for each viewport-height frame; only changed data needs a new projection.
+            if table.dragID == nil, previewTabs == nil, draggingGroup == nil,
+               lastTabs == store.tabs, lastGroups == store.tabGroups, lastIcons == store.icons,
+               lastSelection == store.selected, self.compact == compact, table.theme == theme {
+                if lastExpansion != expansion {
+                    lastExpansion = expansion
+                    updateWipeHeights(table)
+                }
+                return
+            }
             if table.theme != theme {
                 table.theme = theme
                 table.enumerateAvailableRowViews { row, _ in
@@ -817,6 +917,25 @@ struct NativeTabList: NSViewRepresentable {
                 }
             }
             let incomingIDs = store.tabs.map(\.id)
+            var startingWipes: [TabRowWipe] = []
+            if !storeIDs.isEmpty, table.window != nil, table.dragID == nil,
+               !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
+               let container = table.enclosingScrollView?.superview {
+                let incoming = Set(incomingIDs), previous = Set(storeIDs)
+                for tab in tabs where !incoming.contains(tab.id) {
+                    guard let position = rows.firstIndex(of: .tab(tab.id)) else { continue }
+                    let height = table.rect(ofRow: position).height
+                    rowWipes.removeValue(forKey: tab.id)?.removeFromSuperview()
+                    let following = rows.indices.contains(position + 1) ? rows[position + 1].id : nil
+                    let wipe = TabRowWipe(tab: tab, position: position, following: following, closing: true, height: height)
+                    rowWipes[tab.id] = wipe; container.addSubview(wipe); startingWipes.append(wipe)
+                }
+                for tab in store.tabs where !previous.contains(tab.id) {
+                    let wipe = rowWipes[tab.id] ?? TabRowWipe(tab: tab, position: 0, closing: false, height: 0)
+                    wipe.closing = false
+                    rowWipes[tab.id] = wipe; container.addSubview(wipe); startingWipes.append(wipe)
+                }
+            }
             if table.dragID != nil && (incomingIDs != storeIDs || store.tabRows != storeRows ||
                                       store.tabs.map(\.groupID) != storeMembership) {
                 table.clearDrag(); previewTabs = nil; draggingGroup = nil; groupDropValid = false
@@ -841,7 +960,23 @@ struct NativeTabList: NSViewRepresentable {
                 table.clearHover()
             }
             self.compact = compact
+            lastTabs = store.tabs; lastGroups = store.tabGroups; lastIcons = store.icons
+            lastSelection = store.selected; lastExpansion = expansion
             render(table)
+            if !startingWipes.isEmpty { table.clearHover(); table.animatingRows = true }
+            for wipe in startingWipes {
+                wipe.changed = { [weak self, weak table, weak wipe] in
+                    guard let self, let table, let wipe, self.rowWipes[wipe.tab.id] === wipe else { return }
+                    self.scheduleWipeUpdate(table)
+                }
+            }
+            for wipe in startingWipes {
+                wipe.animate(to: wipe.closing ? 0 : 1) { [weak self, weak table, weak wipe] in
+                    guard let self, let table, let wipe, self.rowWipes[wipe.tab.id] === wipe else { return }
+                    wipe.finished = true
+                    self.scheduleWipeUpdate(table)
+                }
+            }
         }
 
         private func displayedRows(_ table: TabTable) -> [TabListRow] {
@@ -857,18 +992,24 @@ struct NativeTabList: NSViewRepresentable {
                     result.insert(contentsOf: members.map { .tab($0.id) }, at: header + 1)
                 }
             }
+            for wipe in rowWipes.values.filter(\.closing).sorted(by: { $0.position > $1.position }) {
+                let index = wipe.following.flatMap { next in result.firstIndex { $0.id == next } }
+                result.insert(.tab(wipe.tab.id), at: index ?? min(wipe.position, result.count))
+            }
             return result
         }
         private func render(_ table: TabTable) {
             let oldIDs = rows.map(\.id)
             rows = displayedRows(table)
+            rowIndexes = Dictionary(uniqueKeysWithValues: rows.enumerated().map { ($0.element.id, $0.offset) })
             let container = table.enclosingScrollView?.superview as? TabListContainer
             let newIDs = rows.map(\.id)
             table.ids = newIDs
             table.groupIDs = Set(store.openTabGroups.map(\.id))
             if let container {
                 container.railViews.values.forEach { $0.changed = nil }
-                let counts = tabs.reduce(into: [UUID: Int]()) { counts, tab in
+                let railTabs = tabs + rowWipes.values.filter(\.closing).map(\.tab)
+                let counts = railTabs.reduce(into: [UUID: Int]()) { counts, tab in
                     if let id = tab.groupID { counts[id, default: 0] += 1 }
                 }
                 container.updateRails(rows.indices.compactMap { start in
@@ -877,14 +1018,14 @@ struct NativeTabList: NSViewRepresentable {
                     let count = counts[id, default: 0]
                     var end = start
                     while end + 1 < rows.count, case .tab(let tabID) = rows[end + 1],
-                          tabs.first(where: { $0.id == tabID })?.groupID == id { end += 1 }
+                          displayedTab(tabID)?.groupID == id { end += 1 }
                     return count > 0 ? (id: id, rows: start...end, color: group.color.color,
                                         expanded: !group.collapsed && draggingGroup != id,
                                         retained: tabs.contains { $0.id == store.selected && $0.groupID == id }) : nil
                 }, animated: !oldIDs.isEmpty && table.dragID == nil)
                 wipeRows = [:]
                 var offsets: [UUID: Int] = [:]
-                let membership = Dictionary(uniqueKeysWithValues: tabs.map { ($0.id, $0.groupID) })
+                let membership = Dictionary(uniqueKeysWithValues: railTabs.map { ($0.id, $0.groupID) })
                 let selectedGroup = tabs.first { $0.id == store.selected }?.groupID
                 for (row, entry) in rows.enumerated() {
                     guard case .tab(let id) = entry, let groupID = membership[id] ?? nil,
@@ -910,7 +1051,7 @@ struct NativeTabList: NSViewRepresentable {
                 NSAnimationContext.runAnimationGroup { context in
                     // Disclosure already animates row heights; a second row-frame animation would rebound on reversal.
                     context.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ||
-                        (!table.groupIDs.isEmpty && table.dragID == nil) ? 0 : 0.2
+                        !rowWipes.isEmpty || (!table.groupIDs.isEmpty && table.dragID == nil) ? 0 : 0.2
                     context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
                     table.beginUpdates()
                     table.removeRows(at: removed, withAnimation: [])
@@ -923,9 +1064,12 @@ struct NativeTabList: NSViewRepresentable {
                             table.moveRow(at: source, to: destination)
                         }
                     }
-                } completionHandler: { [weak table] in
-                    guard let table, table.animationRevision == revision else { return }
-                    table.animatingRows = false
+                } completionHandler: { [weak self, weak table] in
+                    MainActor.assumeIsolated {
+                        guard let self, let table, table.animationRevision == revision else { return }
+                        table.animatingRows = !self.rowWipes.isEmpty
+                        table.refreshHover()
+                    }
                 }
             }
             if let selected = newIDs.firstIndex(where: { $0 == store.selected }) {
@@ -940,10 +1084,12 @@ struct NativeTabList: NSViewRepresentable {
                     }
                 }
             }
-            updateWipeHeights(table)
+            rowHeights = rows.indices.map { table.rect(ofRow: $0).height }
+            updateWipeHeights(table, allRows: true)
             container?.railViews.values.forEach { view in
                 view.changed = { [weak self, weak table, weak view] in
                     guard let self, let table, let view else { return }
+                    // The rail draws its progress directly, so its row geometry must update in the same callback.
                     if view.progress == 0 && !view.expanded {
                         let wasUpdating = self.updating
                         self.updating = true
@@ -956,15 +1102,45 @@ struct NativeTabList: NSViewRepresentable {
             // A zero-duration update can finish while progress callbacks are being reconfigured.
             if rows != displayedRows(table) { render(table) }
         }
-        private func updateWipeHeights(_ table: TabTable) {
+        private func scheduleWipeUpdate(_ table: TabTable) {
+            guard !wipeUpdatePending else { return }
+            wipeUpdatePending = true
+            DispatchQueue.main.async { [weak self, weak table] in
+                guard let self, let table else { return }
+                self.wipeUpdatePending = false
+                let finished = self.rowWipes.values.filter(\.finished)
+                for wipe in finished {
+                    wipe.changed = nil
+                    self.rowWipes[wipe.tab.id] = nil
+                    wipe.removeFromSuperview()
+                }
+                let wasUpdating = self.updating
+                self.updating = true
+                if !finished.isEmpty { self.render(table) }
+                else { self.updateWipeHeights(table) }
+                self.updating = wasUpdating
+                table.animatingRows = !self.rowWipes.isEmpty
+                table.refreshHover()
+            }
+        }
+        private func updateWipeHeights(_ table: TabTable, allRows: Bool = false) {
             let wasUpdating = updating
             updating = true
             defer { updating = wasUpdating }
             let container = table.enclosingScrollView?.superview as? TabListContainer
+            let groupsWereAnimating = table.animatingGroups
             table.animatingGroups = container?.railViews.values.contains { $0.progress != ($0.expanded ? 1 : 0) } == true
-            let changed = IndexSet(rows.indices.filter {
-                $0 < table.numberOfRows && abs(table.rect(ofRow: $0).height - tableView(table, heightOfRow: $0)) > 0.0001
-            })
+            if !groupsWereAnimating && table.animatingGroups { table.clearHover() }
+            var candidates = allRows ? IndexSet(rows.indices) : IndexSet(wipeRows.keys)
+            for id in rowWipes.keys { if let row = rowIndexes[id] { candidates.insert(row) } }
+            var changed = IndexSet()
+            for row in candidates where row < rowHeights.count && row < table.numberOfRows {
+                let height = tableView(table, heightOfRow: row)
+                if abs(rowHeights[row] - height) > 0.0001 {
+                    rowHeights[row] = height
+                    changed.insert(row)
+                }
+            }
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = 0
                 if !changed.isEmpty { table.noteHeightOfRows(withIndexesChanged: changed) }
@@ -977,8 +1153,12 @@ struct NativeTabList: NSViewRepresentable {
                 }
             }
             container?.updateRailOrigins()
+            if groupsWereAnimating && !table.animatingGroups { table.refreshHover() }
         }
         func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+            if rows.indices.contains(row), let wipe = rowWipes[rows[row].id] {
+                return max(0.001, TabSelectionRow.rowHeight * wipe.progress)
+            }
             guard let wipe = wipeRows[row] else { return TabSelectionRow.rowHeight }
             return max(0.001, min(TabSelectionRow.rowHeight,
                 (CGFloat(wipe.count) * wipe.view.progress - CGFloat(wipe.offset)) * TabSelectionRow.rowHeight))
@@ -1008,13 +1188,16 @@ struct NativeTabList: NSViewRepresentable {
         }
         func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
         private func decorate(_ view: TabSelectionRow, row: Int) {
-            view.groupColor = nil; view.extraLeadingInset = 0
+            var color: NSColor?
+            var inset: CGFloat = 0
             if rows.indices.contains(row), case .tab(let id) = rows[row],
-               let groupID = tabs.first(where: { $0.id == id })?.groupID,
+               let groupID = displayedTab(id)?.groupID,
                let group = store.tabGroups.first(where: { $0.id == groupID }) {
-                view.groupColor = compact || groupExpansion(id) == 0 ? nil : group.color.color
-                view.extraLeadingInset = 7 * groupExpansion(id)
+                color = compact || groupExpansion(id) == 0 ? nil : group.color.color
+                inset = 7 * groupExpansion(id)
             }
+            guard view.groupColor != color || view.extraLeadingInset != inset else { return }
+            view.groupColor = color; view.extraLeadingInset = inset
             view.needsDisplay = true
         }
         func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
@@ -1081,10 +1264,10 @@ struct NativeTabList: NSViewRepresentable {
             }
         }
         private func displayedTab(_ id: UUID) -> Tab? {
-            tabs.first { $0.id == id }
+            tabByID[id] ?? rowWipes[id]?.tab
         }
         private func groupExpansion(_ id: UUID) -> CGFloat {
-            guard let groupID = tabs.first(where: { $0.id == id })?.groupID,
+            guard let groupID = displayedTab(id)?.groupID,
                   let container = table?.enclosingScrollView?.superview as? TabListContainer,
                   let rail = container.railViews[groupID] else { return 0 }
             return expansion * rail.progress

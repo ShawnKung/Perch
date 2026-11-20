@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 failures = []
 titles = set()
@@ -58,7 +59,7 @@ class Provider(BaseHTTPRequestHandler):
             if self.path == "/nav/auth-icon":
                 self.send_header("Set-Cookie", "fixture_icon=allowed; HttpOnly; Path=/; SameSite=Lax")
             self.end_headers()
-            page = self.path.rsplit("/", 1)[-1]
+            page = urlsplit(self.path).path.rsplit("/", 1)[-1]
             html = "<title>" + page + "</title><p>" + page + "</p>"
             if page == "auth-icon":
                 html += '<link rel="icon" href="/nav/auth-icon.png">'
@@ -707,7 +708,8 @@ class Provider(BaseHTTPRequestHandler):
 
 server = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
 threading.Thread(target=server.serve_forever, daemon=True).start()
-navigation = "--navigation" in sys.argv
+navigation_ui = "--navigation-ui" in sys.argv
+navigation = "--navigation" in sys.argv or navigation_ui
 search_only = "--search-only" in sys.argv
 composer_only = "--composer-only" in sys.argv
 files_only = "--files-only" in sys.argv
@@ -716,6 +718,9 @@ streaming_only = "--streaming-only" in sys.argv
 background_only = "--background-only" in sys.argv
 arguments = ["--navigation-self-test" if navigation else "--ai-background-self-test" if background_only else "--ai-streaming-self-test" if streaming_only else "--ai-experience-self-test" if experience_only else "--ai-files-self-test" if files_only else "--ai-search-self-test" if search_only else "--ai-composer-self-test" if composer_only else "--ai-self-test", f"http://127.0.0.1:{server.server_port}"]
 result = subprocess.run([sys.argv[1]] + arguments, timeout=120)
+if result.returncode == 0 and navigation_ui:
+    result = subprocess.run([sys.argv[1], "--ui-preview", "--verify-preview", "--verify-home-navigation",
+                             f"http://127.0.0.1:{server.server_port}"], timeout=60)
 server.shutdown()
 if not navigation and not search_only and not composer_only and not files_only and not experience_only and not streaming_only and not background_only and (title_counts.get("hello fixture") != 1 or "Remember attachment fixture" in titles or "Replacement attachment fixture" in titles):
     failures.append("Conversation title was not generated exactly once")

@@ -47,6 +47,49 @@ enum SelfTests {
         }
         print("PASS: bounded suggestions, strict bookmark priority, sparse history fallback, Unicode multiword matching, URL deduplication and invalid URL rejection")
     }
+    @MainActor static func tabContents() throws {
+        let suite = "dev.perch.content-tests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = Store(defaults: defaults)
+        store.tabs = (0..<180).map { Tab(title: "内容 \($0)", address: "") }
+        let first = store.tabs[0].id, second = store.tabs[100].id
+        store.homeAddressDrafts[first] = [true: "保留草稿"]
+        store.activate(first)
+        let controller = TabContentsController()
+        controller.update(store: store, controlsInset: 0)
+        precondition(controller.tabViewItems.count == 1, "Unvisited tabs must not create content controllers")
+        let original = controller.tabViewItems[0].viewController!
+        let page = (original as! NSHostingController<TabContentView>).rootView.page
+        var updates = 0
+        let observation = page.objectWillChange.sink { updates += 1 }
+        defer { observation.cancel() }
+        store.activate(second)
+        controller.update(store: store, controlsInset: 0)
+        precondition(controller.tabViewItems.count == 2)
+        let inactiveUpdates = updates
+        store.tabs[0].title = "后台更新"
+        store.pendingAddressFocus = second
+        precondition(updates == inactiveUpdates, "Inactive page roots must not render unrelated Store changes")
+        store.activate(first)
+        precondition(updates > inactiveUpdates, "Returning to a retained page must refresh its current Store state")
+        controller.update(store: store, controlsInset: 24)
+        precondition(controller.tabViewItems[controller.selectedTabViewItemIndex].viewController === original,
+                     "Returning to a visited tab must retain its controller")
+        precondition((original as! NSHostingController<TabContentView>).rootView.controlsInset == 24)
+        store.close(second)
+        controller.update(store: store, controlsInset: 24)
+        precondition(controller.tabViewItems.count == 1 && controller.tabViewItems[0].viewController === original)
+        store.newTab()
+        controller.update(store: store, controlsInset: 24)
+        let empty = controller.tabViewItems[controller.selectedTabViewItemIndex].viewController!
+        store.newTab()
+        controller.update(store: store, controlsInset: 24)
+        precondition(controller.tabViewItems.count == 2 &&
+                     controller.tabViewItems[controller.selectedTabViewItemIndex].viewController === empty,
+                     "Pristine new homes should reuse one hosting controller")
+        print("PASS: lazy tab content creation, visited-controller retention, layout updates and closed-controller cleanup")
+    }
     @MainActor
     static func keychainUpgrade(write: Bool) throws {
         guard let service = ProcessInfo.processInfo.environment["PERCH_KEYCHAIN_TEST_SERVICE"],
@@ -92,6 +135,7 @@ enum SelfTests {
         try AISelfCheck.conversationPreferences()
         try addressSuggestions()
         try databaseSnapshot()
+        try tabContents()
         let source = NSRect(x: 0, y: 25, width: 1440, height: 875)
         let target = NSRect(x: -1920, y: 100, width: 1920, height: 1040)
         let original = NSRect(x: 320, y: 182.5, width: 800, height: 560)
@@ -151,6 +195,20 @@ enum SelfTests {
         store.close(b)
         precondition(store.tabs.count == 2)
         precondition(Store(defaults: defaults).tabs.count == 2)
+        let existing = store.tabs.map(\.id)
+        store.activate(existing[0])
+        store.newTab(); let recent = store.selected!
+        store.activate(existing[1])
+        store.activate(recent)
+        store.close(recent)
+        precondition(store.selected == existing[1], "Closing returns to the most recently active tab, independent of row order")
+        store.newTab(); let inactive = store.selected!
+        store.activate(existing[1])
+        store.close(inactive)
+        precondition(store.selected == existing[1], "Closing an inactive tab preserves selection")
+        store.close(existing[1])
+        precondition(store.selected == existing[0], "Closed tabs are pruned from activation history")
+        print("PASS: tab closing restores activation history and preserves selection when closing inactive tabs")
         store.mergeHistory([Visit(title: "Example", address: "https://example.com", date: Date(timeIntervalSince1970: 123456))])
         store.mergeHistory(store.history)
         precondition(store.history.count == 1)
@@ -1048,6 +1106,10 @@ final class LayoutSelfCheck {
         Task { @MainActor in
             if preview {
                 await settle()
+                if let index = CommandLine.arguments.firstIndex(of: "--verify-home-navigation"),
+                   CommandLine.arguments.count > index + 1 {
+                    await verifyHomeNavigation(baseURL: CommandLine.arguments[index + 1])
+                }
                 if CommandLine.arguments.contains("--verify-sidebar-animation") {
                     await verifySidebarAnimation()
                     print("PASS: ordinary icons stay fixed; group icons, highlights and rendered rails animate together through reversal")
@@ -1055,6 +1117,15 @@ final class LayoutSelfCheck {
                 }
                 if CommandLine.arguments.contains("--verify-group-transition") {
                     await verifyGroupTransition()
+                }
+                if CommandLine.arguments.contains("--verify-tab-closing") {
+                    await verifyTabClosing()
+                }
+                if CommandLine.arguments.contains("--verify-tab-performance") {
+                    await verifyTabPerformance()
+                }
+                if CommandLine.arguments.contains("--verify-tab-burst") {
+                    await verifyTabBurst()
                 }
                 if CommandLine.arguments.contains("--compact") && CommandLine.arguments.contains("--verify-preview") {
                     verify(width: 32)
@@ -1239,7 +1310,10 @@ final class LayoutSelfCheck {
         for _ in 0..<60 where !NSApp.isActive || !panel.isKeyWindow {
             try? await Task.sleep(nanoseconds: 16_000_000)
         }
-        precondition(NSApp.isActive && panel.isKeyWindow, "Native click checks require an active isolated window")
+        guard NSApp.isActive && panel.isKeyWindow else {
+            fputs("FAIL: native click checks require an active isolated window: active=\(NSApp.isActive), key=\(panel.isKeyWindow)\n", stderr)
+            exit(1)
+        }
         // Queue the release for AppKit's tracking loop, then dispatch the press before sampling.
         NSApp.postEvent(NSEvent.mouseEvent(with: .leftMouseUp, location: point, modifierFlags: [],
             timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber,
@@ -1925,6 +1999,94 @@ final class LayoutSelfCheck {
         }
         return find(panel.contentView!)!
     }
+    func verifyHomeNavigation(baseURL: String) async {
+        SelfTests.prepareAccessibility()
+        func clickAccessible(_ label: String) async throws {
+            var visited = Set<ObjectIdentifier>()
+            func find(_ node: NSObject) -> NSRect? {
+                guard visited.insert(ObjectIdentifier(node)).inserted else { return nil }
+                if node.responds(to: NSSelectorFromString("accessibilityLabel")),
+                   node.value(forKey: "accessibilityLabel") as? String == label,
+                   node.responds(to: NSSelectorFromString("accessibilityPerformPress")),
+                   node.responds(to: NSSelectorFromString("accessibilityFrame")),
+                   let frame = node.value(forKey: "accessibilityFrame") as? NSValue { return frame.rectValue }
+                var children: [NSObject] = (node as? NSView)?.subviews ?? []
+                if node.responds(to: NSSelectorFromString("accessibilityChildren")),
+                   let accessible = node.value(forKey: "accessibilityChildren") as? [NSObject] { children += accessible }
+                for child in children { if let frame = find(child) { return frame } }
+                return nil
+            }
+            guard let rect = find(panel.contentView!), !rect.isEmpty else { throw PerchError("Missing native button: \(label)") }
+            await clickInPanel(panel.convertPoint(fromScreen: NSPoint(x: rect.midX, y: rect.midY)))
+        }
+        do {
+            guard URL(string: baseURL)?.host == "127.0.0.1" else { throw PerchError("Home UI fixture must use loopback") }
+            let id = store.selected!
+            store.settings.searchEngine = "custom"
+            store.settings.customSearchURL = baseURL + "/nav/a?q={query}"
+            for home in [true, false] {
+                let field = home ? homeAddressField() : addressField()
+                panel.focusWindow()
+                panel.makeFirstResponder(field)
+                let editor = field.currentEditor() as! NSTextView
+                let draft = home ? "  " + baseURL + "/nav/a  " : "  合成 搜索词  "
+                editor.selectAll(nil)
+                editor.insertText(draft, replacementRange: NSRange(location: NSNotFound, length: 0))
+                await Task.yield()
+                for type in [NSEvent.EventType.keyDown, .keyUp] {
+                    NSApp.sendEvent(NSEvent.keyEvent(with: type, location: .zero, modifierFlags: [],
+                        timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber,
+                        context: nil, characters: "\r", charactersIgnoringModifiers: "\r",
+                        isARepeat: false, keyCode: 36)!)
+                }
+                try await AISelfCheck.wait(timeout: 10) { self.store.browser?.webView.title == "a" && self.store.browser?.canGoBack == true }
+                await settle()
+                guard addressField().currentEditor() == nil else {
+                    throw PerchError("Submitted address stole focus after navigation, central=\(home), responder=\(String(describing: panel.firstResponder)), input=\(addressField().stringValue)")
+                }
+                try await clickAccessible("后退")
+                try await AISelfCheck.wait(timeout: 10) { self.store.browser == nil }
+                await settle()
+                let restored = home ? homeAddressField() : addressField()
+                guard store.selected == id, restored.stringValue == draft else { throw PerchError("Native home input did not survive back") }
+                try await clickAccessible("前进")
+                try await AISelfCheck.wait(timeout: 10) { self.store.browser?.webView.title == "a" }
+                store.cachedBrowser(for: id)?.goBack()
+                try await AISelfCheck.wait(timeout: 10) { self.store.browser == nil }
+                await settle()
+            }
+            let site = Site(title: "首页合成书签", address: baseURL + "/nav/b")
+            store.sites = [site]
+            await settle()
+            var visited = Set<ObjectIdentifier>()
+            func bookmark(_ node: NSObject) -> NSObject? {
+                guard visited.insert(ObjectIdentifier(node)).inserted else { return nil }
+                if node.responds(to: NSSelectorFromString("accessibilityLabel")),
+                   (node.value(forKey: "accessibilityLabel") as? String)?.contains(site.title) == true,
+                   node.responds(to: NSSelectorFromString("accessibilityPerformPress")),
+                   node.responds(to: NSSelectorFromString("accessibilityFrame")) { return node }
+                var children: [NSObject] = (node as? NSView)?.subviews ?? []
+                if node.responds(to: NSSelectorFromString("accessibilityChildren")),
+                   let accessible = node.value(forKey: "accessibilityChildren") as? [NSObject] { children += accessible }
+                for child in children { if let result = bookmark(child) { return result } }
+                return nil
+            }
+            guard let button = bookmark(panel.contentView!),
+                  let frame = button.value(forKey: "accessibilityFrame") as? NSValue else { throw PerchError("Home bookmark has no native hit target") }
+            let count = store.tabs.count
+            let rect = frame.rectValue
+            await clickInPanel(panel.convertPoint(fromScreen: NSPoint(x: rect.midX, y: rect.midY)))
+            try await AISelfCheck.wait(timeout: 10) { self.store.browser?.webView.title == "b" }
+            guard store.selected == id, store.tabs.count == count else { throw PerchError("Home bookmark click opened another tab") }
+            store.browser?.goBack()
+            try await AISelfCheck.wait(timeout: 10) { self.store.browser == nil }
+            await settle()
+            guard homeAddressField().stringValue.contains("/nav/a"),
+                  addressField().stringValue == "  合成 搜索词  " else { throw PerchError("Bookmark back lost home inputs") }
+            print("PASS: native Return submission, actual back/forward clicks and restored central/toolbar input")
+            print("PASS: actual home bookmark click reuses its tab and back preserves both inputs")
+        } catch { fputs("FAIL: home navigation UI: \(error)\n", stderr); exit(1) }
+    }
     func editAddress(_ text: String) {
         let field = addressField()
         panel.makeFirstResponder(field)
@@ -1998,7 +2160,7 @@ final class LayoutSelfCheck {
         print("PASS: page reference opens within Perch and reuses an existing tab")
     }
     func verifyAddressComposition() async {
-        let host = NSHostingView(rootView: HomeScreen(store: store).defaultAppStorage(defaults))
+        let host = NSHostingView(rootView: HomeScreen(store: store, tabID: store.selected ?? AIController.homeID).defaultAppStorage(defaults))
         let window = NSWindow(contentRect: NSRect(x: 150, y: 180, width: 780, height: 580),
                               styleMask: [.titled], backing: .buffered, defer: false)
         window.contentView = host; window.makeKeyAndOrderFront(nil)
@@ -2294,7 +2456,8 @@ final class LayoutSelfCheck {
         flags(.option)
         await settle()
         guard let preview = trigger.preview else {
-            fputs("FAIL: holding Alt on a link must present a preview\n", stderr); exit(1)
+            let point = browser.webView.convert(NSPoint(x: 80, y: 80), to: nil)
+            fputs("FAIL: holding Alt on a link must present a preview; active=\(NSApp.isActive), key=\(panel.isKeyWindow), attached=\(browser.webView.window === panel), visible=\(browser.webView.visibleRect), point=\(point), site=\(browser.hoverLinks?.site?.address ?? "nil"), selected=\(store.selected == tab), enabled=\(store.settings.linkPreviewEnabled), delay=\(store.settings.linkPreviewDelay)\n", stderr); exit(1)
         }
         check(preview.window.parent === panel && preview.browser.hoverLinks == nil &&
               preview.browser.onVisit == nil && !preview.browser.webView.configuration.websiteDataStore.isPersistent,
@@ -2597,11 +2760,16 @@ final class LayoutSelfCheck {
         print("PASS: settings open without numeric focus; actual clicks retain input focus inside the field, blur on whitespace and save the decimal")
     }
     func run() async {
+        setbuf(stdout, nil)
         func check(_ condition: @autoclosure () -> Bool, _ message: String, line: UInt = #line) {
             guard condition() else {
                 fputs("FAIL: UI interaction at line \(line): \(message)\n", stderr); exit(1)
             }
         }
+        func precondition(_ condition: @autoclosure () -> Bool, _ message: String = "", line: UInt = #line) {
+            check(condition(), message, line: line)
+        }
+        if !CommandLine.arguments.contains("--verify-address-input") {
         await settle()
         if defaults.bool(forKey: "sidebarHidden") { verify(width: 32) }
         await verifySidebarAnimation()
@@ -2808,6 +2976,7 @@ final class LayoutSelfCheck {
         store.tabs = shortTabs
         await settle()
         precondition(!table().enclosingScrollView!.hasVerticalScroller)
+        }
         NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
         panel.focusWindow()
         await settle()
@@ -2898,9 +3067,11 @@ final class LayoutSelfCheck {
         await settle()
         precondition(coordinator.control(field, textView: NSTextView(), doCommandBy: NSSelectorFromString("moveDown:")))
         await settle()
-        precondition(coordinator.control(field, textView: NSTextView(), doCommandBy: NSSelectorFromString("insertNewline:")))
+        let suggestionEditor = field.currentEditor() as! NSTextView
+        suggestionEditor.doCommand(by: #selector(NSResponder.insertNewline(_:)))
         precondition(store.tabs.first(where: { $0.id == store.selected })?.address == "http://127.0.0.1:9/suggestion-fixture")
         print("PASS: native address focus, retained dropdown during typing, empty-input dismissal, async suggestions, rapid edits, Escape cancellation, mutation invalidation and arrow/Enter navigation")
+        if CommandLine.arguments.contains("--verify-address-input") { return }
         let delegate = AppDelegate(store: store)
         delegate.panel = panel
         delegate.installMenu()
@@ -2934,6 +3105,289 @@ final class LayoutSelfCheck {
         print("PASS: native menu shortcuts for reload, forced reload, page zoom, find and tab switching")
         await verifySettingsFocus()
         print("PASS: real root layout keeps sidebar width through tab insert/remove/reorder/reopen; rounded rows, icon rail and inactive-window activation")
+    }
+    private func verifyTabClosing() async {
+        SelfTests.prepareAccessibility()
+        func check(_ condition: @autoclosure () -> Bool, _ message: String) {
+            if !condition() { fputs("FAIL: tab closing: \(message)\n", stderr); exit(1) }
+        }
+        let savedTabs = store.tabs, savedGroups = store.tabGroups, savedSelection = store.selected
+        let savedClosed = store.recentlyClosed
+        func plusY() -> CGFloat {
+            var visited = Set<ObjectIdentifier>()
+            func find(_ node: NSObject) -> CGFloat? {
+                guard visited.insert(ObjectIdentifier(node)).inserted else { return nil }
+                if node.responds(to: NSSelectorFromString("accessibilityLabel")),
+                   node.value(forKey: "accessibilityLabel") as? String == "新建标签页",
+                   node.responds(to: NSSelectorFromString("accessibilityFrame")),
+                   let frame = node.value(forKey: "accessibilityFrame") as? NSValue { return frame.rectValue.midY }
+                var children: [NSObject] = (node as? NSView)?.subviews ?? []
+                if node.responds(to: NSSelectorFromString("accessibilityChildren")),
+                   let accessible = node.value(forKey: "accessibilityChildren") as? [NSObject] { children += accessible }
+                for child in children { if let result = find(child) { return result } }
+                return nil
+            }
+            guard let y = find(panel.contentView!) else { fputs("FAIL: new-tab button frame unavailable\n", stderr); exit(1) }
+            return y
+        }
+        for grouped in [false, true] {
+            store.tabs = (0..<4).map { Tab(title: "关闭动画 \($0)", address: "") }
+            store.tabGroups = []
+            let ids = store.tabs.map(\.id)
+            if grouped {
+                let group = store.createTabGroup(ids[0])!
+                for id in ids.dropFirst() { store.moveTab(id, to: store.tabs.count, groupID: group) }
+            }
+            store.activate(ids[3])
+            store.activate(ids[1])
+            await settle()
+            let list = table()
+            let plusStart = plusY()
+            store.newTab()
+            let added = store.selected!
+            var plusOpeningFrames = 0
+            for _ in 0..<24 {
+                try? await Task.sleep(nanoseconds: 16_000_000)
+                let y = plusY()
+                if y < plusStart - 0.5 && y > plusStart - TabSelectionRow.rowHeight + 0.5 { plusOpeningFrames += 1 }
+            }
+            if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                check(plusOpeningFrames > 0, "The new-tab button must move through intermediate positions on insertion")
+            }
+            store.activate(ids[3]); store.activate(ids[1])
+            await settle()
+            let index = list.ids.firstIndex(of: ids[1])!
+            let cell = list.view(atColumn: 0, row: index, makeIfNecessary: true) as! TabCell
+            cell.mouseEntered(with: NSEvent.enterExitEvent(with: .mouseEntered,
+                location: cell.convert(NSPoint(x: cell.bounds.midX, y: cell.bounds.midY), to: nil),
+                modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: panel.windowNumber, context: nil, eventNumber: 1, trackingNumber: 0, userData: nil)!)
+            await settle()
+            check(cell.closeButton.isEnabled && !cell.closeButton.isHidden, "Hover must expose the close button")
+            let followingID = list.ids[index + 1]
+            let startY = list.rect(ofRow: index + 1).minY
+            let button = cell.closeButton
+            let plusBeforeClose = plusY()
+            let clickStarted = ProcessInfo.processInfo.systemUptime
+            await clickInPanel(button.convert(NSPoint(x: button.bounds.midX, y: button.bounds.midY), to: nil))
+            let clickElapsed = ProcessInfo.processInfo.systemUptime - clickStarted
+            var retainedFrames = 0, movingFrames = 0, plusClosingFrames = 0
+            var minY = startY, maxY = startY
+            var positions: [String] = []
+            for _ in 0..<24 {
+                try? await Task.sleep(nanoseconds: 16_000_000)
+                if cell.window === panel && !cell.visibleRect.isEmpty { retainedFrames += 1 }
+                let followingIndex = list.ids.firstIndex(of: followingID)!
+                let y = list.rect(ofRow: followingIndex).minY
+                positions.append(String(format: "%.3f:%.1f", ProcessInfo.processInfo.systemUptime - clickStarted, y))
+                minY = min(minY, y); maxY = max(maxY, y)
+                if y < startY - 0.5 && y > startY - TabSelectionRow.rowHeight + 0.5 { movingFrames += 1 }
+                let plus = plusY()
+                if plus > plusBeforeClose + 0.5 && plus < plusBeforeClose + TabSelectionRow.rowHeight - 0.5 { plusClosingFrames += 1 }
+                if list.animatingRows {
+                    let moving = list.view(atColumn: 0, row: min(index + 1, list.numberOfRows - 1), makeIfNecessary: true) as! TabCell
+                    let event = NSEvent.enterExitEvent(with: .mouseEntered, location: .zero, modifierFlags: [],
+                        timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber,
+                        context: nil, eventNumber: 1, trackingNumber: 0, userData: nil)!
+                    moving.mouseEntered(with: event)
+                    check(!moving.hovered, "Moving rows must not flash hover highlights")
+                    moving.mouseExited(with: event)
+                }
+            }
+            check(!store.tabs.contains { $0.id == ids[1] }, "The close button must remove its tab")
+            check(store.selected == ids[3], "The close button must restore the previously active tab")
+            check(!list.ids.contains(ids[1]) && !list.animatingRows,
+                  "Row removal must finish: retained=\(list.ids.contains(ids[1])), animating=\(list.animatingRows), updating=\((list.delegate as! NativeTabList.Coordinator).updating)")
+            if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                check(retainedFrames > 0, "Outgoing tab content must remain visible during removal, grouped=\(grouped)")
+                check(movingFrames > 0, "Remaining rows must move through intermediate positions, grouped=\(grouped), start=\(startY), range=\(minY)...\(maxY), click=\(clickElapsed), retained=\(retainedFrames), plus=\(plusClosingFrames), positions=\(positions)")
+                check(plusClosingFrames > 0, "The new-tab button must follow the closing wipe continuously")
+            }
+            store.close(ids[0]); store.close(ids[2]); store.close(added)
+            await settle()
+            check(store.selected == ids[3] && list.ids.contains(ids[3]), "Rapid inactive closures must preserve the active tab")
+            if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                store.newTab()
+                let reversed = store.selected!
+                await settle()
+                let restoredTab = store.tabs.first { $0.id == reversed }!
+                store.close(reversed)
+                try? await Task.sleep(nanoseconds: 70_000_000)
+                let row = list.ids.firstIndex(of: reversed)!
+                let before = list.rect(ofRow: row).height
+                // Exercise the row animator's identity-preserving reversal; Store.reopen intentionally creates a new tab.
+                store.tabs.append(restoredTab)
+                store.activate(reversed)
+                try? await Task.sleep(nanoseconds: 16_000_000)
+                let after = list.rect(ofRow: list.ids.firstIndex(of: reversed)!).height
+                check(before > 0 && after >= before - 2 && abs(after - before) < 8,
+                      "Restoring a row during removal must continue from the displayed height")
+                await settle()
+                check(list.rect(ofRow: list.ids.firstIndex(of: reversed)!).height == TabSelectionRow.rowHeight,
+                      "The reversed wipe must finish at full height")
+            }
+        }
+        store.tabs = savedTabs; store.tabGroups = savedGroups; store.selected = savedSelection
+        store.recentlyClosed = savedClosed
+        await settle()
+        print("PASS: native close-button wipes, continuous insertion/removal of the new-tab button, stable moving-row hover and activation history")
+        fflush(stdout)
+    }
+    private func verifyTabBurst() async {
+        SelfTests.prepareAccessibility()
+        let savedTabs = store.tabs, savedGroups = store.tabGroups, savedSelection = store.selected
+        store.tabs = (0..<12).map { Tab(title: "连续新建 \($0)", address: "") }
+        store.tabGroups = []
+        let first = store.tabs[0].id
+        store.homeAddressDrafts[first] = [true: "toolbar draft", false: "central draft"]
+        store.activate(first)
+        await settle()
+        func fields(_ view: NSView) -> [AddressTextField.Field] {
+            (view as? AddressTextField.Field).map { [$0] } ?? view.subviews.flatMap(fields)
+        }
+        let originalFields = fields(panel.contentView!)
+        precondition(originalFields.count == 2 && originalFields.allSatisfy { $0.ownerTab == first })
+        for grouped in [false, true] {
+            if grouped { _ = store.createTabGroup(store.selected!) }
+            await settle()
+            var gaps: [Double] = [], operations: [Double] = []
+            var previous = ProcessInfo.processInfo.systemUptime
+            // A new selected homepage arrives before the preceding 280ms wipe finishes.
+            for tick in 0..<120 {
+                if tick % 4 == 0 {
+                    let start = ProcessInfo.processInfo.systemUptime
+                    store.newTab()
+                    operations.append((ProcessInfo.processInfo.systemUptime - start) * 1000)
+                }
+                try? await Task.sleep(nanoseconds: 16_000_000)
+                let now = ProcessInfo.processInfo.systemUptime
+                gaps.append((now - previous) * 1000)
+                previous = now
+            }
+            await settle()
+            let list = table()
+            precondition(!list.animatingRows && Set(list.ids).count == list.ids.count)
+            precondition(list.ids == store.tabRows.map(\.id))
+            func controller(_ view: NSView) -> TabContentsController? {
+                if let found = view.nextResponder as? TabContentsController { return found }
+                return view.subviews.lazy.compactMap(controller).first
+            }
+            precondition(controller(panel.contentView!)?.tabViewItems.count == 2,
+                         "Continuous pristine homes must share one controller while the original draft retains its own")
+            let sorted = gaps.sorted()
+            print(String(format: "MEASURE: burst grouped=%@, tabs=%d, interval median=%.1f p95=%.1f max=%.1f ms, newTab max=%.1f ms",
+                         String(grouped), store.tabs.count, sorted[sorted.count / 2],
+                         sorted[Int(Double(sorted.count - 1) * 0.95)], sorted.last!, operations.max()!))
+            fflush(stdout)
+        }
+        let scrolledHome = store.selected!
+        let savedSites = store.sites
+        store.sites = (0..<40).map { Site(title: "滚动保留 \($0)", address: "https://scroll-\($0).invalid") }
+        await settle()
+        var ancestor: NSView? = fields(panel.contentView!).first { $0.identifier?.rawValue == "homeAddress" }
+        while ancestor != nil && !(ancestor is NSScrollView) { ancestor = ancestor?.superview }
+        guard let scroll = ancestor as? NSScrollView else {
+            fputs("FAIL: burst homepage scroll view unavailable\n", stderr); exit(1)
+        }
+        scroll.contentView.scroll(to: NSPoint(x: 0, y: 160))
+        scroll.reflectScrolledClipView(scroll.contentView)
+        let position = scroll.contentView.bounds.origin
+        precondition(position.y > 0)
+        store.newTab()
+        await settle()
+        store.activate(scrolledHome)
+        await settle()
+        precondition(scroll.window === panel && scroll.contentView.bounds.origin == position,
+                     "Scrolled homepages must retain their own controller and reading position")
+        store.sites = savedSites
+        store.activate(first)
+        await settle()
+        let returnedFields = fields(panel.contentView!)
+        precondition(Set(originalFields.map(ObjectIdentifier.init)) == Set(returnedFields.map(ObjectIdentifier.init)),
+                     "New tabs must not recreate the retained homepage's input fields")
+        precondition(returnedFields.allSatisfy { $0.ownerTab == first })
+        precondition(returnedFields.first { $0.identifier?.rawValue == "toolbarAddress" }?.stringValue == "toolbar draft")
+        precondition(returnedFields.first { $0.identifier?.rawValue == "homeAddress" }?.stringValue == "central draft")
+        store.tabs = savedTabs; store.tabGroups = savedGroups; store.selected = savedSelection
+        await settle()
+        print("PASS: overlapping selected-homepage insertions, retained input identity, ownership, drafts and homepage scroll")
+    }
+    private func verifyTabPerformance() async {
+        func check(_ condition: Bool, _ message: String) {
+            if !condition { fputs("FAIL: tab performance: \(message)\n", stderr); exit(1) }
+        }
+        let savedTabs = store.tabs, savedGroups = store.tabGroups, savedSelection = store.selected
+        for count in [12, 180] {
+            store.tabs = (0..<count).map { Tab(title: "性能 \($0)", address: "") }
+            store.tabGroups = []
+            store.activate(store.tabs[0].id)
+            await settle()
+            let list = table(), coordinator = table().delegate as! NativeTabList.Coordinator
+            let start = ProcessInfo.processInfo.systemUptime
+            for _ in 0..<60 { coordinator.update(list, compact: false, theme: PerchTheme.shared.selection) }
+            let elapsed = (ProcessInfo.processInfo.systemUptime - start) * 1000 / 60
+            print("MEASURE: \(count) tabs, unchanged sidebar update \(String(format: "%.3f", elapsed)) ms")
+            fflush(stdout)
+            for grouped in [false, true] {
+                if grouped {
+                    let group = store.createTabGroup(store.tabs[0].id)!
+                    for id in store.tabs.dropFirst().map(\.id) { store.moveTab(id, to: store.tabs.count, groupID: group) }
+                    await settle()
+                }
+                for _ in 0..<3 {
+                    let started = ProcessInfo.processInfo.systemUptime
+                    store.newTab()
+                    let added = store.selected!
+                    var previous = started, gaps: [Double] = [], heights: [String] = []
+                    var intermediate = 0, previousHeight: CGFloat = 0
+                    for _ in 0..<24 {
+                        try? await Task.sleep(nanoseconds: 16_000_000)
+                        let now = ProcessInfo.processInfo.systemUptime
+                        gaps.append((now - previous) * 1000)
+                        previous = now
+                        if let row = list.ids.firstIndex(of: added) {
+                            let height = list.rect(ofRow: row).height
+                            check(height >= previousHeight - 0.5,
+                                  "New-tab wipes must not rebound: count=\(count), grouped=\(grouped), heights=\(heights), now=\(now - started):\(height)")
+                            previousHeight = height
+                            if height > 0.5 && height < TabSelectionRow.rowHeight - 0.5 { intermediate += 1 }
+                            heights.append(String(format: "%.3f:%.1f", now - started, height))
+                        } else { heights.append(String(format: "%.3f:missing", now - started)) }
+                    }
+                    check(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion || intermediate >= 4,
+                          "New-tab wipes must retain several intermediate frames: count=\(count), grouped=\(grouped), heights=\(heights)")
+                    print("MEASURE: \(count) tabs, insertion grouped=\(grouped), maximum interval \(String(format: "%.1f", gaps.max() ?? 0)) ms, heights=\(heights)")
+                    fflush(stdout)
+                    store.close(added)
+                    await settle()
+                }
+            }
+            store.tabGroups = []
+            for index in store.tabs.indices { store.tabs[index].groupID = nil }
+            let group = store.createTabGroup(store.tabs[0].id)!
+            let ids = store.tabs.map(\.id)
+            for id in ids.dropFirst() { store.moveTab(id, to: store.tabs.count, groupID: group) }
+            store.activate(ids[0])
+            await settle()
+            var maxGap = 0.0
+            for _ in 0..<3 {
+                store.toggleTabGroup(group)
+                var previous = ProcessInfo.processInfo.systemUptime
+                for _ in 0..<8 {
+                    try? await Task.sleep(nanoseconds: 16_000_000)
+                    let now = ProcessInfo.processInfo.systemUptime
+                    maxGap = max(maxGap, now - previous)
+                    previous = now
+                }
+            }
+            await settle()
+            print("MEASURE: \(count) grouped tabs, interrupted wipe maximum event-loop interval \(String(format: "%.1f", maxGap * 1000)) ms")
+            precondition(Set(list.ids).count == list.ids.count && !list.animatingGroups,
+                         "Interrupted large groups must finish with unique rows")
+            fflush(stdout)
+        }
+        store.tabs = savedTabs; store.tabGroups = savedGroups; store.selected = savedSelection
+        await settle()
     }
     private func verifyGroupTransition() async {
         func check(_ condition: @autoclosure () -> Bool, _ message: String) {
@@ -2973,13 +3427,14 @@ final class LayoutSelfCheck {
             let row = list.ids.firstIndex(of: group)!
             let header = list.view(atColumn: 0, row: row, makeIfNecessary: true)!
             let point = header.convert(NSPoint(x: header.bounds.midX, y: header.bounds.midY), to: nil)
+            let clickStart = ProcessInfo.processInfo.systemUptime
             await clickInPanel(point)
             for sample in 0..<samples {
                 try? await Task.sleep(nanoseconds: 16_000_000)
                 check(container.layer?.masksToBounds == true, "Animated tab content must be clipped at the native viewport")
                 if sample == 0 && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
                     check(abs(railView.progress - previousProgress) < 0.3,
-                          "Reversing a wipe must continue from the displayed line length")
+                          "Reversing a wipe must continue from the displayed line length: before=\(previousProgress), after=\(railView.progress), elapsed=\(ProcessInfo.processInfo.systemUptime - clickStart), expanding=\(expanding), samples=\(samples)")
                 }
                 let root = panel.contentView!
                 let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds)!
@@ -3060,7 +3515,7 @@ final class LayoutSelfCheck {
                 }
             }
             check(store.tabGroups.first { $0.id == group }?.collapsed == !expanding,
-                  "The actual group header event must toggle its expansion: expanding=\(expanding), samples=\(samples), collapsed=\(store.tabGroups.first { $0.id == group }!.collapsed), progress=\(railView.progress), row=\(row), point=\(point), viewport=\(container.bounds)")
+                  "The actual group header event must toggle its expansion: expanding=\(expanding), samples=\(samples), collapsed=\(store.tabGroups.first { $0.id == group }!.collapsed), progress=\(railView.progress), row=\(row), point=\(point), viewport=\(container.bounds), updating=\((list.delegate as! NativeTabList.Coordinator).updating), hit=\(String(describing: panel.contentView!.hitTest(panel.contentView!.convert(point, from: nil))))")
         }
         }
         if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
@@ -3444,6 +3899,73 @@ enum NavigationSelfCheck {
         precondition(!FaviconLoader.sameOrigin(page, URL(string: "https://127.0.0.1/nav/auth-icon.png")!))
         print("PASS: authenticated same-origin favicon uses isolated WebKit session")
         print("PASS: provisional cancellation, committed and rapid history navigation, failure recovery and same-document pushState")
+        let store = Store(defaults: defaults)
+        store.newTab()
+        let homeID = store.selected!
+        let draft = "  " + baseURL + "/nav/a  "
+        store.homeAddressDrafts[homeID] = [false: draft, true: "toolbar draft"]
+        store.navigate(draft)
+        let homeBrowser = store.browser!
+        try await AISelfCheck.wait(timeout: 10) { homeBrowser.webView.title == "a" && !homeBrowser.loading && homeBrowser.canGoBack }
+        print("PASS: first home URL navigation establishes a back entry")
+        homeBrowser.goBack()
+        try await AISelfCheck.wait(timeout: 10) { store.browser == nil && homeBrowser.isHome && !homeBrowser.loading }
+        print("PASS: first back restores native home")
+        guard store.selected == homeID, store.cachedBrowser(for: homeID) === homeBrowser,
+              homeBrowser.canGoForward, homeBrowser.address.isEmpty,
+              store.homeAddressDrafts[homeID]?[false] == draft,
+              store.homeAddressDrafts[homeID]?[true] == "toolbar draft",
+              !store.loadedReferencePages.contains(where: { $0 === homeBrowser }),
+              !store.history.contains(where: { $0.address.hasPrefix("perch-home:") }) else {
+            throw PerchError("Returning home lost drafts, identity or home isolation")
+        }
+        homeBrowser.goForward()
+        try await AISelfCheck.wait(timeout: 10) { store.browser === homeBrowser && homeBrowser.webView.title == "a" && !homeBrowser.loading }
+        homeBrowser.goBack()
+        try await AISelfCheck.wait(timeout: 10) { store.browser == nil && !homeBrowser.loading }
+        store.settings.searchEngine = "custom"
+        store.settings.customSearchURL = baseURL + "/nav/b?q={query}"
+        store.navigate("new search")
+        try await AISelfCheck.wait(timeout: 10) { homeBrowser.webView.title == "b" && !homeBrowser.loading }
+        guard !homeBrowser.canGoForward, homeBrowser.webView.url?.query == "q=new%20search" else {
+            throw PerchError("Search from restored home did not replace forward history")
+        }
+        homeBrowser.goBack()
+        try await AISelfCheck.wait(timeout: 10) { store.browser == nil && !homeBrowser.loading }
+        store.navigate(baseURL + "/nav/failure")
+        try await AISelfCheck.wait(timeout: 10) { homeBrowser.error != nil }
+        homeBrowser.goBack()
+        try await AISelfCheck.wait(timeout: 10) { store.browser == nil && homeBrowser.error == nil && !homeBrowser.loading }
+        store.navigate(baseURL + "/nav/slow-headers")
+        try await AISelfCheck.wait(timeout: 10) { homeBrowser.loading }
+        homeBrowser.goBack()
+        try await AISelfCheck.wait(timeout: 10) { store.browser == nil && !homeBrowser.loading }
+        store.newTab()
+        guard store.homeAddressDrafts[store.selected!] == nil,
+              store.homeAddressDrafts[homeID]?[false] == draft else { throw PerchError("Home drafts leaked across tabs") }
+        store.activate(homeID)
+        let group = store.createTabGroup(homeID)!
+        let count = store.tabs.count
+        store.open(Site(title: "首页合成书签", address: baseURL + "/nav/a"))
+        try await AISelfCheck.wait(timeout: 10) { homeBrowser.webView.title == "a" && !homeBrowser.loading }
+        guard store.selected == homeID, store.tabs.count == count,
+              store.tabs.first(where: { $0.id == homeID })?.groupID == group else { throw PerchError("Home bookmark did not reuse its grouped tab") }
+        _ = try await homeBrowser.webView.evaluateJavaScript("window.open('/nav/b', '_blank'); true")
+        try await AISelfCheck.wait(timeout: 10) { store.tabs.count == count + 1 }
+        guard store.tabs.first(where: { $0.id == store.selected })?.groupID == group else { throw PerchError("Page popup escaped its source group") }
+        store.activate(homeID)
+        store.open(Site(title: "网页合成书签", address: baseURL + "/nav/b"))
+        guard store.tabs.count == count + 2,
+              store.tabs.first(where: { $0.id == store.selected })?.groupID == group else { throw PerchError("Bookmark from a web tab escaped its group") }
+        store.openBookmarks([Site(title: "批量一", address: baseURL + "/nav/a"), Site(title: "批量二", address: baseURL + "/nav/b")])
+        guard store.tabs.filter({ $0.groupID == group }).count == 5 else { throw PerchError("Batch bookmarks escaped their group") }
+        store.activate(homeID)
+        homeBrowser.goBack()
+        try await AISelfCheck.wait(timeout: 10) { store.browser == nil && !homeBrowser.loading }
+        store.openChat()
+        guard store.isChatPage, store.cachedBrowser(for: homeID) == nil else { throw PerchError("Home to Chat retained a web controller") }
+        print("PASS: home bookmark reuse/back, source/current group inheritance, batch bookmarks and home-to-Chat cleanup")
+        print("PASS: native home back/forward, URL/search branching, drafts, failed/pending navigation and tab isolation")
     }
 }
 
