@@ -641,12 +641,15 @@ final class TabCell: NSTableCellView {
 
 final class TabGroupCell: NSTableCellView {
     var group = TabGroup()
-    var expansion: CGFloat = 1
+    var expansion: CGFloat = 1 { didSet { if expansion != oldValue { needsDisplay = true } } }
     var dropTarget = false { didSet { needsDisplay = true } }
     var toggle: (() -> Void)?
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         identifier = .init("tabGroupCell")
+        wantsLayer = true
+        layerContentsRedrawPolicy = .duringViewResize
+        layer?.needsDisplayOnBoundsChange = true
         setAccessibilityElement(true)
         setAccessibilityRole(.button)
     }
@@ -1146,10 +1149,16 @@ struct NativeTabList: NSViewRepresentable {
                 if !changed.isEmpty { table.noteHeightOfRows(withIndexesChanged: changed) }
                 table.layoutSubtreeIfNeeded()
                 table.enumerateAvailableRowViews { view, row in
-                    guard self.rows.indices.contains(row), case .tab(let id) = self.rows[row] else { return }
-                    (table.view(atColumn: 0, row: row, makeIfNecessary: false) as? TabCell)?
-                        .setGroupExpansion(self.groupExpansion(id))
-                    if let view = view as? TabSelectionRow { self.decorate(view, row: row) }
+                    guard self.rows.indices.contains(row) else { return }
+                    switch self.rows[row] {
+                    case .tab(let id):
+                        (table.view(atColumn: 0, row: row, makeIfNecessary: false) as? TabCell)?
+                            .setGroupExpansion(self.groupExpansion(id))
+                        if let view = view as? TabSelectionRow { self.decorate(view, row: row) }
+                    case .group:
+                        (table.view(atColumn: 0, row: row, makeIfNecessary: false) as? TabGroupCell)?
+                            .expansion = self.expansion
+                    }
                 }
             }
             container?.updateRailOrigins()

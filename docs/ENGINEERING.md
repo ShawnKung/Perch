@@ -4,6 +4,8 @@
 
 ## 网页、标签与窗口
 
+- 侧栏宽度的增量更新同时刷新可见标签和分组按钮的展开进度；不能只刷新组内图标而让按钮等待下一次元数据变化。分组按钮按当前 bounds 重绘，避免图层保留过渡尺寸。`--ui-preview --verify-sidebar-animation --verify-preview` 通过实际侧栏按钮点击、快速反向切换和箭头像素检查，验证无需点击分组即可保持正确位置。
+
 - 标签分组由 Store 的 `tabGroups` 和 `Tab.groupID` 共同管理，组成员在有序标签集合中连续排列；固定标签不归组。`TabListRow` 将集合投影为组标题和可见标签，折叠不销毁页面或改变当前选择。若当前标签属于折叠组，在组标题下方临时显示一行普通标签，切走后消失；这一行不改变顺序、归属或持久化数据，重复点击当前行不展开分组。旧数据缺少 `groupID` 时保持未分组。
 - 隐藏与折叠独立：隐藏分组将有序成员保存到 `TabGroup.hiddenTabs`，批量清理网页控制器并移除侧栏行，不写入最近关闭列表；已打开分组仍以 `Store.tabs` 为唯一成员来源，管理页直接投影两种状态。旧数据缺少 `hiddenTabs` 时为已打开分组；空的已打开分组自动移除，隐藏分组跨重启保留。重新打开清空快照并恢复标签，保留名称、颜色和顺序；仅恢复标签地址及应用状态，不恢复 WebKit 页面内存或前进后退栈。解散隐藏组会先恢复标签再移除归属，删除组同时删除快照。
 - 分组编辑弹窗的 SwiftUI `onHover` 未可靠更新菜单反馈，单纯移动状态归属也未解决。操作行与颜色按钮共用不参与命中的原生跟踪视图，以 `activeAlways` 跟踪区和弹窗内鼠标坐标更新悬停；本地事件监听只观察事件，视图离窗时清理。跟踪区显式初始化并随布局更新，范围取按钮 `bounds` 与 `visibleRect` 的交集：未裁切的 SwiftUI 托管祖先可能使 `visibleRect` 超出按钮，不能直接使用 `inVisibleRect`。跟踪区生命周期参考 [AppKit 官方说明](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/EventOverview/TrackingAreaObjects/TrackingAreaObjects.html)。`--ui-preview --preview-saved-groups --verify-preview` 验证 NSApp 鼠标事件、实际背景像素、高亮转移、重绘与移出清除及整行点击，不移动系统鼠标。
