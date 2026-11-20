@@ -3582,18 +3582,36 @@ final class LayoutSelfCheck {
         var widths: [CGFloat] = []
         var groupedPositions: [CGFloat] = []
         var railPositions: [CGFloat] = []
+        func toggleSidebar() async {
+            func find(_ node: NSObject) -> NSObject? {
+                if node.responds(to: NSSelectorFromString("accessibilityLabel")),
+                   node.value(forKey: "accessibilityLabel") as? String == "切换侧栏" { return node }
+                var children: [NSObject] = (node as? NSView)?.subviews ?? []
+                if node.responds(to: NSSelectorFromString("accessibilityChildren")),
+                   let accessible = node.value(forKey: "accessibilityChildren") as? [NSObject] { children += accessible }
+                return children.lazy.compactMap(find).first
+            }
+            let button = find(panel.contentView!)!
+            let frame = (button.value(forKey: "accessibilityFrame") as! NSValue).rectValue
+            await clickInPanel(panel.convertPoint(fromScreen: NSPoint(x: frame.midX, y: frame.midY)))
+        }
         // Six samples reverse before the 220ms transition ends; sixteen finish it.
         for (compact, samples) in [(true, 16), (false, 16), (true, 6), (false, 6), (true, 16), (false, 16)] {
             var captured = false
-            defaults.set(compact, forKey: "sidebarHidden")
-            for _ in 0..<samples {
+            await toggleSidebar()
+            for sample in 0..<samples {
                 try? await Task.sleep(nanoseconds: 16_000_000)
+                precondition(defaults.bool(forKey: "sidebarHidden") == compact,
+                             "The actual sidebar button must toggle the sidebar")
                 let x = iconX(id)
                 precondition(abs(x - initialX) < 0.5,
                              "Sidebar animation must keep the icon fixed: expected \(initialX), got \(x)")
                 let list = table()
                 let container = list.enclosingScrollView!.superview as! TabListContainer
                 let progress = container.expansion
+                let header = list.view(atColumn: 0, row: list.ids.firstIndex(of: group)!, makeIfNecessary: true) as! TabGroupCell
+                precondition(abs(header.expansion - progress) < 0.0001,
+                             "Group button disclosure must follow the sidebar without another group click: header=\(header.expansion), sidebar=\(progress)")
                 let row = list.ids.firstIndex(of: groupedID)!
                 let selection = list.rowView(atRow: row, makeIfNecessary: true) as! TabSelectionRow
                 let groupedX = iconX(groupedID)
@@ -3605,7 +3623,7 @@ final class LayoutSelfCheck {
                 groupedPositions.append(groupedX)
                 railPositions.append(rail.minX)
                 widths.append(list.enclosingScrollView!.frame.width)
-                if !captured && progress > 0.2 && progress < 0.8 {
+                if (!captured && progress > 0.2 && progress < 0.8) || sample == samples - 1 {
                     let root = panel.contentView!
                     let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds)!
                     root.cacheDisplay(in: root.bounds, to: bitmap)
@@ -3614,7 +3632,6 @@ final class LayoutSelfCheck {
                             y: Int((root.isFlipped ? point.y : root.bounds.height - point.y) *
                                    CGFloat(bitmap.pixelsHigh) / root.bounds.height))!.usingColorSpace(.deviceRGB)!
                     }
-                    let header = list.view(atColumn: 0, row: list.ids.firstIndex(of: group)!, makeIfNecessary: true)!
                     let reference = color(header.convert(NSPoint(x: 6, y: 8), to: root))
                     let child = container.convert(list.rect(ofRow: row), from: list)
                     let actual = color(container.convert(NSPoint(x: rail.midX, y: child.midY), to: root))
@@ -3622,6 +3639,24 @@ final class LayoutSelfCheck {
                                  abs(actual.greenComponent - reference.greenComponent) < 0.025 &&
                                  abs(actual.blueComponent - reference.blueComponent) < 0.025,
                                  "The group rail must actually render at its intermediate animated position")
+                    let arrowX = 18 + progress * (header.bounds.maxX - 33)
+                    let foreground = header.group.color.foreground.usingColorSpace(.deviceRGB)!
+                    var arrowDifference: CGFloat = 3
+                    for dx in -3...3 {
+                        for dy in -2...2 {
+                            let pixel = color(header.convert(NSPoint(x: arrowX + CGFloat(dx),
+                                y: header.bounds.midY + CGFloat(dy)), to: root))
+                            arrowDifference = min(arrowDifference, abs(pixel.redComponent - foreground.redComponent) +
+                                abs(pixel.greenComponent - foreground.greenComponent) +
+                                abs(pixel.blueComponent - foreground.blueComponent))
+                        }
+                    }
+                    precondition(arrowDifference < 0.2,
+                                 "The disclosure arrow must render at its current position without clicking the group")
+                    if sample == samples - 1, let png = bitmap.representation(using: .png, properties: [:]) {
+                        try? png.write(to: FileManager.default.temporaryDirectory.appendingPathComponent(
+                            compact ? "perch-sidebar-header-compact.png" : "perch-sidebar-header-expanded.png"))
+                    }
                     captured = true
                 }
             }
