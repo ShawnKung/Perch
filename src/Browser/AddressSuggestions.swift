@@ -179,6 +179,10 @@ struct AddressTextField: NSViewRepresentable {
         }
         func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
             guard !textView.hasMarkedText() else { return false }
+            if commandSelector == #selector(NSResponder.insertNewline(_:)), parent.text != textView.string {
+                parent.text = textView.string
+                parent.changed()
+            }
             return parent.command(NSStringFromSelector(commandSelector))
         }
     }
@@ -186,10 +190,13 @@ struct AddressTextField: NSViewRepresentable {
 
 struct AddressEntry: View {
     @ObservedObject private var theme = PerchTheme.shared
-    @ObservedObject var store: Store
+    let store: Store
     var currentAddress = ""
     var focusShortcut = true
     var homeTab: UUID?
+    private let ownerTab: UUID?
+    private let focusRequest: UUID?
+    private let suggestionRevision: Int
     @State private var text = ""
     @State private var focused = false
     @State private var editing = false
@@ -200,11 +207,19 @@ struct AddressEntry: View {
         let revision: Int
         let active: Bool
     }
-    private var request: Request { Request(text: text, revision: store.suggestionRevision, active: focused && editing) }
+    init(store: Store, currentAddress: String = "", focusShortcut: Bool = true, homeTab: UUID? = nil,
+         ownerTab: UUID? = nil) {
+        self.store = store; self.currentAddress = currentAddress
+        self.focusShortcut = focusShortcut; self.homeTab = homeTab
+        self.ownerTab = ownerTab ?? homeTab ?? store.selected
+        focusRequest = focusShortcut && self.ownerTab == store.selected ? store.pendingAddressFocus : nil
+        suggestionRevision = store.suggestionRevision
+    }
+    private var request: Request { Request(text: text, revision: suggestionRevision, active: focused && editing) }
     var body: some View {
         AddressTextField(text: $text, focused: $focused, placeholder: "输入网址或搜索", focusShortcut: focusShortcut,
-                         ownerTab: homeTab ?? store.selected,
-                         focusRequest: focusShortcut ? store.pendingAddressFocus : nil,
+                         ownerTab: ownerTab,
+                         focusRequest: focusRequest,
                          canFocus: { id in store.pendingAddressFocus == id && store.selected == id && !store.isChatPage },
                          focusedRequest: { store.pendingAddressFocus = nil },
                          changed: {
@@ -270,7 +285,9 @@ struct AddressEntry: View {
     }
     private func navigate(_ address: String) {
         dismissSuggestions()
-        NSApp.keyWindow?.makeFirstResponder(nil)
+        store.pendingAddressFocus = nil
+        if let panel = NSApp.keyWindow as? Panel { panel.endAddressEditing() }
+        else { NSApp.keyWindow?.makeFirstResponder(nil) }
         store.navigate(address)
     }
 }

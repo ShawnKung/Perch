@@ -55,19 +55,23 @@ final class BookmarkListItem {
     let site: Site?
     let folderID: UUID?
     let editable: Bool
+    let groupID: UUID?
+    let groupColor: TabGroupColor?
     let children: [BookmarkListItem]?
     init(key: String, title: String = "", site: Site? = nil, folderID: UUID? = nil,
-         editable: Bool = false, children: [BookmarkListItem]? = nil) {
+         editable: Bool = false, children: [BookmarkListItem]? = nil,
+         groupID: UUID? = nil, groupColor: TabGroupColor? = nil) {
         self.key = key; self.title = site.map { $0.title.isEmpty ? $0.address : $0.title } ?? title
         self.site = site; self.folderID = folderID; self.editable = editable; self.children = children
+        self.groupID = groupID; self.groupColor = groupColor
     }
     var id: UUID? { site?.id ?? folderID }
-    var selectable: Bool { site.map { URLInput.parse($0.address, search: false) != nil } ?? (folderID != nil) }
+    var selectable: Bool { groupID != nil || (site.map { URLInput.parse($0.address, search: false) != nil } ?? (folderID != nil)) }
     var signature: String {
         // Length-prefix each value so titles and URLs cannot collide with structural separators.
         let values = [key, title, site?.address ?? "", site?.id.uuidString ?? "",
                       folderID?.uuidString ?? "", String(site?.showOnHome != false),
-                      String(editable), children == nil ? "leaf" : "folder"]
+                      String(editable), children == nil ? "leaf" : "folder", groupID?.uuidString ?? "", groupColor?.rawValue ?? ""]
         return values.map { "\($0.utf8.count):\($0)" }.joined() + (children ?? []).map(\.signature).joined()
     }
     static func imported(_ nodes: [BookmarkNode], path: String) -> [BookmarkListItem] {
@@ -214,6 +218,7 @@ final class BookmarkCell: NSTableCellView {
         icon.image = favicon ?? NSImage(systemSymbolName: item.site == nil && expanded ? "folder.fill" :
                             (item.site == nil ? "folder" : "globe"),
                             accessibilityDescription: item.site == nil ? (expanded ? "已展开目录" : "已收起目录") : "书签")
+        icon.contentTintColor = item.site == nil ? item.groupColor?.color : nil
         editButton.isHidden = !item.editable
         editWidth.constant = item.editable ? 22 : 0
         editButton.setAccessibilityLabel("编辑 \(item.title)")
@@ -399,7 +404,8 @@ struct NativeBookmarks: NSViewRepresentable {
             return cell
         }
         func activate(_ item: BookmarkListItem) {
-            if let folder = item.folderID, item.children == nil { parent.navigate(folder) }
+            if item.groupID != nil, let site = item.site { parent.folderAction(site.id, "openTab") }
+            else if let folder = item.folderID, item.children == nil { parent.navigate(folder) }
             else if item.children != nil {
                 if table.isItemExpanded(item) { table.collapseItem(item) } else { table.expandItem(item) }
             }
@@ -436,6 +442,20 @@ struct NativeBookmarks: NSViewRepresentable {
                 let entry = menu.addItem(withTitle: title, action: #selector(menuAction(_:)), keyEquivalent: "")
                 entry.target = self; entry.representedObject = [item.key, action]; entry.isEnabled = enabled
             }
+            if item.groupID != nil {
+                if item.site != nil {
+                    add("打开标签页", "open")
+                    add("复制网址", "address", enabled: item.site?.address.isEmpty == false)
+                } else {
+                    add("查看标签", "open")
+                    add("打开分组", "openGroup")
+                    add("隐藏分组", "hideGroup")
+                    add("解散分组", "dissolveGroup")
+                    menu.addItem(.separator())
+                    add("删除分组", "deleteGroup")
+                }
+                return menu
+            }
             add(item.site == nil ? "打开目录" : "在新标签页中打开", "open", enabled: item.selectable)
             add("复制", "copy")
             add("剪切", "cut", enabled: parent.selection.isSubset(of: parent.movable))
@@ -466,6 +486,8 @@ struct NativeBookmarks: NSViewRepresentable {
             case "paste": if let folder = item.folderID { parent.pasteInto(table.clipboard, folder) }
             case "newFolder", "rename", "deleteFolder":
                 if let folder = item.folderID { parent.folderAction(folder, args[1]) }
+            case "openGroup", "hideGroup", "dissolveGroup", "deleteGroup":
+                if let group = item.groupID { parent.folderAction(group, args[1]) }
             default: break
             }
         }
@@ -473,7 +495,7 @@ struct NativeBookmarks: NSViewRepresentable {
 }
 
 private enum BookmarkScope: Equatable {
-    case all, root, folder(UUID), imported(String), history
+    case all, root, folder(UUID), imported(String), history, group(UUID)
 }
 
 struct BookmarkNode: Identifiable, Codable {
@@ -523,6 +545,7 @@ struct BookmarksPage: View {
         case .folder(let id): return store.bookmarkFolderPath(id)
         case .imported(let source): return "\(source)/ · 只读"
         case .history: return "历史记录"
+        case .group(let id): return store.tabGroups.first { $0.id == id }?.name ?? "标签组"
         }
     }
     private var personal: [Site] {
@@ -532,7 +555,7 @@ struct BookmarksPage: View {
             case .all: inScope = true
             case .root: inScope = site.folderID == nil
             case .folder(let id): inScope = site.folderID == id
-            case .imported, .history: inScope = false
+            case .imported, .history, .group: inScope = false
             }
             return inScope && matches(site.title, site.address)
         }
@@ -556,6 +579,12 @@ struct BookmarksPage: View {
         Set(rows.compactMap(\.id)).union(rows.reduce(into: Set<UUID>()) { $0.formUnion(rowIDs($1.children ?? [])) })
     }
     private var rows: [BookmarkListItem] {
+        if case .group(let id) = scope {
+            return store.tabs(inGroup: id).filter { matches($0.title, $0.address) }.map {
+                BookmarkListItem(key: "group/\(id)/\($0.id)", site: Site(id: $0.id, title: $0.title, address: $0.address),
+                    groupID: id)
+            }
+        }
         var result: [BookmarkListItem] = []
         if search.isEmpty, scope != .all, sources.isEmpty {
             result += store.bookmarkFolders.filter { $0.parentID == currentFolder }.map {
@@ -578,7 +607,7 @@ struct BookmarksPage: View {
         VStack(spacing: 12) {
             HStack {
                 TextField("搜索名称或网址", text: $search).textFieldStyle(.roundedBorder)
-                if scope != .history {
+                if scope != .history && !isGroupScope {
                     Button("添加书签") {
                         editing = nil; adding = true; title = ""; address = ""
                     }.disabled({ if case .imported = scope { return true }; return false }())
@@ -588,7 +617,7 @@ struct BookmarksPage: View {
                     }
                 }
             }
-            if scope != .history && (adding || editing != nil) {
+            if scope != .history && !isGroupScope && (adding || editing != nil) {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(editing == nil ? "添加书签" : "编辑书签").font(.caption).foregroundStyle(Style.muted)
                     HStack {
@@ -628,9 +657,10 @@ struct BookmarksPage: View {
                         NativeBookmarks(rows: rows, selection: $selection, expandAll: !search.isEmpty,
                             edit: edit, toggleHome: { store.toggleBookmarkHome($0.id) },
                             open: { store.open($0); store.library = nil },
-                            navigate: { scope = .folder($0) },
+                            navigate: { scope = isGroupScope ? .group($0) : .folder($0) },
                             delete: { selection = [$0.id]; deleting = true },
                             paste: { board in
+                                guard !isGroupScope else { return }
                                 if case .imported = scope {
                                     store.notice = "请选择个人书签目录后再粘贴。"; return
                                 }
@@ -646,6 +676,10 @@ struct BookmarksPage: View {
                                 return moved
                             },
                             folderAction: { id, action in
+                                if isGroupScope {
+                                    groupAction(id, action: action)
+                                    return
+                                }
                                 guard let folder = store.bookmarkFolders.first(where: { $0.id == id }) else { return }
                                 switch action {
                                 case "newFolder":
@@ -663,7 +697,8 @@ struct BookmarksPage: View {
                             .padding(.leading, -16)
                             .overlay(alignment: .topLeading) {
                                 if rows.isEmpty {
-                                    Text(search.isEmpty ? "此处没有书签" : "没有匹配的书签")
+                                    Text(isGroupScope ? (search.isEmpty ? "此处没有标签组或标签" : "没有匹配的标签组或标签") :
+                                        (search.isEmpty ? "此处没有书签" : "没有匹配的书签"))
                                         .foregroundStyle(Style.muted).padding(16).allowsHitTesting(false)
                                 }
                             }
@@ -673,6 +708,18 @@ struct BookmarksPage: View {
             if scope == .history {
                 Text("\(store.history.count) 条记录 · 最多保留最近 10,000 条")
                     .font(.caption).foregroundStyle(Style.muted).frame(maxWidth: .infinity, alignment: .leading)
+            } else if isGroupScope {
+                HStack {
+                    if case .group(let id) = scope, let group = store.tabGroups.first(where: { $0.id == id }) {
+                        Button("打开分组") { groupAction(id, action: "openGroup") }
+                        Button("隐藏分组") { groupAction(id, action: "hideGroup") }.disabled(group.hidden)
+                        Button("解散分组") { groupAction(id, action: "dissolveGroup") }
+                        Button("删除分组", role: .destructive) { groupAction(id, action: "deleteGroup") }
+                        Spacer()
+                        Text(group.hidden ? "已隐藏 · \(rows.count) 个标签" : "已打开 · \(rows.count) 个标签")
+                            .font(.caption).foregroundStyle(Style.muted)
+                    }
+                }
             } else {
                 HStack {
                     Button("打开所选") {
@@ -740,6 +787,26 @@ struct BookmarksPage: View {
     private var sortedFolders: [BookmarkFolder] {
         store.bookmarkFolders.sorted { store.bookmarkFolderPath($0.id).localizedStandardCompare(store.bookmarkFolderPath($1.id)) == .orderedAscending }
     }
+    private var isGroupScope: Bool {
+        if case .group = scope { return true }
+        return false
+    }
+    private func groupAction(_ id: UUID, action: String) {
+        switch action {
+        case "openGroup": store.openTabGroup(id); store.library = nil
+        case "openTab":
+            if case .group(let group) = scope { store.openTabGroup(group, tabID: id); store.library = nil }
+        case "hideGroup": store.hideTabGroup(id)
+        case "dissolveGroup": store.ungroup(id); leaveDeletedGroup(id)
+        case "deleteGroup": store.deleteTabGroup(id); leaveDeletedGroup(id)
+        default: break
+        }
+    }
+    private func leaveDeletedGroup(_ id: UUID) {
+        guard scope == .group(id) else { return }
+        scope = store.tabGroups.first.map { .group($0.id) } ?? .root
+        selection.removeAll()
+    }
     private var folderDeletionCount: Int {
         guard let folderToDelete else { return 0 }
         let ids = store.bookmarkFolderDescendants(folderToDelete.id)
@@ -754,6 +821,18 @@ struct BookmarksPage: View {
             scopeButton("个人书签", icon: "bookmark", target: .root)
             ForEach(store.bookmarkFolders.filter { $0.parentID == nil }) { folder in
                 folderRow(folder, ancestors: [])
+            }
+            Section("标签组") {
+                ForEach(store.tabGroups) { group in
+                    scopeButton(group.name.isEmpty ? "未命名分组" : group.name, icon: "folder", target: .group(group.id))
+                        .help("\(group.hidden ? "已隐藏" : "已打开") · \(store.tabs(inGroup: group.id).count) 个标签")
+                        .contextMenu {
+                            Button("打开分组") { groupAction(group.id, action: "openGroup") }
+                            Button("隐藏分组") { groupAction(group.id, action: "hideGroup") }.disabled(group.hidden)
+                            Button("解散分组") { groupAction(group.id, action: "dissolveGroup") }
+                            Button("删除分组", role: .destructive) { groupAction(group.id, action: "deleteGroup") }
+                        }
+                }
             }
             if !store.importedBookmarks.isEmpty {
                 Section("浏览器导入") {
@@ -775,11 +854,13 @@ struct BookmarksPage: View {
             Label {
                 Text(name)
             } icon: {
-                Image(systemName: icon).foregroundStyle(Style.accent)
+                Image(systemName: icon).foregroundStyle(scopeColor(target))
             }.lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 5)
                 .background(scope == target ? Style.mint : Color.clear, in: RoundedRectangle(cornerRadius: 5))
+                .contentShape(Rectangle())
         }.buttonStyle(.plain)
+            .accessibilityLabel(name)
             .onDrop(of: [BookmarkDrag.type.rawValue], isTargeted: nil) { providers in
                 switch target {
                 case .root: return drop(providers, to: nil)
@@ -787,6 +868,12 @@ struct BookmarksPage: View {
                 default: return false
                 }
             }
+    }
+    private func scopeColor(_ target: BookmarkScope) -> Color {
+        if case .group(let id) = target, let group = store.tabGroups.first(where: { $0.id == id }) {
+            return Color(group.color.color)
+        }
+        return Style.accent
     }
     private func drop(_ providers: [NSItemProvider], to folder: UUID?) -> Bool {
         let group = DispatchGroup()

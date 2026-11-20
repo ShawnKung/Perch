@@ -71,7 +71,7 @@ enum BackupScope: String, Codable, CaseIterable {
         switch self {
         case .settings: return "设置与布局"
         case .ai: return "AI 配置"
-        case .bookmarks: return "书签"
+        case .bookmarks: return "书签与标签组"
         }
     }
 }
@@ -84,7 +84,7 @@ struct BackupCredentials: Codable {
 
 struct SettingsBackup: Codable {
     var format = "dev.perch.settings-bookmarks"
-    var version = 2
+    var version = 3
     var created = Date()
     var settings: BrowserSettings
     var launchAtLogin: Bool
@@ -95,12 +95,13 @@ struct SettingsBackup: Codable {
     var sites: [Site]
     var folders: [BookmarkFolder]
     var imported: [String: [BookmarkNode]]
+    var tabGroups: [TabGroup]?
     var scope = Set(BackupScope.allCases)
     var credentials: BackupCredentials?
     var scopeDescription: String { BackupScope.allCases.filter(scope.contains).map(\.title).joined(separator: "、") }
 
     func validate() throws {
-        guard format == "dev.perch.settings-bookmarks", [1, 2].contains(version), !scope.isEmpty,
+        guard format == "dev.perch.settings-bookmarks", [1, 2, 3].contains(version), !scope.isEmpty,
               version != 1 || (scope == Set(BackupScope.allCases) && credentials == nil) else {
             throw PerchError("不支持此备份格式或版本，请使用兼容版本的 Perch。")
         }
@@ -139,6 +140,8 @@ struct SettingsBackup: Codable {
             }
         }
         guard scope.contains(.bookmarks) else { return }
+        guard (tabGroups ?? []).allSatisfy(\.hidden) else { throw PerchError("备份中的标签组缺少保存的标签。") }
+        try TabGroup.validateStoredTabs(tabGroups ?? [])
         guard sites.count + folders.count <= 50000 else { throw PerchError("备份中的书签过多。") }
         var ids = Set<UUID>()
         for folder in folders {
@@ -194,6 +197,15 @@ struct SettingsBackup: Codable {
             return value
         }
         copy.search?.id = UUID(); copy.search?.keyEnvironment = ""
+        copy.tabGroups = tabGroups?.map { group in
+            var value = group; value.id = UUID()
+            value.hiddenTabs = group.hiddenTabs?.map { tab in
+                var page = tab; page.id = UUID(); page.groupID = value.id
+                page.chatOwner = nil; page.aiOwner = nil; page.aiSidebarOpen = nil
+                return page
+            }
+            return value
+        }
         return copy
     }
 }
@@ -201,7 +213,7 @@ struct SettingsBackup: Codable {
 extension SettingsBackup {
     private enum CodingKeys: String, CodingKey {
         case format, version, created, scope, settings, launchAtLogin, layout, providers, selectedProvider
-        case search, sites, folders, imported, credentials
+        case search, sites, folders, imported, tabGroups, credentials
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -218,6 +230,7 @@ extension SettingsBackup {
             sites: scope.contains(.bookmarks) ? try c.decode([Site].self, forKey: .sites) : [],
             folders: scope.contains(.bookmarks) ? try c.decode([BookmarkFolder].self, forKey: .folders) : [],
             imported: scope.contains(.bookmarks) ? try c.decode([String: [BookmarkNode]].self, forKey: .imported) : [:],
+            tabGroups: version >= 3 && scope.contains(.bookmarks) ? try c.decodeIfPresent([TabGroup].self, forKey: .tabGroups) : nil,
             scope: scope, credentials: try c.decodeIfPresent(BackupCredentials.self, forKey: .credentials))
     }
     func encode(to encoder: Encoder) throws {
@@ -234,6 +247,7 @@ extension SettingsBackup {
         }
         if scope.contains(.bookmarks) {
             try c.encode(sites, forKey: .sites); try c.encode(folders, forKey: .folders); try c.encode(imported, forKey: .imported)
+            if version >= 3 { try c.encodeIfPresent(tabGroups, forKey: .tabGroups) }
         }
     }
 }

@@ -108,7 +108,7 @@ final class PerchTheme: ObservableObject {
     }
 }
 
-struct Tab: Identifiable, Codable {
+struct Tab: Identifiable, Codable, Equatable {
     var id = UUID()
     var title: String
     var address: String
@@ -116,6 +116,94 @@ struct Tab: Identifiable, Codable {
     var chatOwner: UUID?
     var aiOwner: UUID?
     var aiSidebarOpen: Bool?
+    var groupID: UUID?
+}
+
+enum TabGroupColor: String, Codable, CaseIterable {
+    case blue, purple, pink, red, orange, yellow, green, cyan, gray
+    var color: NSColor {
+        let rgb: (CGFloat, CGFloat, CGFloat)
+        switch self {
+        case .blue: rgb = (0.26, 0.42, 0.85)
+        case .purple: rgb = (0.62, 0.22, 0.96)
+        case .pink: rgb = (0.78, 0.00, 0.65)
+        case .red: rgb = (0.89, 0.06, 0.16)
+        case .orange: rgb = (1.00, 0.56, 0.19)
+        case .yellow: rgb = (1.00, 0.81, 0.18)
+        case .green: rgb = (0.09, 0.50, 0.16)
+        case .cyan: rgb = (0.00, 0.48, 0.51)
+        case .gray: rgb = (0.38, 0.40, 0.42)
+        }
+        return NSColor(srgbRed: rgb.0, green: rgb.1, blue: rgb.2, alpha: 1)
+    }
+    var foreground: NSColor { self == .yellow || self == .orange ? .black : .white }
+    var name: String {
+        switch self {
+        case .blue: return "蓝色"
+        case .purple: return "紫色"
+        case .pink: return "粉色"
+        case .red: return "红色"
+        case .orange: return "橙色"
+        case .yellow: return "黄色"
+        case .green: return "绿色"
+        case .cyan: return "青色"
+        case .gray: return "灰色"
+        }
+    }
+}
+
+struct TabGroup: Identifiable, Codable, Equatable {
+    var id = UUID()
+    var name = "新分组"
+    var color: TabGroupColor = .blue
+    var collapsed = false
+    // Only hidden groups own stored tabs; visible groups use Store.tabs as their source of truth.
+    var hiddenTabs: [Tab]?
+    var hidden: Bool { hiddenTabs != nil }
+
+    static func validateStoredTabs(_ groups: [TabGroup]) throws {
+        guard groups.count <= 50000 else { throw PerchError("保存的标签组过多。") }
+        var groupIDs = Set<UUID>(), tabIDs = Set<UUID>(), count = groups.count
+        for group in groups {
+            guard groupIDs.insert(group.id).inserted else { throw PerchError("标签组 ID 重复。") }
+            guard let members = group.hiddenTabs else { continue }
+            count += members.count
+            guard !members.isEmpty, count <= 50000 else { throw PerchError("保存的标签组为空或标签过多。") }
+            for tab in members {
+                guard tabIDs.insert(tab.id).inserted, !tab.pinned, tab.groupID == group.id,
+                      tab.address.isEmpty || tab.address == "about:blank" || URLInput.parse(tab.address, search: false) != nil else {
+                    throw PerchError("保存的标签 ID、网址或分组归属无效。")
+                }
+            }
+        }
+    }
+}
+
+enum TabListRow: Equatable {
+    case tab(UUID), group(UUID)
+    var id: UUID {
+        switch self { case .tab(let id), .group(let id): return id }
+    }
+    static func rows(tabs: [Tab], groups: [TabGroup], selected: UUID? = nil, draggingGroup: UUID? = nil) -> [TabListRow] {
+        let groups = Dictionary(uniqueKeysWithValues: groups.map { ($0.id, $0) })
+        var seen = Set<UUID>()
+        var result: [TabListRow] = []
+        for tab in tabs {
+            if let id = tab.groupID, let group = groups[id] {
+                if seen.insert(id).inserted {
+                    result.append(.group(id))
+                    // The active page stays visible outside its collapsed group without changing membership.
+                    if group.collapsed, draggingGroup != id,
+                       let active = tabs.first(where: { $0.id == selected && $0.groupID == id }) {
+                        result.append(.tab(active.id))
+                    }
+                }
+                if group.collapsed || draggingGroup == id { continue }
+            }
+            result.append(.tab(tab.id))
+        }
+        return result
+    }
 }
 
 struct Visit: Identifiable, Codable {

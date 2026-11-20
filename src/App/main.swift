@@ -70,6 +70,18 @@ enum WebsiteCookies {
     }
 }
 
+final class HomeHistoryPage: NSObject, WKURLSchemeHandler {
+    static let url = URL(string: "perch-home://new-tab/")!
+    func webView(_ webView: WKWebView, start urlSchemeTask: WKURLSchemeTask) {
+        let data = Data("<!doctype html><title>新标签页</title>".utf8)
+        urlSchemeTask.didReceive(URLResponse(url: Self.url, mimeType: "text/html",
+                                            expectedContentLength: data.count, textEncodingName: "utf-8"))
+        urlSchemeTask.didReceive(data)
+        urlSchemeTask.didFinish()
+    }
+    func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {}
+}
+
 @MainActor
 final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate, NSMenuItemValidation {
     let webView: PageWebView
@@ -121,6 +133,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         webView.find(findQuery, configuration: configuration) { _ in }
     }
     var onVisit: ((String, String) -> Void)?
+    var onHomeChanged: ((Bool) -> Void)?
     var onNewTab: ((URL, Bool) -> Void)?
     var onOpenInPerch: ((URL) -> Void)?
     var onBookmark: (() -> Void)?
@@ -131,15 +144,23 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     private var activeNavigation: WKNavigation?
     private var pendingHistoryItem: WKBackForwardListItem?
     private var provisionalFailure = false
+    private var firstHomeDestination: URL?
+    private let startsAtHome: Bool
+    var isHome: Bool { startsAtHome && webView.url == HomeHistoryPage.url }
+    private func displayAddress(_ url: URL?) -> String {
+        url == HomeHistoryPage.url ? "" : url?.absoluteString ?? ""
+    }
 
     init(url: URL, userAgent: String? = nil, dataStore: WKWebsiteDataStore? = nil,
-         trackHoverLinks: Bool = false, previewDefaults: UserDefaults = .standard) {
+         trackHoverLinks: Bool = false, previewDefaults: UserDefaults = .standard, startsAtHome: Bool = false) {
+        self.startsAtHome = startsAtHome
         self.previewDefaults = previewDefaults
         let tracker = trackHoverLinks ? HoverLinkTracker() : nil
         hoverLinks = tracker
         let bridge = PasswordBridge()
         passwordBridge = bridge
         let configuration = WKWebViewConfiguration()
+        if startsAtHome { configuration.setURLSchemeHandler(HomeHistoryPage(), forURLScheme: "perch-home") }
         configuration.websiteDataStore = dataStore ?? .default()
         configuration.userContentController.add(bridge, contentWorld: .defaultClient, name: "perchPassword")
         configuration.userContentController.addUserScript(WKUserScript(source: PasswordBridge.script,
@@ -173,10 +194,13 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
                 DispatchQueue.main.async { self?.syncNavigationState() }
             },
             webView.observe(\.url, options: [.new]) { [weak self] view, _ in
-                DispatchQueue.main.async { self?.address = view.url?.absoluteString ?? ""; self?.syncNavigationState() }
+                DispatchQueue.main.async { self?.address = self?.displayAddress(view.url) ?? ""; self?.syncNavigationState() }
             }
         ]
-        load(url)
+        if startsAtHome {
+            firstHomeDestination = url
+            activeNavigation = webView.load(URLRequest(url: HomeHistoryPage.url))
+        } else { load(url) }
     }
 
     func extendContextMenu(_ menu: NSMenu) {
@@ -230,6 +254,11 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     }
 
     func load(_ url: URL) {
+        if firstHomeDestination != nil && webView.backForwardList.currentItem == nil {
+            firstHomeDestination = url
+            return
+        }
+        firstHomeDestination = nil
         error = nil
         httpAlternative = nil
         address = url.absoluteString
@@ -265,7 +294,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
             if activeNavigation == nil { webView.stopLoading(); pendingHistoryItem = nil }
             provisionalFailure = false
             error = nil; httpAlternative = nil
-            address = webView.backForwardList.currentItem?.url.absoluteString ?? address
+            address = displayAddress(webView.backForwardList.currentItem?.url)
             syncNavigationState()
             return
         }
@@ -278,7 +307,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
             pendingHistoryItem = target
             activeNavigation = webView.go(to: target)
             if activeNavigation == nil { webView.stopLoading(); pendingHistoryItem = nil }
-            address = target.url.absoluteString
+            address = displayAddress(target.url)
         } else {
             pendingHistoryItem = target
             activeNavigation = webView.go(to: target)
@@ -301,6 +330,8 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         guard navigation === activeNavigation else { return }
         pendingHistoryItem = nil; provisionalFailure = false
         title = webView.title ?? ""
+        address = displayAddress(webView.url)
+        if startsAtHome && firstHomeDestination == nil { onHomeChanged?(isHome) }
         syncNavigationState()
     }
 
@@ -310,6 +341,11 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         error = nil; httpAlternative = nil
         syncNavigationState()
         title = webView.title ?? ""
+        if isHome {
+            if let destination = firstHomeDestination { load(destination) }
+            else { onHomeChanged?(true) }
+            return
+        }
         if let url = webView.url { onVisit?(url.absoluteString, title) }
         favicon.load(from: webView)
     }
@@ -342,7 +378,8 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         guard let url = navigationAction.request.url,
-              ["http", "https", "about"].contains(url.scheme?.lowercased() ?? "") else {
+              ["http", "https", "about"].contains(url.scheme?.lowercased() ?? "") ||
+                (startsAtHome && url == HomeHistoryPage.url && navigationAction.targetFrame?.isMainFrame == true) else {
             error = "此链接使用其他应用的专用协议，Perch 暂不支持打开。"
             decisionHandler(.cancel)
             return
@@ -429,9 +466,16 @@ final class Store: ObservableObject {
             parts?.user = nil; parts?.password = nil; parts?.query = nil; parts?.fragment = nil
             ai.referenceClosed(page.id, reference: AIPageReference(title: page.title, url: parts?.url))
         }
-        ai.retainTabs(Set(tabs.map(\.id) + tabs.compactMap(\.chatOwner) + tabs.compactMap(\.aiOwner) + [AIController.homeID]))
+        let retained = tabs + tabGroups.flatMap { $0.hiddenTabs ?? [] }
+        ai.retainTabs(Set(retained.map(\.id) + retained.compactMap(\.chatOwner) + retained.compactMap(\.aiOwner) + [AIController.homeID]))
     } }
     @Published var history: [Visit] = [] { didSet { suggestionRevision &+= 1 } }
+    @Published var tabGroups: [TabGroup] = []
+    var openTabGroups: [TabGroup] { tabGroups.filter { !$0.hidden } }
+    func tabs(inGroup id: UUID) -> [Tab] {
+        tabGroups.first { $0.id == id }?.hiddenTabs ?? tabs.filter { $0.groupID == id }
+    }
+    var tabRows: [TabListRow] { TabListRow.rows(tabs: tabs, groups: openTabGroups, selected: selected) }
     @Published var importedBookmarks: [String: [BookmarkNode]] = [:] { didSet { suggestionRevision &+= 1 } }
     @Published private(set) var suggestionRevision = 0
     let addressSuggestionSearch = AddressSuggestionSearch()
@@ -457,6 +501,10 @@ final class Store: ObservableObject {
         }
     }
     @Published var selected: UUID? { didSet {
+        if oldValue != selected, let selected, tabs.contains(where: { $0.id == selected }) {
+            activationHistory.removeAll { $0 == selected }
+            activationHistory.append(selected)
+        }
         if pendingAddressFocus != selected { pendingAddressFocus = nil }
         if oldValue != selected, let oldValue { browsers[oldValue]?.passwordBridge.dismiss() }
         if oldValue != selected && isChatPage { chatHistoryVisible = true }
@@ -477,6 +525,7 @@ final class Store: ObservableObject {
     @Published var settings: BrowserSettings
     @Published var icons: [UUID: NSImage] = [:]
     private var browsers: [UUID: Browser] = [:]
+    private var activationHistory: [UUID] = []
     let defaults: UserDefaults
     func cachedFavicon(_ address: String) -> NSImage? { FaviconCache.image(for: address, defaults: defaults) }
     func openBookmarks(history: Bool = false) {
@@ -512,27 +561,41 @@ final class Store: ObservableObject {
         let restoredSelection = defaults.string(forKey: "selectedTab").flatMap(UUID.init(uuidString:))
         let chatTab = restoredTabs.first { $0.chatOwner != nil && $0.id == restoredSelection } ??
             restoredTabs.first { $0.chatOwner != nil }
+        tabGroups = restore([TabGroup].self, key: "tabGroups") ?? []
+        do { try TabGroup.validateStoredTabs(tabGroups) }
+        catch {
+            protectedKeys.insert("tabGroups"); tabGroups = []
+            notice = "标签组数据无法读取，已保留原数据。\(error.localizedDescription)"
+        }
         tabs = restoredTabs.filter { $0.chatOwner == nil || $0.id == chatTab?.id }
-        ai.classifyWebConversations(owners: Set(tabs.filter { !$0.address.isEmpty && $0.chatOwner == nil }.map { $0.aiOwner ?? $0.id }))
+        // Tabs and group metadata form one logical snapshot; preserve both if either cannot be decoded.
+        if protectedKeys.contains("tabs") || protectedKeys.contains("tabGroups") {
+            protectedKeys.formUnion(["tabs", "tabGroups"])
+        }
+        normalizeTabGroups()
+        let savedPages = tabs + tabGroups.flatMap { $0.hiddenTabs ?? [] }
+        ai.classifyWebConversations(owners: Set(savedPages.filter { !$0.address.isEmpty && $0.chatOwner == nil }.map { $0.aiOwner ?? $0.id }))
         for tab in tabs { icons[tab.id] = FaviconCache.image(for: tab.address, defaults: defaults) }
         history = restore([Visit].self, key: "history") ?? []
         importedBookmarks = restore([String: [BookmarkNode]].self, key: "importedBookmarks") ?? [:]
         bookmarkFolders = restore([BookmarkFolder].self, key: "bookmarkFolders") ?? []
         if let raw = defaults.string(forKey: "selectedTab"), let id = UUID(uuidString: raw), tabs.contains(where: { $0.id == id }) {
             selected = id
-            activate(id)
+            activate(id, select: false)
         }
         if tabs.count != restoredTabs.count { persistTabs() }
     }
 
     var browser: Browser? {
-        guard let selected else { return nil }
+        guard let selected, tabs.contains(where: { $0.id == selected && !$0.address.isEmpty && $0.chatOwner == nil }) else { return nil }
         return browsers[selected]
     }
     func cachedBrowser(for id: UUID) -> Browser? { browsers[id] }
 
     func open(_ site: Site) {
-        newTab(address: site.address, title: site.title)
+        if !isChatPage && (selected == nil || tabs.first(where: { $0.id == selected })?.address.isEmpty == true) {
+            navigate(site.address)
+        } else { newTab(address: site.address, title: site.title) }
     }
 
     func openReferencedPage(_ url: URL) {
@@ -549,21 +612,33 @@ final class Store: ObservableObject {
     }
 
     func openBookmarks(_ sites: [Site]) {
-        let added = sites.filter { URLInput.parse($0.address, search: false) != nil }
+        var added = sites.filter { URLInput.parse($0.address, search: false) != nil }
             .map { Tab(title: $0.title, address: $0.address) }
         guard let first = added.first else { return }
-        tabs.append(contentsOf: added)
+        if let index = tabs.firstIndex(where: { $0.id == selected }), let group = tabs[index].groupID {
+            for index in added.indices { added[index].groupID = group }
+            tabs.insert(contentsOf: added, at: index + 1)
+        } else { tabs.append(contentsOf: added) }
         // Only load the active page; the other tabs load when selected.
         activate(first.id)
     }
 
-    func activate(_ id: UUID, select: Bool = true) {
+    func activate(_ id: UUID, select: Bool = true, startsAtHome: Bool = false) {
         guard let tab = tabs.first(where: { $0.id == id }) else { return }
+        if select, selected != id, let groupID = tab.groupID, let index = tabGroups.firstIndex(where: { $0.id == groupID }),
+           tabGroups[index].collapsed { tabGroups[index].collapsed = false }
         if icons[id] == nil { icons[id] = FaviconCache.image(for: tab.address, defaults: defaults) }
         if browsers[id] == nil, let url = URLInput.parse(tab.address, search: false) {
             let view = Browser(url: url, userAgent: settings.userAgent,
                                dataStore: defaults === UserDefaults.standard ? .default() : .nonPersistent(),
-                               trackHoverLinks: true, previewDefaults: defaults)
+                               trackHoverLinks: true, previewDefaults: defaults, startsAtHome: startsAtHome)
+            view.onHomeChanged = { [weak self, weak view] home in
+                guard let self, let view, let index = self.tabs.firstIndex(where: { $0.id == id }),
+                      self.tabs[index].chatOwner == nil else { return }
+                self.tabs[index].address = home ? "" : view.address
+                self.tabs[index].title = home ? "新标签页" : URL(string: view.address)?.host ?? view.address
+                self.persistTabs()
+            }
             linkPreview.start()
             view.hoverLinks?.changed = { [weak self] in self?.linkPreview.hoverChanged() }
             view.onVisit = { [weak self] address, title in
@@ -626,12 +701,15 @@ final class Store: ObservableObject {
     }
 
     func newTab(address: String = "", title: String = "新标签页", after: UUID? = nil, select: Bool = true) {
-        let tab = Tab(title: title == "新标签页" ? URL(string: address)?.host ?? title : title, address: address)
-        if let after, let index = tabs.firstIndex(where: { $0.id == after }) {
+        var tab = Tab(title: title == "新标签页" ? URL(string: address)?.host ?? title : title, address: address)
+        let source = after ?? tabs.first(where: { $0.id == selected && $0.groupID != nil })?.id
+        if let source, let index = tabs.firstIndex(where: { $0.id == source }) {
+            tab.groupID = tabs[index].groupID
             tabs.insert(tab, at: tabs[index].pinned ? tabs.filter(\.pinned).count : index + 1)
         } else { tabs.append(tab) }
         activate(tab.id, select: select)
         if select && address.isEmpty { pendingAddressFocus = tab.id }
+        persistTabs()
     }
 
     @Published var chatHistoryVisible = true
@@ -678,6 +756,11 @@ final class Store: ObservableObject {
             activate(chatID)
         }
         else if let index = tabs.firstIndex(where: { $0.id == selected && $0.address.isEmpty && $0.chatOwner == nil }) {
+            if let browser = browsers.removeValue(forKey: tabs[index].id) {
+                browser.onHomeChanged = nil; browser.onVisit = nil
+                browser.passwordBridge.dismiss(); browser.favicon.reset(); browser.webView.stopLoading()
+                browser.webView.removeFromSuperview()
+            }
             tabs[index].chatOwner = owner; tabs[index].title = "Chat"
             activate(tabs[index].id)
         }
@@ -688,8 +771,11 @@ final class Store: ObservableObject {
         chatHistoryVisible = true
         aiVisible = false
     }
-    func referenceBrowser(_ id: UUID) -> Browser? { activate(id, select: false); return browsers[id] }
-    var loadedReferencePages: [Browser] { tabs.compactMap { browsers[$0.id] } }
+    func referenceBrowser(_ id: UUID) -> Browser? {
+        guard tabs.contains(where: { $0.id == id && !$0.address.isEmpty && $0.chatOwner == nil }) else { return nil }
+        activate(id, select: false); return browsers[id]
+    }
+    var loadedReferencePages: [Browser] { tabs.filter { !$0.address.isEmpty && $0.chatOwner == nil }.compactMap { browsers[$0.id] } }
     func restoreReference(_ reference: AIPageReference) -> Browser? {
         func matches(_ tab: Tab) -> Bool {
             guard tab.chatOwner == nil, let url = URL(string: tab.address) else { return false }
@@ -707,21 +793,33 @@ final class Store: ObservableObject {
     }
 
     func close(_ id: UUID) {
-        guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
-        homeAddressDrafts[id] = nil
-        var closed = tabs[index]
-        if closed.chatOwner == nil { closed.aiOwner = closed.aiOwner ?? closed.id }
-        tabs.remove(at: index)
-        recentlyClosed.append(closed)
-        recentlyClosed = Array(recentlyClosed.suffix(20))
-        if let browser = browsers.removeValue(forKey: id) {
-            browser.passwordBridge.dismiss(); browser.favicon.reset(); browser.webView.stopLoading()
-            browser.webView.removeFromSuperview()
+        closeTabs([id], remember: true)
+    }
+
+    private func closeTabs(_ ids: Set<UUID>, remember: Bool) {
+        guard let index = tabs.firstIndex(where: { ids.contains($0.id) }) else { return }
+        let removed = tabs.filter { ids.contains($0.id) }
+        tabs.removeAll { ids.contains($0.id) }
+        let remaining = Set(tabs.map(\.id))
+        activationHistory.removeAll { !remaining.contains($0) }
+        normalizeTabGroups()
+        for var closed in removed {
+            if remember {
+                homeAddressDrafts[closed.id] = nil
+                if closed.chatOwner == nil { closed.aiOwner = closed.aiOwner ?? closed.id }
+                recentlyClosed.append(closed)
+            }
+            if let browser = browsers.removeValue(forKey: closed.id) {
+                browser.passwordBridge.dismiss(); browser.favicon.reset(); browser.webView.stopLoading()
+                browser.webView.removeFromSuperview()
+            }
+            icons.removeValue(forKey: closed.id)
         }
-        icons.removeValue(forKey: id)
-        if selected == id {
-            selected = nil
-            if !tabs.isEmpty { activate(tabs[min(index, tabs.count - 1)].id) }
+        recentlyClosed = Array(recentlyClosed.suffix(20))
+        if let selected, ids.contains(selected) {
+            if !tabs.isEmpty {
+                activate(activationHistory.last ?? tabs[min(index, tabs.count - 1)].id)
+            } else { self.selected = nil }
         }
         persistTabs()
     }
@@ -732,12 +830,17 @@ final class Store: ObservableObject {
             activate(existing.id); return
         }
         tab.id = UUID()
-        tabs.append(tab); sortPinned(); activate(tab.id)
+        if let groupID = tab.groupID, let last = tabs.lastIndex(where: { $0.groupID == groupID }) {
+            tabs.insert(tab, at: last + 1)
+        } else { tab.groupID = nil; tabs.append(tab) }
+        sortPinned(); activate(tab.id)
     }
 
     func pin(_ id: UUID) {
         guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
-        tabs[index].pinned.toggle(); sortPinned(); persistTabs()
+        tabs[index].pinned.toggle()
+        tabs[index].groupID = nil
+        sortPinned(); normalizeTabGroups(); persistTabs()
     }
 
     private func sortPinned() { tabs = tabs.filter(\.pinned) + tabs.filter { !$0.pinned } }
@@ -746,9 +849,7 @@ final class Store: ObservableObject {
         guard id != target, let source = tabs.firstIndex(where: { $0.id == id }),
               let destination = tabs.firstIndex(where: { $0.id == target }),
               tabs[source].pinned == tabs[destination].pinned else { return }
-        let tab = tabs.remove(at: source)
-        tabs.insert(tab, at: tabs.firstIndex(where: { $0.id == target })! + (after ? 1 : 0))
-        persistTabs()
+        moveTab(id, to: destination + (after ? 1 : 0), groupID: tabs[destination].groupID)
     }
 
     func canMove(_ id: UUID, to insertion: Int) -> Bool {
@@ -758,16 +859,172 @@ final class Store: ObservableObject {
     }
 
     func move(_ id: UUID, to insertion: Int) {
-        guard canMove(id, to: insertion), let source = tabs.firstIndex(where: { $0.id == id }) else { return }
-        let tab = tabs.remove(at: source)
-        tabs.insert(tab, at: insertion - (source < insertion ? 1 : 0))
+        moveTab(id, to: insertion, groupID: nil)
+    }
+
+    // One ordered tab collection owns group membership. Headers are a projection, never browser tabs.
+    func normalizeTabGroups() {
+        var seen = Set<UUID>()
+        tabGroups = tabGroups.filter { seen.insert($0.id).inserted }
+        let valid = Set(openTabGroups.map(\.id))
+        var ordered = tabs
+        for index in ordered.indices {
+            if ordered[index].pinned || ordered[index].groupID.map({ !valid.contains($0) }) == true {
+                ordered[index].groupID = nil
+            }
+        }
+        var emitted = Set<UUID>(), result: [Tab] = []
+        for tab in ordered {
+            if let id = tab.groupID {
+                if emitted.insert(id).inserted { result += ordered.filter { $0.groupID == id } }
+            } else { result.append(tab) }
+        }
+        tabs = result.filter(\.pinned) + result.filter { !$0.pinned }
+        tabGroups.removeAll { !$0.hidden && !emitted.contains($0.id) }
+    }
+
+    @discardableResult func createTabGroup(_ id: UUID) -> UUID? {
+        guard let index = tabs.firstIndex(where: { $0.id == id }), !tabs[index].pinned else { return nil }
+        let group = TabGroup()
+        // Detach at the boundary of the old group before creating a new one.
+        moveTab(id, to: index, groupID: nil)
+        guard let newIndex = tabs.firstIndex(where: { $0.id == id }) else { return nil }
+        tabGroups.append(group)
+        tabs[newIndex].groupID = group.id
+        normalizeTabGroups(); persistTabs()
+        return group.id
+    }
+
+    func editTabGroup(_ id: UUID, name: String? = nil, color: TabGroupColor? = nil) {
+        guard let index = tabGroups.firstIndex(where: { $0.id == id }) else { return }
+        if let name { tabGroups[index].name = name }
+        if let color { tabGroups[index].color = color }
         persistTabs()
+    }
+
+    func toggleTabGroup(_ id: UUID) {
+        guard let index = tabGroups.firstIndex(where: { $0.id == id }) else { return }
+        tabGroups[index].collapsed.toggle(); persistTabs()
+    }
+
+    func ungroup(_ id: UUID) {
+        if tabGroups.first(where: { $0.id == id })?.hidden == true { openTabGroup(id) }
+        for index in tabs.indices where tabs[index].groupID == id { tabs[index].groupID = nil }
+        tabGroups.removeAll { $0.id == id }
+        for index in recentlyClosed.indices where recentlyClosed[index].groupID == id { recentlyClosed[index].groupID = nil }
+        normalizeTabGroups(); persistTabs()
+    }
+
+    func hideTabGroup(_ id: UUID) {
+        guard let index = tabGroups.firstIndex(where: { $0.id == id }), !tabGroups[index].hidden else { return }
+        let members = tabs(inGroup: id).map { tab in
+            var saved = tab
+            if let browser = browsers[tab.id], !browser.address.isEmpty {
+                saved.address = browser.address
+                if !browser.title.isEmpty { saved.title = browser.title }
+            }
+            return saved
+        }
+        guard !members.isEmpty else { return }
+        tabGroups[index].hiddenTabs = members
+        // Preserve the snapshot before close normalizes the open collection.
+        closeTabs(Set(members.map(\.id)), remember: false)
+        persistTabs()
+    }
+
+    func openTabGroup(_ id: UUID, tabID: UUID? = nil) {
+        guard let group = tabGroups.first(where: { $0.id == id }) else { return }
+        if let saved = group.hiddenTabs {
+            // The app has one full Chat page; restoring its saved owner replaces the current Chat page.
+            if saved.contains(where: { $0.chatOwner != nil }), let chat = tabs.first(where: { $0.chatOwner != nil }) {
+                close(chat.id)
+            }
+            guard let index = tabGroups.firstIndex(where: { $0.id == id }) else { return }
+            var restored = saved
+            var selection = tabID
+            for offset in restored.indices {
+                if tabs.contains(where: { $0.id == restored[offset].id }) {
+                    let original = restored[offset].id
+                    restored[offset].id = UUID()
+                    if selection == original { selection = restored[offset].id }
+                }
+                restored[offset].pinned = false; restored[offset].groupID = id
+            }
+            tabs.append(contentsOf: restored)
+            tabGroups[index].hiddenTabs = nil
+            tabGroups[index].collapsed = false
+            normalizeTabGroups()
+            if let member = restored.first(where: { $0.id == selection }) ?? restored.first { activate(member.id) }
+        } else {
+            if let index = tabGroups.firstIndex(where: { $0.id == id }) { tabGroups[index].collapsed = false }
+            if let member = tabs.first(where: { $0.groupID == id && $0.id == tabID }) ??
+                tabs.first(where: { $0.groupID == id }) { activate(member.id) }
+        }
+        persistTabs()
+    }
+
+    func deleteTabGroup(_ id: UUID) {
+        hideTabGroup(id)
+        let members = tabs(inGroup: id)
+        for tab in members { homeAddressDrafts[tab.id] = nil }
+        tabGroups.removeAll { $0.id == id }
+        for index in recentlyClosed.indices where recentlyClosed[index].groupID == id { recentlyClosed[index].groupID = nil }
+        let retained = tabs + tabGroups.flatMap { $0.hiddenTabs ?? [] }
+        ai.retainTabs(Set(retained.map(\.id) + retained.compactMap(\.chatOwner) + retained.compactMap(\.aiOwner) + [AIController.homeID]))
+        persistTabs()
+    }
+
+    func newTab(inGroup id: UUID) {
+        guard let last = tabs.last(where: { $0.groupID == id }) else { return }
+        newTab(after: last.id)
+    }
+
+    // Insertion is in the original collection. Ungrouped drops snap to a group boundary.
+    func previewMovingTab(_ id: UUID, to insertion: Int, groupID: UUID?) -> [Tab]? {
+        guard canMove(id, to: insertion), let source = tabs.firstIndex(where: { $0.id == id }),
+              groupID == nil || (!tabs[source].pinned && openTabGroups.contains { $0.id == groupID }) else { return nil }
+        var result = tabs
+        var tab = result.remove(at: source)
+        tab.groupID = groupID
+        var destination = insertion - (source < insertion ? 1 : 0)
+        if let groupID {
+            let members = result.indices.filter { result[$0].groupID == groupID }
+            if let first = members.first, let last = members.last { destination = min(max(destination, first), last + 1) }
+        } else if destination > 0, destination < result.count,
+                  let split = result[destination].groupID, result[destination - 1].groupID == split {
+            destination = result.firstIndex { $0.groupID == split }!
+        }
+        result.insert(tab, at: destination)
+        return result
+    }
+
+    func moveTab(_ id: UUID, to insertion: Int, groupID: UUID?) {
+        guard let result = previewMovingTab(id, to: insertion, groupID: groupID) else { return }
+        tabs = result; normalizeTabGroups(); persistTabs()
+    }
+
+    func previewMovingGroup(_ id: UUID, to insertion: Int) -> [Tab]? {
+        let members = tabs.filter { $0.groupID == id }
+        guard !members.isEmpty, (tabs.filter(\.pinned).count...tabs.count).contains(insertion) else { return nil }
+        var result = tabs.filter { $0.groupID != id }
+        var destination = insertion - tabs.prefix(insertion).filter { $0.groupID == id }.count
+        if destination > 0, destination < result.count,
+           let split = result[destination].groupID, result[destination - 1].groupID == split {
+            destination = result.firstIndex { $0.groupID == split }!
+        }
+        result.insert(contentsOf: members, at: destination)
+        return result
+    }
+
+    func moveTabGroup(_ id: UUID, to insertion: Int) {
+        guard let result = previewMovingGroup(id, to: insertion) else { return }
+        tabs = result; persistTabs()
     }
 
     func closeOthers(_ id: UUID, below: Bool = false) {
         guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
         let ids = tabs.enumerated().filter { $0.element.id != id && !$0.element.pinned && (!below || $0.offset > index) }.map { $0.element.id }
-        ids.forEach(close)
+        ids.forEach { close($0) }
     }
 
     func reload(_ id: UUID) { activate(id); browser?.webView.reload() }
@@ -786,6 +1043,7 @@ final class Store: ObservableObject {
 
     private func persistTabs() {
         persist(tabs, key: "tabs")
+        persist(tabGroups, key: "tabGroups")
         defaults.set(selected?.uuidString, forKey: "selectedTab")
     }
 
@@ -831,7 +1089,7 @@ final class Store: ObservableObject {
 
     private func checkBackupAccess(_ scope: Set<BackupScope>) throws {
         let keys = Set(scope.contains(.settings) ? ["settings"] : [])
-            .union(scope.contains(.bookmarks) ? ["sites", "bookmarkFolders", "importedBookmarks"] : [])
+            .union(scope.contains(.bookmarks) ? ["sites", "bookmarkFolders", "importedBookmarks", "tabs", "tabGroups"] : [])
         guard protectedKeys.isDisjoint(with: keys), !scope.contains(.ai) || ai.canRestoreSettings else {
             throw PerchError("当前设置或书签数据损坏，已保留原数据。请先备份并修复原始数据。")
         }
@@ -845,7 +1103,11 @@ final class Store: ObservableObject {
         let backup = SettingsBackup(settings: settings, launchAtLogin: launchAtLogin,
             layout: LayoutPreference.capture(defaults), providers: providers,
             selectedProvider: ai.configuration.id, search: ai.searchConfiguration,
-            sites: sites, folders: bookmarkFolders, imported: importedBookmarks, scope: scope,
+            sites: sites, folders: bookmarkFolders, imported: importedBookmarks,
+            tabGroups: tabGroups.map { group in
+                var saved = group; saved.hiddenTabs = tabs(inGroup: group.id)
+                return saved
+            }, scope: scope,
             credentials: includeKeys && scope.contains(.ai) ? try ai.backupCredentials() : nil)
         try backup.validate()
         return backup
@@ -864,6 +1126,12 @@ final class Store: ObservableObject {
             encoded["sites"] = try encoder.encode(backup.sites)
             encoded["bookmarkFolders"] = try encoder.encode(backup.folders)
             encoded["importedBookmarks"] = try encoder.encode(backup.imported)
+            if let groups = backup.tabGroups {
+                encoded["tabGroups"] = try encoder.encode(groups)
+                encoded["tabs"] = try encoder.encode(tabs.map { tab in
+                    var page = tab; page.groupID = nil; return page
+                })
+            }
         }
         if backup.scope.contains(.ai) { encoded["aiProviders"] = try encoder.encode(backup.providers) }
         let search = try backup.search.map { try encoder.encode($0) }
@@ -889,6 +1157,10 @@ final class Store: ObservableObject {
         }
         if backup.scope.contains(.bookmarks) {
             sites = backup.sites; bookmarkFolders = backup.folders; importedBookmarks = backup.imported
+            if let groups = backup.tabGroups {
+                tabGroups = groups
+                for index in tabs.indices { tabs[index].groupID = nil }
+            }
         }
         if backup.scope.contains(.settings) {
             LayoutPreference.restore(backup.layout, to: defaults)
@@ -902,8 +1174,7 @@ final class Store: ObservableObject {
             notice = "请输入有效的 http / https 网址，或输入关键词搜索。"
             return
         }
-        if let selected { homeAddressDrafts[selected] = nil }
-        if let browser {
+        if let selected, let browser = browsers[selected], !isChatPage {
             if let index = tabs.firstIndex(where: { $0.id == selected }) {
                 tabs[index].address = url.absoluteString
                 tabs[index].title = url.host ?? url.absoluteString
@@ -914,8 +1185,12 @@ final class Store: ObservableObject {
         else {
             if let selected, let index = tabs.firstIndex(where: { $0.id == selected }) {
                 tabs[index].chatOwner = nil
-                tabs[index].address = url.absoluteString; activate(selected)
-            } else { newTab(address: url.absoluteString) }
+                tabs[index].address = url.absoluteString; activate(selected, startsAtHome: true)
+            } else {
+                newTab()
+                if let selected { homeAddressDrafts[selected] = homeAddressDrafts.removeValue(forKey: AIController.homeID) }
+                navigate(text)
+            }
         }
     }
 
@@ -1310,6 +1585,7 @@ struct BrowserAddressBar: View {
     @ObservedObject private var theme = PerchTheme.shared
     @ObservedObject var browser: Browser
     @ObservedObject var store: Store
+    let tabID: UUID
 
     var body: some View {
         HStack(spacing: 3) {
@@ -1321,7 +1597,7 @@ struct BrowserAddressBar: View {
                     if browser.loading { browser.webView.stopLoading() } else { browser.webView.reload() }
                 }
                 HStack(spacing: 0) {
-                    AddressEntry(store: store, currentAddress: browser.address)
+                    AddressEntry(store: store, currentAddress: browser.address, ownerTab: tabID)
                     PasswordFillButton(store: store, browser: browser)
                     let saved = store.bookmark(for: browser.address) != nil
                     GlyphButton(symbol: saved ? "star.fill" : "star",
@@ -1350,12 +1626,30 @@ struct BrowserAddressBar: View {
 
 struct HomeAddressBar: View {
     @ObservedObject private var theme = PerchTheme.shared
-    @ObservedObject var store: Store
+    private let entry: AddressEntry
+    init(store: Store, tabID: UUID) {
+        entry = AddressEntry(store: store, homeTab: tabID)
+    }
     var body: some View {
-        AddressEntry(store: store, homeTab: store.selected ?? AIController.homeID)
-            .id(store.selected)
+        entry
+            .id(entry.homeTab)
             .background(Style.paper, in: RoundedRectangle(cornerRadius: 8))
             .overlay(RoundedRectangle(cornerRadius: 8).stroke(Style.line, lineWidth: 1).allowsHitTesting(false))
+    }
+}
+
+struct HomeHistoryAddressBar: View {
+    @ObservedObject var browser: Browser
+    @ObservedObject var store: Store
+    let tabID: UUID
+    var body: some View {
+        HStack(spacing: 3) {
+            GlyphButton(symbol: "chevron.left", label: "后退", size: 28) { browser.goBack() }
+                .disabled(!browser.canGoBack)
+            GlyphButton(symbol: "chevron.right", label: "前进", size: 28) { browser.goForward() }
+                .disabled(!browser.canGoForward)
+            HomeAddressBar(store: store, tabID: tabID)
+        }
     }
 }
 
@@ -1502,9 +1796,18 @@ struct BrowserFindBar: View {
 
 struct HomeScreen: View {
     @ObservedObject private var theme = PerchTheme.shared
-    @ObservedObject var store: Store
+    let store: Store
+    let tabID: UUID
+    private let shortcuts: [Site]
+    private let suggestionRevision: Int
+    private let icons: [UUID: NSImage]
+    init(store: Store, tabID: UUID) {
+        self.store = store; self.tabID = tabID
+        shortcuts = store.sites.filter { $0.showOnHome != false }
+        suggestionRevision = store.suggestionRevision
+        icons = store.icons
+    }
     var body: some View {
-        let shortcuts = store.sites.filter { $0.showOnHome != false }
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 HStack {
@@ -1523,8 +1826,8 @@ struct HomeScreen: View {
                 }
                 HStack(spacing: 10) {
                     Image(systemName: "magnifyingglass").foregroundStyle(Style.muted)
-                    AddressEntry(store: store, focusShortcut: false, homeTab: store.selected ?? AIController.homeID)
-                        .id(store.selected)
+                    AddressEntry(store: store, focusShortcut: false, homeTab: tabID)
+                        .id(tabID)
                 }.padding(14).background(.white, in: RoundedRectangle(cornerRadius: 13))
                     .overlay(RoundedRectangle(cornerRadius: 13).stroke(Style.line, lineWidth: 1))
                     .zIndex(20)
@@ -1553,8 +1856,15 @@ struct HomeScreen: View {
                             ForEach(shortcuts) { site in
                                 Button { store.open(site) } label: {
                                     HStack(spacing: 12) {
-                                        Image(systemName: site.symbol).font(.system(size: 20))
-                                            .frame(width: 32).foregroundStyle(Style.accent)
+                                        Group {
+                                            if let icon = store.cachedFavicon(site.address) {
+                                                Image(nsImage: icon).resizable().scaledToFit()
+                                                    .frame(width: 20, height: 20)
+                                            } else {
+                                                Image(systemName: site.symbol).font(.system(size: 20))
+                                                    .foregroundStyle(Style.accent)
+                                            }
+                                        }.frame(width: 32).accessibilityHidden(true)
                                         VStack(alignment: .leading, spacing: 5) {
                                             Text(site.title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
                                             Text(URL(string: site.address)?.host ?? site.address)
@@ -1609,17 +1919,28 @@ struct AddSite: View {
 
 struct WindowTools: View {
     @ObservedObject private var theme = PerchTheme.shared
-    @ObservedObject var store: Store
+    let store: Store
+    private let chatPage: Bool
+    private let aiVisible: Bool
+    private let pinned: Bool
+    private let hasBrowser: Bool
+    private let canClearCookies: Bool
     @State private var cookieTarget: (host: String, store: WKHTTPCookieStore)?
     @State private var confirmingCookies = false
+    init(store: Store) {
+        self.store = store
+        chatPage = store.isChatPage; aiVisible = store.aiVisible; pinned = store.pinned
+        hasBrowser = store.browser != nil
+        canClearCookies = store.browser?.webView.url?.host != nil && !store.isChatPage
+    }
     var body: some View {
         HStack(spacing: 3) {
-            if !store.isChatPage {
-                GlyphButton(symbol: "sparkles", label: "AI 聊天", active: store.aiVisible, size: 28) {
+            if !chatPage {
+                GlyphButton(symbol: "sparkles", label: "AI 聊天", active: aiVisible, size: 28) {
                     store.aiVisible.toggle()
                 }
             }
-            GlyphButton(symbol: store.pinned ? "pin.fill" : "pin", label: "窗口置顶", active: store.pinned, size: 28) {
+            GlyphButton(symbol: pinned ? "pin.fill" : "pin", label: "窗口置顶", active: pinned, size: 28) {
                 store.pinned.toggle(); store.changeWindow?()
             }
             Menu {
@@ -1629,7 +1950,7 @@ struct WindowTools: View {
                 Divider()
                 Button("在新标签页打开") {
                     if let url = URLInput.parse(store.browser?.address ?? "", search: false) { store.newTab(address: url.absoluteString) }
-                }.disabled(store.browser == nil)
+                }.disabled(!hasBrowser)
                 Divider()
                 Button("回到首页") { store.selected = nil }
                 Button("添加网站") { store.adding = true }
@@ -1639,7 +1960,7 @@ struct WindowTools: View {
                           ["http", "https"].contains(url.scheme?.lowercased() ?? ""), let host = url.host else { return }
                     cookieTarget = (host, browser.webView.configuration.websiteDataStore.httpCookieStore)
                     confirmingCookies = true
-                }.disabled(store.browser?.webView.url?.host == nil || store.isChatPage)
+                }.disabled(!canClearCookies)
                 Divider()
                 Text("Perch \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")")
                 Button("退出 Perch") { NSApp.terminate(nil) }.keyboardShortcut("q")
@@ -1758,7 +2079,10 @@ struct RootView: View {
                 let controlsInset = Self.controlsInset(tabSidebarWidth)
                 let topBarHeight = Self.topBarHeight(chat: store.isChatPage)
                 HStack(spacing: 0) {
-                    TabSidebar(store: store, compact: sidebarCollapsed, topBarHeight: topBarHeight)
+                    TabSidebar(store: store, compact: sidebarCollapsed, expansion: sidebarCollapsed ? 0 : 1,
+                               topBarHeight: topBarHeight, contentHeight: CGFloat(store.tabRows.count) * TabSelectionRow.rowHeight)
+                        .animation(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil :
+                            .easeInOut(duration: TabListContainer.groupAnimationDuration), value: store.tabRows)
                         .frame(width: tabSidebarWidth)
                         .clipped()
                     SidebarResizeHandle(changed: { translation in
@@ -2011,6 +2335,14 @@ final class Panel: NSPanel {
     }
 
     func cancelPendingFieldSelection() { pendingFieldSelection = nil }
+
+    func endAddressEditing() {
+        restoringTabFocus = true
+        defer { restoringTabFocus = false }
+        makeFirstResponder(nil)
+        if let selectedTab { tabFocus[selectedTab] = nil }
+        pendingFieldSelection = nil
+    }
 
     private func field(with identifier: NSUserInterfaceItemIdentifier, tab: UUID, in view: NSView) -> NSTextField? {
         if let field = view as? NSTextField, field.identifier == identifier,
@@ -2285,8 +2617,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var activeBrowser: Browser? { panel?.attachedSheet == nil && store.library == nil && !store.adding ? store.browser : nil }
     @objc func reloadPage() { activeBrowser?.webView.reload() }
     @objc func reloadFromOrigin() { activeBrowser?.webView.reloadFromOrigin() }
-    @objc func goBack() { activeBrowser?.goBack() }
-    @objc func goForward() { activeBrowser?.goForward() }
+    private var navigationBrowser: Browser? {
+        guard panel?.attachedSheet == nil, store.library == nil, !store.adding, !store.isChatPage,
+              let id = store.selected else { return nil }
+        return store.cachedBrowser(for: id)
+    }
+    @objc func goBack() { navigationBrowser?.goBack() }
+    @objc func goForward() { navigationBrowser?.goForward() }
     @objc func bookmarkPage() {
         if let browser = activeBrowser { store.toggleBookmark(title: browser.title, address: browser.address) }
     }
@@ -2630,7 +2967,7 @@ if CommandLine.arguments.contains("--scroll-self-test") {
 } else if CommandLine.arguments.contains("--ui-self-test") || CommandLine.arguments.contains("--ui-preview") {
     let app = NSApplication.shared
     // A CLI-launched test needs its own foreground identity while the installed menu-bar app is running.
-    app.setActivationPolicy(CommandLine.arguments.contains("--ui-self-test") ? .regular : .accessory)
+    app.setActivationPolicy(CommandLine.arguments.contains("--ui-self-test") || CommandLine.arguments.contains("--verify-preview") ? .regular : .accessory)
     Task { @MainActor in
         setbuf(stdout, nil)
         // Activate only after AppKit has finished launching the CLI process.
