@@ -154,7 +154,8 @@ struct TabSidebar: View, Animatable {
                 }.buttonStyle(.plain).foregroundStyle(Style.muted)
                     .help("设置 ⌘,").accessibilityLabel("设置")
             }
-            .animation(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil : .easeInOut(duration: 0.2),
+            .animation(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil :
+                .easeInOut(duration: TabListContainer.groupAnimationDuration),
                        value: store.tabRows)
             .padding(.bottom, 4)
         }.padding(.horizontal, 8).padding(.top, 12)

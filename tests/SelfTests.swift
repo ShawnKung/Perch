@@ -1233,6 +1233,21 @@ final class LayoutSelfCheck {
         return find(panel.contentView!)!
     }
     func settle() async { try? await Task.sleep(nanoseconds: 350_000_000) }
+    private func clickInPanel(_ point: NSPoint) async {
+        NSApp.activate(ignoringOtherApps: true)
+        panel.focusWindow()
+        for _ in 0..<60 where !NSApp.isActive || !panel.isKeyWindow {
+            try? await Task.sleep(nanoseconds: 16_000_000)
+        }
+        precondition(NSApp.isActive && panel.isKeyWindow, "Native click checks require an active isolated window")
+        // Queue the release for AppKit's tracking loop, then dispatch the press before sampling.
+        NSApp.postEvent(NSEvent.mouseEvent(with: .leftMouseUp, location: point, modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber,
+            context: nil, eventNumber: 1, clickCount: 1, pressure: 0)!, atStart: true)
+        NSApp.sendEvent(NSEvent.mouseEvent(with: .leftMouseDown, location: point, modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber,
+            context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!)
+    }
     func verifyTabGroups() async {
         // Keep assertion locations available in the stripped release executable used by UI checks.
         func precondition(_ condition: @autoclosure () -> Bool, _ message: String = "", line: UInt = #line) {
@@ -1258,26 +1273,19 @@ final class LayoutSelfCheck {
         let groupedRow = table.rowView(atRow: 1, makeIfNecessary: true) as! TabSelectionRow
         precondition(groupedRow.groupColor != nil && groupedRow.extraLeadingInset == 7)
         let point = groupCell.convert(NSPoint(x: groupCell.bounds.midX, y: groupCell.bounds.midY), to: nil)
-        func click(_ location: NSPoint) {
-            panel.focusWindow()
-            let up = NSEvent.mouseEvent(with: .leftMouseUp, location: location, modifierFlags: [],
-                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber,
-                context: nil, eventNumber: 1, clickCount: 1, pressure: 0)!
-            NSApp.postEvent(up, atStart: true)
-            panel.sendEvent(NSEvent.mouseEvent(with: .leftMouseDown, location: location, modifierFlags: [],
-                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber,
-                context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!)
+        func click(_ location: NSPoint) async {
+            await clickInPanel(location)
         }
-        func clickHeader() { click(point) }
+        func clickHeader() async { await click(point) }
         panel.focusWindow()
-        clickHeader()
+        await clickHeader()
         await settle()
         precondition(store.tabGroups[0].collapsed && table.ids == [group, ids[1], ids[2], ids[3]] &&
                      store.selected == ids[1] && store.tabs.filter { $0.groupID == group }.map(\.id) == [ids[0], ids[1]],
-                     "Collapse must display the active tab below its group without changing selection or membership")
+                     "Collapse must display the active tab below its group without changing selection or membership: collapsed=\(store.tabGroups[0].collapsed), actual=\(table.ids), selected=\(String(describing: store.selected)), progress=\((table.enclosingScrollView!.superview as! TabListContainer).railViews[group]?.progress ?? -1)")
         precondition((table.rowView(atRow: 1, makeIfNecessary: true) as? TabSelectionRow)?.groupColor == nil,
                      "The temporary active tab must appear outside the group rail")
-        click(table.convert(NSPoint(x: 20, y: table.rect(ofRow: 1).midY), to: nil))
+        await click(table.convert(NSPoint(x: 20, y: table.rect(ofRow: 1).midY), to: nil))
         await settle()
         precondition(store.tabGroups[0].collapsed, "Clicking the already active outside row must not expand its group")
         let restored = Store(defaults: defaults)
@@ -1285,12 +1293,12 @@ final class LayoutSelfCheck {
                      restored.tabGroups.first?.collapsed == true && restored.tabs.filter { $0.groupID == group }.count == 2)
         await settle()
         let otherPoint = table.convert(NSPoint(x: 20, y: table.rect(ofRow: 2).midY), to: nil)
-        click(otherPoint)
+        await click(otherPoint)
         await settle()
         precondition(store.selected == ids[2] && table.ids == [group, ids[2], ids[3]] &&
                      store.tabs.first { $0.id == ids[1] }?.groupID == group,
                      "Switching away must remove only the temporary row")
-        clickHeader()
+        await clickHeader()
         await settle()
         precondition(!store.tabGroups[0].collapsed && table.ids.count == 5)
         NSApp.sendEvent(NSEvent.mouseEvent(with: .rightMouseDown, location: point, modifierFlags: [],
@@ -1432,7 +1440,7 @@ final class LayoutSelfCheck {
                         let a = color(outside), b = color(inside)
                         precondition(abs(a.redComponent - b.redComponent) + abs(a.greenComponent - b.greenComponent) +
                                      abs(a.blueComponent - b.blueComponent) > 0.2,
-                                     "Group button edges must match the tab highlight's 2pt horizontal inset")
+                                     "Group button edges must match the tab highlight's 2pt horizontal inset: compact=\(compact), row=\(row), bounds=\(header.bounds), outside=\(outside):\(a), inside=\(inside):\(b)")
                     }
                 }
                 for row in 1..<coordinator.rows.count {
@@ -2947,21 +2955,32 @@ final class LayoutSelfCheck {
         store.toggleTabGroup(group)
         await settle()
         var intermediateFrames = 0
-        for expanding in [true, false, true, false] {
+        var railOpeningFrames = 0, railClosingFrames = 0
+        var memberWipeFrames = 0
+        for (active, narrow) in [(outside, false), (members[0], false), (members[2], false), (members.last!, true)] {
+            store.activate(active)
+            defaults.set(narrow, forKey: "sidebarHidden")
+            if !store.tabGroups.first(where: { $0.id == group })!.collapsed { store.toggleTabGroup(group) }
+            await settle()
+        for (expanding, samples) in [(true, 24), (false, 24), (true, 1), (false, 1), (true, 1), (false, 1),
+                                     (true, 5), (false, 5), (true, 24), (false, 24)] {
+            panel.focusWindow()
             let list = table()
+            let container = list.enclosingScrollView!.superview as! TabListContainer
+            let railView = container.railViews[group]!
+            let previousProgress = railView.progress
+            var activeY: CGFloat?
             let row = list.ids.firstIndex(of: group)!
             let header = list.view(atColumn: 0, row: row, makeIfNecessary: true)!
             let point = header.convert(NSPoint(x: header.bounds.midX, y: header.bounds.midY), to: nil)
-            NSApp.postEvent(NSEvent.mouseEvent(with: .leftMouseUp, location: point, modifierFlags: [],
-                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber,
-                context: nil, eventNumber: 1, clickCount: 1, pressure: 0)!, atStart: true)
-            NSApp.sendEvent(NSEvent.mouseEvent(with: .leftMouseDown, location: point, modifierFlags: [],
-                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber,
-                context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!)
-            for _ in 0..<16 {
+            await clickInPanel(point)
+            for sample in 0..<samples {
                 try? await Task.sleep(nanoseconds: 16_000_000)
-                let container = list.enclosingScrollView!.superview as! TabListContainer
                 check(container.layer?.masksToBounds == true, "Animated tab content must be clipped at the native viewport")
+                if sample == 0 && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                    check(abs(railView.progress - previousProgress) < 0.3,
+                          "Reversing a wipe must continue from the displayed line length")
+                }
                 let root = panel.contentView!
                 let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds)!
                 root.cacheDisplay(in: root.bounds, to: bitmap)
@@ -2976,6 +2995,62 @@ final class LayoutSelfCheck {
                       abs(reference.greenComponent - below.greenComponent) +
                       abs(reference.blueComponent - below.blueComponent) > 0.2,
                       "The group rail must not paint below the viewport onto the moving new-tab button")
+                let line = railView.lineRect
+                let totalHeight = list.ids.indices.filter { members.contains(list.ids[$0]) }
+                    .reduce(CGFloat(0)) { $0 + list.rect(ofRow: $1).height }
+                let retained = members.contains(active) ? TabSelectionRow.rowHeight : 0
+                let expectedHeight = max(0, totalHeight - retained * (1 - railView.progress) +
+                    31 * (1 - container.expansion) * railView.progress - 4)
+                check(abs(line.height - expectedHeight) < 0.02,
+                      "The line edge must follow actual clipped tab geometry on every frame")
+                let visibleLine = container.convert(line, from: railView).intersection(container.bounds)
+                if railView.progress > 0.1 && railView.progress < 0.9 && visibleLine.height > 6 {
+                    if expanding { railOpeningFrames += 1 } else { railClosingFrames += 1 }
+                    let inside = color(container.convert(NSPoint(x: visibleLine.midX,
+                        y: visibleLine.minY + min(8, visibleLine.height / 2)), to: root))
+                    let after = color(railView.convert(NSPoint(x: line.midX, y: line.maxY + 4), to: root))
+                    check(abs(reference.redComponent - inside.redComponent) +
+                          abs(reference.greenComponent - inside.greenComponent) +
+                          abs(reference.blueComponent - inside.blueComponent) < 0.075,
+                          "The displayed line must stay opaque behind the moving wipe edge: progress=\(railView.progress), line=\(line), viewport=\(container.bounds), actual=\(inside), reference=\(reference)")
+                    check(abs(reference.redComponent - after.redComponent) +
+                          abs(reference.greenComponent - after.greenComponent) +
+                          abs(reference.blueComponent - after.blueComponent) > 0.2,
+                          "The line must not jump to its full length ahead of the wipe")
+                }
+                for index in list.ids.indices where members.contains(list.ids[index]) {
+                    if let cell = list.view(atColumn: 0, row: index, makeIfNecessary: false) {
+                        check(cell.alphaValue == 1, "Group members must not fade during a wipe")
+                        let tabCell = cell as! TabCell
+                        let inset = 10 * container.expansion * railView.progress
+                        check(abs(tabCell.icon.convert(tabCell.icon.bounds, to: tabCell).minX - 9 - inset) < 0.5,
+                              "Grouped icons must move horizontally with disclosure progress instead of jumping on collapse")
+                        let selection = list.rowView(atRow: index, makeIfNecessary: false) as? TabSelectionRow
+                        check(abs((selection?.extraLeadingInset ?? 0) - inset * 0.7) < 0.01,
+                              "Group highlights and icon insets must follow the same displayed progress")
+                        let height = list.rect(ofRow: index).height
+                        if height > 1 && height < TabSelectionRow.rowHeight - 1 {
+                            memberWipeFrames += 1
+                            let tabCell = cell as! TabCell
+                            check(abs(tabCell.content.frame.height - TabSelectionRow.rowHeight) < 0.5,
+                                  "Wiping must clip fixed-size icon content instead of compressing it")
+                        }
+                    }
+                }
+                if members.contains(active) {
+                    check(store.selected == active && list.ids.contains(active),
+                          "The selected grouped tab must stay selected and visible throughout its wipe")
+                    let activeRect = list.rect(ofRow: list.ids.firstIndex(of: active)!)
+                    check(abs(activeRect.height - TabSelectionRow.rowHeight) < 0.01,
+                          "The selected icon must never collapse or reappear during either wipe direction")
+                    if let previous = activeY {
+                        check(expanding ? activeRect.minY >= previous - 0.5 : activeRect.minY <= previous + 0.5,
+                              "The selected icon must move naturally with preceding rows without a rebound: expanding=\(expanding), samples=\(samples), sample=\(sample), oldY=\(previous), newY=\(activeRect.minY), progress=\(railView.progress)")
+                    }
+                    activeY = activeRect.minY
+                    check(list.ids.filter { members.contains($0) } == members.filter { list.ids.contains($0) },
+                          "Wiping must preserve the original member order, including the selected tab")
+                }
                 if expanding && container.bounds.height > 74 && container.bounds.height < 214 {
                     intermediateFrames += 1
                     if intermediateFrames == 1 {
@@ -2985,13 +3060,50 @@ final class LayoutSelfCheck {
                 }
             }
             check(store.tabGroups.first { $0.id == group }?.collapsed == !expanding,
-                  "The actual group header event must toggle its expansion")
+                  "The actual group header event must toggle its expansion: expanding=\(expanding), samples=\(samples), collapsed=\(store.tabGroups.first { $0.id == group }!.collapsed), progress=\(railView.progress), row=\(row), point=\(point), viewport=\(container.bounds)")
         }
-        check(intermediateFrames > 1, "Clipping must be sampled while the group is opening, not only at its endpoints")
+        }
+        if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            check(intermediateFrames > 1, "Clipping must be sampled while the group is opening, not only at its endpoints")
+            check(railOpeningFrames > 1 && railClosingFrames > 1,
+                  "The line itself must animate through intermediate lengths in both directions")
+            check(memberWipeFrames > 1, "Group icons must reveal and disappear through intermediate clipped row heights")
+        }
+        store.toggleTabGroup(group)
+        // Fill the viewport so ordinary selection cannot accidentally rely on outer list clipping.
+        store.tabs.append(contentsOf: (0..<15).map { Tab(title: "固定位置 \($0)", address: "") })
+        await settle()
+        let list = table()
+        let positions = Dictionary(uniqueKeysWithValues: members.map { id -> (UUID, CGFloat) in
+            let cell = list.view(atColumn: 0, row: list.ids.firstIndex(of: id)!, makeIfNecessary: true) as! TabCell
+            return (id, cell.icon.convert(cell.icon.bounds, to: panel.contentView!).midY)
+        })
+        for id in members + members.reversed() {
+            panel.focusWindow()
+            let row = list.ids.firstIndex(of: id)!
+            let cell = list.view(atColumn: 0, row: row, makeIfNecessary: true) as! TabCell
+            let point = cell.icon.convert(NSPoint(x: cell.icon.bounds.midX, y: cell.icon.bounds.midY), to: nil)
+            await clickInPanel(point)
+            for _ in 0..<6 {
+                try? await Task.sleep(nanoseconds: 16_000_000)
+                for member in members {
+                    let index = list.ids.firstIndex(of: member)!
+                    let cell = list.view(atColumn: 0, row: index, makeIfNecessary: true) as! TabCell
+                    let rowView = list.rowView(atRow: index, makeIfNecessary: true)!
+                    check(abs(cell.icon.convert(cell.icon.bounds, to: panel.contentView!).midY - positions[member]!) < 0.5,
+                          "Ordinary icon clicks must not change any grouped icon's vertical position")
+                    if let displayed = rowView.layer?.presentation() {
+                        check(abs(displayed.frame.minY - rowView.frame.minY) < 0.5,
+                              "Ordinary icon clicks must not leave a second row-position animation running")
+                    }
+                }
+            }
+            check(store.selected == id, "The actual icon click must select the expected member")
+        }
         store.tabs = savedTabs; store.tabGroups = savedGroups; store.selected = savedSelection
         defaults.set(compact, forKey: "sidebarHidden")
         await settle()
-        print("PASS: group opening/closing header events, intermediate viewport clipping and no rail over the new-tab button")
+        print("PASS: group wipe with outside/first/middle/last selection, full-height active icon, stable member order, 16ms reversals, viewport clipping and ordinary icon clicks")
     }
     private func verifySidebarAnimation() async {
         func precondition(_ condition: @autoclosure () -> Bool, _ message: String, line: UInt = #line) {
@@ -3033,7 +3145,8 @@ final class LayoutSelfCheck {
                 precondition(abs(groupedX - initialX - 10 * progress) < 0.5 &&
                              abs(selection.extraLeadingInset - 7 * progress) < 0.01,
                              "Grouped icon and highlight insets must follow the same displayed expansion progress")
-                let rail = container.railRect(container.rails.first!.rows, table: list)
+                let railView = container.railViews[group]!
+                let rail = container.convert(railView.lineRect, from: railView)
                 groupedPositions.append(groupedX)
                 railPositions.append(rail.minX)
                 widths.append(list.enclosingScrollView!.frame.width)
