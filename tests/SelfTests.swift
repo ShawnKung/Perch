@@ -217,13 +217,56 @@ enum SelfTests {
         precondition(Store(defaults: defaults).history.isEmpty)
         let address = "https://perch-bookmark.invalid"
         precondition(store.bookmark(for: address) == nil)
-        store.toggleBookmark(title: "Star test", address: address)
+        store.editCurrentBookmark(title: "Star test", address: address, tabID: store.selected!)
         precondition(store.bookmark(for: address + "/") != nil)
         precondition(store.bookmark(for: address + "/other") == nil)
-        precondition(Store(defaults: defaults).bookmark(for: address) != nil)
-        store.toggleBookmark(title: "Star test", address: address + "/")
+        precondition(Store(defaults: defaults).bookmark(for: address)?.showOnHome == false)
+        let star = store.bookmark(for: address)!
+        store.editCurrentBookmark(title: "Ignored title", address: address + "/", tabID: store.selected!)
+        precondition(store.bookmarkEditRequest?.site.id == star.id && store.bookmarkEditRequest?.isNew == false)
+        let folder = BookmarkFolder(title: "Star folder")
+        precondition(store.saveBookmarkFolder(folder))
+        let draft = BookmarkEditorDraft(store: store, request: store.bookmarkEditRequest!)
+        draft.title = "Edited star"; draft.folderID = folder.id; draft.showOnHome = true
+        precondition(draft.save())
+        let restoredStar = Store(defaults: defaults).bookmark(for: address)!
+        precondition(restoredStar.title == "Edited star" && restoredStar.folderID == folder.id && restoredStar.showOnHome == true)
+        let copyBoard = NSPasteboard.withUniqueName()
+        defer { copyBoard.releaseGlobally() }
+        BookmarkClipboard.copy([restoredStar], to: copyBoard)
+        let copyIDs = store.pasteBookmarks(from: copyBoard, to: folder.id)
+        precondition(copyIDs.count == 1)
+        let copy = store.sites.first { copyIDs.contains($0.id) }!
+        precondition(store.edit(copy, title: "Edited copy", address: copy.address, folderID: nil, showOnHome: false))
+        let restoredCopy = Store(defaults: defaults).sites.first { $0.id == copy.id }!
+        precondition(restoredCopy.title == "Edited copy" && restoredCopy.folderID == nil && restoredCopy.showOnHome == false)
+        precondition(store.removeBookmarks(copyIDs))
+        let bytes = defaults.data(forKey: "sites")
+        precondition(!store.edit(star, title: "Duplicate", address: store.sites.first!.address, folderID: nil, showOnHome: false))
+        precondition(defaults.data(forKey: "sites") == bytes)
+        precondition(!store.edit(star, title: "Invalid folder", address: address, folderID: UUID(), showOnHome: false))
+        precondition(defaults.data(forKey: "sites") == bytes)
+        let folderBytes = defaults.data(forKey: "bookmarkFolders")
+        defaults.set(Data("invalid folder data".utf8), forKey: "bookmarkFolders")
+        precondition(!store.edit(star, title: "Must not move", address: address, folderID: nil, showOnHome: false))
+        precondition(defaults.data(forKey: "sites") == bytes)
+        defaults.set(folderBytes, forKey: "bookmarkFolders")
+        let damagedSites = Data("invalid star data".utf8)
+        defaults.set(damagedSites, forKey: "sites")
+        precondition(!store.edit(star, title: "Must not save", address: address, folderID: nil, showOnHome: false))
+        precondition(defaults.data(forKey: "sites") == damagedSites && store.bookmark(for: address)?.title == "Edited star")
+        defaults.set(bytes, forKey: "sites")
+        precondition(store.deleteBookmarkFolder(folder.id))
         precondition(store.bookmark(for: address) == nil && Store(defaults: defaults).bookmark(for: address) == nil)
-        print("PASS: bookmark star URL matching, toggle and persistence")
+        let importedStar = BookmarkNode(title: "Imported star", address: "https://imported-star.invalid/")
+        _ = store.replaceImportedBookmarks([importedStar], source: .chrome)
+        store.bookmarkEditRequest = nil
+        store.editCurrentBookmark(title: "Readonly", address: importedStar.address!, tabID: store.selected!)
+        precondition(store.bookmarkEditRequest == nil && !store.sites.contains { $0.id == importedStar.id })
+        store.importedBookmarks = [:]
+        defaults.removeObject(forKey: "importedBookmarks")
+        store.notice = nil
+        print("PASS: star editor URL matching, default home exclusion, metadata persistence, duplicate/invalid-folder/corrupt-data rejection and imported isolation")
         var settings = BrowserSettings()
         precondition(settings.historyRecordingEnabled && settings.toggleKey?.code == 7 &&
                      settings.toggleKey?.modifiers == UInt32(cmdKey | controlKey), "New settings must enable history and default to Control-Command-X")
@@ -336,7 +379,7 @@ enum SelfTests {
         precondition(store.replaceImportedBookmarks(nodes, source: .chrome) == 2)
         precondition(store.importedBookmarks["Chrome"]?[0].children?.isEmpty == true)
         precondition(Store(defaults: defaults).importedBookmarks["Chrome"]?[1].children?.count == 2)
-        store.toggleBookmark(title: "", address: leaf.address!)
+        store.editCurrentBookmark(title: "", address: leaf.address!, tabID: store.selected!)
         precondition(store.importedBookmarks["Chrome"]?[1].children?.count == 2 && !store.sites.contains { $0.address == leaf.address })
         store.mergeHistory([Visit(title: "Needle from history", address: "https://needle.invalid/path", date: Date()),
                             Visit(title: "Other needle", address: "https://else.invalid/", date: Date())])
@@ -1106,6 +1149,9 @@ final class LayoutSelfCheck {
         Task { @MainActor in
             if preview {
                 await settle()
+                if CommandLine.arguments.contains("--verify-bookmark-editor") {
+                    await verifyBookmarkEditor()
+                }
                 if let index = CommandLine.arguments.firstIndex(of: "--verify-home-navigation"),
                    CommandLine.arguments.count > index + 1 {
                     await verifyHomeNavigation(baseURL: CommandLine.arguments[index + 1])
@@ -1290,7 +1336,10 @@ final class LayoutSelfCheck {
                     try? await Task.sleep(nanoseconds: CommandLine.arguments.contains("--preview-bookmarks") ? 180_000_000_000 : 60_000_000_000)
                 }
             }
-            else { await run() }
+            else {
+                await run()
+                if !CommandLine.arguments.contains("--verify-address-input") { await verifyBookmarkEditor() }
+            }
             defaults.removePersistentDomain(forName: suite)
             panel.orderOut(nil)
             exit(0)
@@ -1999,6 +2048,208 @@ final class LayoutSelfCheck {
         }
         return find(panel.contentView!)!
     }
+    func verifyBookmarkEditor() async {
+        SelfTests.prepareAccessibility()
+        func check(_ condition: Bool, _ message: String) {
+            guard condition else { fputs("FAIL: bookmark editor: \(message)\n", stderr); exit(1) }
+        }
+        func element(_ root: NSObject, label: String) -> NSObject? {
+            var visited = Set<ObjectIdentifier>()
+            func find(_ node: NSObject) -> NSObject? {
+                guard visited.insert(ObjectIdentifier(node)).inserted else { return nil }
+                let matchesLabel = node.responds(to: NSSelectorFromString("accessibilityLabel")) &&
+                    (node.value(forKey: "accessibilityLabel") as? String)?.contains(label) == true
+                let matchesID = node.responds(to: NSSelectorFromString("accessibilityIdentifier")) &&
+                    node.value(forKey: "accessibilityIdentifier") as? String == label
+                if matchesLabel || matchesID,
+                   node.responds(to: NSSelectorFromString("accessibilityRole")),
+                   ["AXButton", "AXCheckBox", "AXPopUpButton"].contains(node.value(forKey: "accessibilityRole") as? String ?? ""),
+                   node.responds(to: NSSelectorFromString("accessibilityPerformPress")),
+                   node.responds(to: NSSelectorFromString("accessibilityFrame")) { return node }
+                var children: [NSObject] = (node as? NSView)?.subviews ?? []
+                if node.responds(to: NSSelectorFromString("accessibilityChildren")),
+                   let accessible = node.value(forKey: "accessibilityChildren") as? [NSObject] { children += accessible }
+                for child in children { if let result = find(child) { return result } }
+                return nil
+            }
+            return find(root)
+        }
+        func clickAt(_ point: NSPoint, window: NSWindow) async {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.postEvent(NSEvent.mouseEvent(with: .leftMouseUp, location: point, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                context: nil, eventNumber: 1, clickCount: 1, pressure: 0)!, atStart: true)
+            NSApp.sendEvent(NSEvent.mouseEvent(with: .leftMouseDown, location: point, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!)
+            await settle()
+        }
+        func click(_ label: String, window: NSWindow) async {
+            guard let node = element(window.contentView!, label: label),
+                  let rect = (node.value(forKey: "accessibilityFrame") as? NSValue)?.rectValue else {
+                check(false, "Missing button \(label)"); return
+            }
+            await clickAt(window.convertPoint(fromScreen: NSPoint(x: rect.midX, y: rect.midY)), window: window)
+        }
+        store.sites = []
+        let editorFolder = BookmarkFolder(title: "合成书签目录")
+        check(store.saveBookmarkFolder(editorFolder), "Synthetic editor folder must be saved")
+        store.newTab(address: "http://127.0.0.1:9/star-editor")
+        let browser = store.browser!
+        browser.webView.loadHTMLString("<title>合成星标页面</title><p>Bookmark fixture</p>",
+                                      baseURL: URL(string: "http://127.0.0.1:9/star-editor"))
+        for _ in 0..<40 where browser.loading || browser.title != "合成星标页面" { await settle() }
+        await settle()
+        let address = browser.address
+        check(URLInput.parse(address, search: false) != nil, "Synthetic page must have a valid address")
+        await click("收藏当前网页", window: panel)
+        check(store.bookmarkEditor.window?.isVisible == true, "Actual star click must present the editor")
+        check(store.bookmark(for: address)?.showOnHome == false, "New stars must default to hidden on home")
+        guard let popup = store.bookmarkEditor.window else {
+            check(false, "Missing editor window"); return
+        }
+        func verifyPlacement(_ label: String) {
+            guard let node = element(panel.contentView!, label: label),
+                  let rect = (node.value(forKey: "accessibilityFrame") as? NSValue)?.rectValue,
+                  let editor = store.bookmarkEditor.window else { check(false, "Missing placement fixture"); return }
+            check(editor.styleMask.contains(.borderless) && editor.parent === panel, "Editor must be a plain child window")
+            let gap = rect.minY - editor.frame.maxY
+            let aboveGap = editor.frame.minY - rect.maxY
+            let visibleBounds = panel.screen!.visibleFrame
+            let fitsBelow = rect.minY - editor.frame.height - 16 >= visibleBounds.minY
+            check(editor.frame.width == 340 && editor.frame.height > 150 &&
+                  ((4...16).contains(gap) || (!fitsBelow && (4...16).contains(aboveGap))),
+                  "Editor must sit next to the actual button, flipping only at the screen edge: button=\(rect), editor=\(editor.frame)")
+            check(abs(editor.frame.maxX - rect.maxX) <= 8,
+                  "Editor must align with the actual button's right edge")
+        }
+        verifyPlacement("编辑当前网页书签")
+        check(element(popup.contentView!, label: "展示在首页") != nil, "Editor must offer a native home checkbox")
+        if let text = popup.firstResponder as? NSTextView {
+            text.insertText("首页菜单合成书签", replacementRange: NSRange(location: 0, length: text.string.utf16.count))
+        } else { check(false, "Name must receive native editing focus") }
+        await click("展示在首页", window: popup)
+        trackedWebMenu = nil
+        let folderObserver = NotificationCenter.default.addObserver(forName: NSMenu.didBeginTrackingNotification, object: nil, queue: .main) { [weak self] note in
+            MainActor.assumeIsolated {
+                guard let menu = note.object as? NSMenu else { return }
+                self?.trackedWebMenu = menu
+                let timer = Timer(timeInterval: 0.05, repeats: false) { _ in menu.cancelTrackingWithoutAnimation() }
+                RunLoop.main.add(timer, forMode: .common)
+            }
+        }
+        await click("bookmark-editor-folder", window: popup)
+        NotificationCenter.default.removeObserver(folderObserver)
+        check(store.bookmarkEditor.window === popup && popup.isVisible, "Native folder menu must not dismiss the editor")
+        guard let folderMenu = trackedWebMenu, let folderIndex = folderMenu.items.firstIndex(where: { $0.title == editorFolder.title }) else {
+            check(false, "Native folder picker must offer the synthetic folder"); return
+        }
+        folderMenu.performActionForItem(at: folderIndex)
+        await settle()
+        await click("完成", window: popup)
+        for _ in 0..<10 where store.bookmarkEditor.window != nil { await settle() }
+        check(store.bookmarkEditor.window == nil,
+              "Done must dismiss: shown=\(store.bookmarkEditor.window?.isVisible == true), finished=\(store.bookmarkEditor.draft?.finished == true), error=\(store.bookmarkEditor.draft?.error ?? "none")")
+        check(store.bookmark(for: address)?.title == "首页菜单合成书签" && store.bookmark(for: address)?.showOnHome == true &&
+              store.bookmark(for: address)?.folderID == editorFolder.id,
+              "Native text and checkbox events must save together")
+        await click("编辑当前网页书签", window: panel)
+        check(store.bookmarkEditor.window?.isVisible == true && store.bookmark(for: address) != nil,
+              "A saved star must edit instead of deleting")
+        verifyPlacement("编辑当前网页书签")
+        let originalFrame = panel.frame
+        panel.setFrameOrigin(NSPoint(x: originalFrame.minX + 24, y: originalFrame.minY + 20))
+        await settle()
+        verifyPlacement("编辑当前网页书签")
+        panel.setFrame(originalFrame, display: true)
+        await settle()
+        if let editor = store.bookmarkEditor.window?.firstResponder as? NSTextView {
+            editor.insertText("首页菜单合成书签·外部保存", replacementRange: NSRange(location: 0, length: editor.string.utf16.count))
+        } else { check(false, "Existing star must focus its name") }
+        await Task.yield()
+        let outside = NSPoint(x: 10, y: 180)
+        check(store.bookmarkEditor.window?.frame.contains(panel.convertPoint(toScreen: outside)) == false,
+              "The dismissal event must be outside the actual editor frame")
+        for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+            NSApp.postEvent(NSEvent.mouseEvent(with: type, location: outside, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber,
+                context: nil, eventNumber: 3, clickCount: 1, pressure: type == .leftMouseDown ? 1 : 0)!, atStart: false)
+        }
+        await settle()
+        for _ in 0..<10 where store.bookmarkEditor.window != nil { await settle() }
+        check(store.bookmarkEditor.window == nil && store.bookmark(for: address)?.title == "首页菜单合成书签·外部保存",
+              "Actual outside click must dismiss and save: shown=\(store.bookmarkEditor.window?.isVisible == true), stored=\(store.bookmark(for: address)?.title ?? ""), draft=\(store.bookmarkEditor.draft?.title ?? ""), keyOnly=\(panel.becomesKeyOnlyIfNeeded)")
+        print("PASS: native star editor name, home checkbox, Done, existing bookmark editing and outside-click save")
+        fflush(stdout)
+        store.newTab()
+        await settle()
+        trackedWebMenu = nil
+        let observer = NotificationCenter.default.addObserver(forName: NSMenu.didBeginTrackingNotification, object: nil, queue: .main) { [weak self] note in
+            MainActor.assumeIsolated {
+                guard let menu = note.object as? NSMenu else { return }
+                self?.trackedWebMenu = menu
+                let timer = Timer(timeInterval: 0.05, repeats: false) { _ in menu.cancelTrackingWithoutAnimation() }
+                RunLoop.main.add(timer, forMode: .common)
+            }
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+        func menu() async -> NSMenu {
+            trackedWebMenu = nil
+            panel.focusWindow()
+            guard let node = element(panel.contentView!, label: "首页菜单合成书签"),
+                  let rect = (node.value(forKey: "accessibilityFrame") as? NSValue)?.rectValue else {
+                check(false, "Missing home shortcut"); return NSMenu()
+            }
+            let point = panel.convertPoint(fromScreen: NSPoint(x: rect.midX, y: rect.midY))
+            DispatchQueue.main.async {
+                NSApp.sendEvent(NSEvent.mouseEvent(with: .rightMouseDown, location: point, modifierFlags: [],
+                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: self.panel.windowNumber,
+                    context: nil, eventNumber: 2, clickCount: 1, pressure: 1)!)
+            }
+            for _ in 0..<20 where trackedWebMenu == nil { await settle() }
+            guard let menu = trackedWebMenu else { check(false, "Actual right click must open a native shortcut menu"); return NSMenu() }
+            return menu
+        }
+        func perform(_ title: String, in menu: NSMenu) async {
+            guard let item = menu.items.first(where: { $0.title == title }), let action = item.action else {
+                check(false, "Missing menu action \(title)"); return
+            }
+            check(NSApp.sendAction(action, to: item.target, from: item), "Menu action must dispatch")
+            await settle()
+        }
+        let firstMenu = await menu()
+        check(firstMenu.items.filter { !$0.isSeparatorItem }.map(\.title) ==
+              ["在新标签页打开", "临时浏览", "编辑书签…", "复制网址", "从首页移除", "删除书签"], "Home menu must offer the common actions")
+        await perform("编辑书签…", in: firstMenu)
+        check(store.bookmarkEditor.window?.isVisible == true && store.bookmarkEditor.draft?.request.showAddress == true,
+              "Home menu editing must include the address")
+        verifyPlacement("首页菜单合成书签")
+        browser.webView.loadHTMLString("<title>Background bookmark fixture</title>",
+                                      baseURL: URL(string: "http://127.0.0.1:9/background-bookmark"))
+        for _ in 0..<20 where browser.address == address { await settle() }
+        check(browser.address != address && store.bookmarkEditor.window?.isVisible == true,
+              "Background navigation must not close another page's bookmark draft")
+        let forcedTitle = "首页菜单合成书签·窗口关闭保存"
+        if let editor = store.bookmarkEditor.window?.firstResponder as? NSTextView {
+            editor.insertText(forcedTitle, replacementRange: NSRange(location: 0, length: editor.string.utf16.count))
+            await settle()
+        } else { check(false, "Home editor must focus its name") }
+        if let root = store.bookmarkEditor.window?.contentView,
+           let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds) {
+            root.cacheDisplay(in: root.bounds, to: bitmap)
+            try? bitmap.representation(using: .png, properties: [:])?.write(to:
+                FileManager.default.temporaryDirectory.appendingPathComponent("perch-bookmark-editor.png"))
+        }
+        store.bookmarkEditor.window?.close()
+        await settle()
+        check(store.bookmark(for: address)?.title == forcedTitle, "Forced AppKit dismissal must save the draft before clearing it")
+        let hideMenu = await menu()
+        await perform("从首页移除", in: hideMenu)
+        check(store.bookmark(for: address)?.showOnHome == false && element(panel.contentView!, label: "首页菜单合成书签") == nil,
+              "Removing a shortcut must keep the bookmark and remove its actual home target")
+        print("PASS: plain editor sits next to actual star/home buttons and follows parent movement; native editing, outside/forced dismissal and home menu actions")
+        fflush(stdout)
+    }
     func verifyHomeNavigation(baseURL: String) async {
         SelfTests.prepareAccessibility()
         func clickAccessible(_ label: String) async throws {
@@ -2320,7 +2571,7 @@ final class LayoutSelfCheck {
         let bookmark = bookmarkMenu.items.first { $0.title == "加入书签" }!
         precondition(NSApp.sendAction(bookmark.action!, to: bookmark.target, from: bookmark) && saved)
         let savedMenu = NSMenu(); browser.extendContextMenu(savedMenu)
-        precondition(savedMenu.items.contains { $0.title == "移除书签" })
+        precondition(savedMenu.items.contains { $0.title == "编辑书签…" })
         browser.address = "javascript:alert(1)"
         precondition(browser.validateMenuItem(copy), "Copy keeps the menu-opening URL snapshot")
         let invalid = NSMenu(); browser.extendContextMenu(invalid)

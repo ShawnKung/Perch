@@ -218,7 +218,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         menu.addItem(.separator())
         add("复制当前网址", "copy")
         add("在 Perch 中打开", "external")
-        if onBookmark != nil { add(isBookmarked?() == true ? "移除书签" : "加入书签", "bookmark") }
+        if onBookmark != nil { add(isBookmarked?() == true ? "编辑书签…" : "加入书签", "bookmark") }
         add("在页面中查找…", "find")
     }
 
@@ -458,6 +458,8 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
 @MainActor
 final class Store: ObservableObject {
     lazy var linkPreview = LinkPreviewController(store: self)
+    lazy var bookmarkEditor = BookmarkEditorController()
+    @Published var bookmarkEditRequest: BookmarkEditRequest?
     private let bookmarkClipboardSession = UUID()
     @Published var sites: [Site] = [] { didSet { suggestionRevision &+= 1 } }
     @Published var tabs: [Tab] = [] { didSet {
@@ -501,6 +503,10 @@ final class Store: ObservableObject {
         }
     }
     @Published var selected: UUID? { didSet {
+        if oldValue != selected {
+            if bookmarkEditRequest != nil { bookmarkEditRequest = nil }
+            bookmarkEditor.close()
+        }
         if oldValue != selected, let selected, tabs.contains(where: { $0.id == selected }) {
             activationHistory.removeAll { $0 == selected }
             activationHistory.append(selected)
@@ -517,6 +523,7 @@ final class Store: ObservableObject {
     @Published var notice: String?
     @Published var libraryShowsHistory = false
     @Published var library: LibraryPage? { didSet {
+        if library != nil { bookmarkEditor.close() }
         if library != nil { browser?.passwordBridge.dismiss() }
         if library != .bookmarks { libraryShowsHistory = false }
     } }
@@ -653,7 +660,7 @@ final class Store: ObservableObject {
             }
             view.onBookmark = { [weak self, weak view] in
                 guard let self, let view else { return }
-                self.toggleBookmark(title: view.title, address: view.address)
+                self.editCurrentBookmark(title: view.title, address: view.address, tabID: id)
             }
             view.isBookmarked = { [weak self, weak view] in
                 guard let self, let view else { return false }
@@ -1195,7 +1202,7 @@ final class Store: ObservableObject {
     }
 
     @discardableResult
-    func add(title: String, address: String, folderID: UUID? = nil) -> Bool {
+    func add(title: String, address: String, folderID: UUID? = nil, showOnHome: Bool? = nil) -> Bool {
         guard validBookmarkFolder(folderID) else { return false }
         guard let url = URLInput.parse(address, search: false) else {
             notice = "请输入完整网址，例如 https://example.com。"
@@ -1206,7 +1213,8 @@ final class Store: ObservableObject {
             return false
         }
         let site = Site(title: title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        ? url.host! : String(title.prefix(80)), address: url.absoluteString, folderID: folderID)
+                        ? url.host! : String(title.prefix(80)), address: url.absoluteString,
+                        folderID: folderID, showOnHome: showOnHome)
         let updated = sites + [site]
         guard save(updated) else { return false }
         sites = updated
@@ -1382,25 +1390,45 @@ final class Store: ObservableObject {
         sites + importedBookmarks.keys.sorted().flatMap { (importedBookmarks[$0] ?? []).flatMap(\.sites) }
     }
 
-    func toggleBookmark(title: String, address: String) {
-        if let url = URLInput.parse(address, search: false),
-           sites.contains(where: { URLInput.parse($0.address, search: false) == url }) {
-            let updated = sites.filter { URLInput.parse($0.address, search: false) != url }
-            guard save(updated) else { return }
-            sites = updated
-        } else if bookmark(for: address) != nil {
+    func editCurrentBookmark(title: String, address: String, tabID: UUID) {
+        guard selected == tabID, URLInput.parse(address, search: false) != nil else { return }
+        let isNew = bookmark(for: address) == nil
+        if isNew, !add(title: title, address: address, showOnHome: false) { return }
+        guard let site = bookmark(for: address), sites.contains(where: { $0.id == site.id }) else {
             notice = "这个书签由浏览器导入，为只读。可以在书签管理中查看，重新导入会更新对应目录。"
-        } else { _ = add(title: title, address: address) }
+            return
+        }
+        bookmarkEditRequest = BookmarkEditRequest(site: site, ownerID: tabID, isNew: isNew)
     }
 
     func edit(_ site: Site, title: String, address: String) -> Bool {
+        guard let current = sites.first(where: { $0.id == site.id }) else { return false }
+        return edit(site, title: title, address: address, folderID: current.folderID, showOnHome: current.showOnHome)
+    }
+
+    func edit(_ site: Site, title: String, address: String, folderID: UUID?, showOnHome: Bool?) -> Bool {
+        guard validBookmarkFolder(folderID) else { return false }
         guard let url = URLInput.parse(address, search: false),
               let index = sites.firstIndex(where: { $0.id == site.id }) else {
             notice = "请输入有效网址。"; return false
         }
+        guard URLInput.parse(sites[index].address, search: false) == url ||
+              !sites.contains(where: { $0.id != site.id && URLInput.parse($0.address, search: false) == url }) else {
+            notice = "这个网站已经在收藏里了。"; return false
+        }
+        if sites[index].folderID != folderID {
+            guard !protectedKeys.contains("bookmarkFolders"),
+                  defaults.data(forKey: "bookmarkFolders").map({
+                      (try? JSONDecoder().decode([BookmarkFolder].self, from: $0)) != nil
+                  }) ?? true else {
+                notice = "书签目录数据损坏，原始数据已保留，暂时禁止修改目录。"; return false
+            }
+        }
         var updated = sites
-        updated[index].title = title.isEmpty ? url.host! : String(title.prefix(80))
+        updated[index].title = title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? url.host! : String(title.prefix(80))
         updated[index].address = url.absoluteString
+        updated[index].folderID = folderID
+        updated[index].showOnHome = showOnHome
         guard save(updated) else { return false }
         sites = updated; return true
     }
@@ -1587,6 +1615,11 @@ struct BrowserAddressBar: View {
     @ObservedObject var store: Store
     let tabID: UUID
 
+    private func closeBookmarkEditor() {
+        if store.bookmarkEditRequest?.ownerID == tabID { store.bookmarkEditRequest = nil }
+        if store.bookmarkEditor.draft?.request.ownerID == tabID { store.bookmarkEditor.close() }
+    }
+
     var body: some View {
         HStack(spacing: 3) {
                 GlyphButton(symbol: "chevron.left", label: "后退", size: 28) { browser.goBack() }
@@ -1601,12 +1634,13 @@ struct BrowserAddressBar: View {
                     PasswordFillButton(store: store, browser: browser)
                     let saved = store.bookmark(for: browser.address) != nil
                     GlyphButton(symbol: saved ? "star.fill" : "star",
-                                label: saved ? "取消收藏当前网页" : "收藏当前网页", active: saved, activeBackground: false, size: 26) {
-                        store.toggleBookmark(title: browser.title, address: browser.address)
+                                label: saved ? "编辑当前网页书签" : "收藏当前网页", active: saved, activeBackground: false, size: 26) {
+                        store.editCurrentBookmark(title: browser.title, address: browser.address, tabID: tabID)
                     }
                     .disabled(URLInput.parse(browser.address, search: false) == nil)
                     .accessibilityValue(saved ? "已收藏" : "未收藏")
                     .anchorPreference(key: BookmarkButtonAnchor.self, value: .bounds) { $0 }
+                    .background(BookmarkEditorAnchor(store: store, ownerID: tabID))
                     .padding(.trailing, 3)
                 }.background(Style.paper, in: RoundedRectangle(cornerRadius: 8))
                     .overlay(RoundedRectangle(cornerRadius: 8).stroke(Style.line, lineWidth: 1).allowsHitTesting(false))
@@ -1621,6 +1655,8 @@ struct BrowserAddressBar: View {
                         }
                     }
         }
+        .onChange(of: browser.address) { _ in closeBookmarkEditor() }
+        .onDisappear { closeBookmarkEditor() }
     }
 }
 
@@ -1844,7 +1880,7 @@ struct HomeScreen: View {
                         .overlay(RoundedRectangle(cornerRadius: 14).stroke(Style.line))
                 }.buttonStyle(.plain)
 
-                if !shortcuts.isEmpty {
+                Group {
                     VStack(alignment: .leading, spacing: 14) {
                         HStack {
                             Text("快捷入口").font(.system(size: 13, weight: .semibold))
@@ -1874,6 +1910,25 @@ struct HomeScreen: View {
                                     }.padding(17).frame(maxWidth: .infinity, alignment: .leading)
                                         .background(.white, in: RoundedRectangle(cornerRadius: 12))
                                 }.buttonStyle(.plain)
+                                    .background(BookmarkEditorAnchor(store: store, ownerID: site.id))
+                                    .contextMenu {
+                                        Button("在新标签页打开") { store.newTab(address: site.address, after: tabID) }
+                                        Button("临时浏览") {
+                                            guard let parent = NSApp.keyWindow else { return }
+                                            store.bookmarkEditor.preview(site, store: store, parent: parent, tabID: tabID)
+                                        }
+                                        Divider()
+                                        Button("编辑书签…") {
+                                            store.bookmarkEditRequest = BookmarkEditRequest(site: site, ownerID: site.id, showAddress: true)
+                                        }
+                                        Button("复制网址") {
+                                            let board = store.browser?.clipboard ?? NSPasteboard.general
+                                            board.clearContents(); board.setString(site.address, forType: .string)
+                                        }
+                                        Divider()
+                                        Button("从首页移除") { store.toggleBookmarkHome(site.id) }
+                                        Button("删除书签") { store.remove(site) }
+                                    }
                             }
                         }
                     }
@@ -2625,7 +2680,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc func goBack() { navigationBrowser?.goBack() }
     @objc func goForward() { navigationBrowser?.goForward() }
     @objc func bookmarkPage() {
-        if let browser = activeBrowser { store.toggleBookmark(title: browser.title, address: browser.address) }
+        if let browser = activeBrowser, let tabID = store.selected {
+            store.editCurrentBookmark(title: browser.title, address: browser.address, tabID: tabID)
+        }
     }
     @objc func findPage() { activeBrowser?.finding = true }
     @objc func findNext() { activeBrowser?.find() }
