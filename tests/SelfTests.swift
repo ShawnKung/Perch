@@ -1218,7 +1218,8 @@ final class LayoutSelfCheck {
                 if CommandLine.arguments.contains("--verify-bookmark-drag") {
                     await verifyBookmarkDrag()
                 }
-                if CommandLine.arguments.contains("--verify-bookmark-folders") {
+                if CommandLine.arguments.contains("--verify-bookmark-folders") ||
+                    CommandLine.arguments.contains("--verify-home-bookmarks") {
                     await verifyBookmarkFolders()
                 }
                 if let index = CommandLine.arguments.firstIndex(of: "--verify-home-navigation"),
@@ -1432,7 +1433,7 @@ final class LayoutSelfCheck {
         let parent = BookmarkFolder(title: "Personal parent")
         let child = BookmarkFolder(title: "Personal child", parentID: parent.id)
         store.bookmarkFolders = [parent, child]
-        store.sites = [Site(title: "Root bookmark", address: "https://root.invalid"),
+        store.sites = [Site(title: "Root bookmark", address: "https://root.invalid", showOnHome: false),
                        Site(title: "Nested bookmark", address: "https://nested.invalid", folderID: child.id),
                        Site(title: "Nested sibling", address: "https://sibling.invalid", folderID: child.id)]
         store.importedBookmarks = ["Chrome": [BookmarkNode(title: "Imported parent", children: [
@@ -1440,9 +1441,68 @@ final class LayoutSelfCheck {
         ])]]
         defaults.set(try! JSONEncoder().encode(store.sites), forKey: "sites")
         defaults.set(try! JSONEncoder().encode(store.bookmarkFolders), forKey: "bookmarkFolders")
-        store.library = .bookmarks
         await settle()
-        let sheet = panel.sheets.first!
+        var sheet: NSWindow = panel
+        var visited: [ObjectIdentifier: NSObject] = [:]
+        func button(_ node: Any, label: String, requireButtonRole: Bool = true) -> NSObject? {
+            guard let object = node as? NSObject, visited[ObjectIdentifier(object)] == nil else { return nil }
+            // Retain transient accessibility nodes so their addresses cannot be reused during traversal.
+            visited[ObjectIdentifier(object)] = object
+            let role = object.responds(to: NSSelectorFromString("accessibilityRole")) ? object.value(forKey: "accessibilityRole") as? String : nil
+            let name = object.responds(to: NSSelectorFromString("accessibilityLabel")) ? object.value(forKey: "accessibilityLabel") as? String : nil
+            if name == label && (!requireButtonRole || role == NSAccessibility.Role.button.rawValue) { return object }
+            for child in (object as? NSView)?.subviews ?? [] {
+                if let result = button(child, label: label, requireButtonRole: requireButtonRole) { return result }
+            }
+            for selector in ["accessibilityChildren", "accessibilityContents"] where object.responds(to: NSSelectorFromString(selector)) {
+                for child in object.value(forKey: selector) as? [Any] ?? [] {
+                    if let result = button(child, label: label, requireButtonRole: requireButtonRole) { return result }
+                }
+            }
+            return nil
+        }
+        func click(_ label: String, in window: NSWindow? = nil) async {
+            let window = window ?? sheet
+            var target: NSObject?
+            for _ in 0..<10 {
+                visited.removeAll()
+                target = button(window.contentView!, label: label, requireButtonRole: window !== panel)
+                if target != nil { break }
+                await settle()
+            }
+            guard let target else {
+                check(false, "Missing real button \(label) in \(window === panel ? "home" : "manager"), scope \(store.libraryBookmarkScope)"); return
+            }
+            let frameValue = target.value(forKey: "accessibilityFrame")
+            guard let frame = (frameValue as? NSValue)?.rectValue else {
+                check(false, "Invalid frame for \(label): \(String(describing: frameValue)), \(target)"); return
+            }
+            let point = window.convertPoint(fromScreen: NSPoint(x: frame.midX, y: frame.midY))
+            window.makeKeyAndOrderFront(nil)
+            // SwiftUI's button gestures need AppKit to establish currentEvent through its queue.
+            for type: NSEvent.EventType in [.leftMouseUp, .leftMouseDown] {
+                NSApp.postEvent(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
+                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                    context: nil, eventNumber: 1, clickCount: 1, pressure: type == .leftMouseUp ? 0 : 1)!, atStart: true)
+            }
+            await settle()
+        }
+        let homeID = store.selected!
+        let homeEntry = CommandLine.arguments.contains("--verify-home-bookmarks")
+        if homeEntry {
+            check(!store.homeShortcuts.contains { $0.title == "Root bookmark" },
+                  "The home entry fixture must include a bookmark hidden from shortcuts")
+            await click("全部书签", in: panel)
+            check(store.library == .bookmarks && store.libraryBookmarkScope == .all,
+                  "The actual home button must open the all-bookmarks scope")
+        } else {
+            store.openBookmarks()
+            await settle()
+        }
+        guard let manager = panel.sheets.first else {
+            check(false, "Bookmark entry must present the manager"); return
+        }
+        sheet = manager
         func find(_ view: NSView) -> BookmarkOutline? {
             if let table = view as? BookmarkOutline { return table }
             for subview in view.subviews { if let table = find(subview) { return table } }
@@ -1469,38 +1529,6 @@ final class LayoutSelfCheck {
             events(at: table.convert(NSPoint(x: 80, y: rect.midY), to: nil), count: 2)
             await settle()
         }
-        var visited = Set<ObjectIdentifier>()
-        func button(_ node: Any, label: String) -> NSObject? {
-            guard let object = node as? NSObject, visited.insert(ObjectIdentifier(object)).inserted else { return nil }
-            let role = object.responds(to: NSSelectorFromString("accessibilityRole")) ? object.value(forKey: "accessibilityRole") as? String : nil
-            let name = object.responds(to: NSSelectorFromString("accessibilityLabel")) ? object.value(forKey: "accessibilityLabel") as? String : nil
-            if role == NSAccessibility.Role.button.rawValue && name == label { return object }
-            for child in (object as? NSView)?.subviews ?? [] {
-                if let result = button(child, label: label) { return result }
-            }
-            for selector in ["accessibilityChildren", "accessibilityContents"] where object.responds(to: NSSelectorFromString(selector)) {
-                for child in object.value(forKey: selector) as? [Any] ?? [] {
-                    if let result = button(child, label: label) { return result }
-                }
-            }
-            return nil
-        }
-        func click(_ label: String) async {
-            visited.removeAll()
-            guard let target = button(sheet.contentView!, label: label),
-                  let frame = (target.value(forKey: "accessibilityFrame") as? NSValue)?.rectValue else {
-                check(false, "Missing real button \(label)"); return
-            }
-            let point = sheet.convertPoint(fromScreen: NSPoint(x: frame.midX, y: frame.midY))
-            sheet.makeKeyAndOrderFront(nil)
-            // SwiftUI's button gestures need AppKit to establish currentEvent through its queue.
-            for type: NSEvent.EventType in [.leftMouseUp, .leftMouseDown] {
-                NSApp.postEvent(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
-                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: sheet.windowNumber,
-                    context: nil, eventNumber: 1, clickCount: 1, pressure: type == .leftMouseUp ? 0 : 1)!, atStart: true)
-            }
-            await settle()
-        }
         func openFolder(_ id: UUID) async {
             guard let item = coordinator.roots.first(where: { $0.folderID == id }) else {
                 check(false, "Open target must be in the current directory"); return
@@ -1517,6 +1545,32 @@ final class LayoutSelfCheck {
             check(hit != nil && !cell.openButton.isHidden, "The visible open button must receive the native click")
             events(at: point)
             await settle()
+        }
+        if homeEntry {
+            check(coordinator.roots.contains { $0.key == "Chrome" } &&
+                  coordinator.roots.first { $0.folderID == parent.id }?.children?.first?.folderID == child.id,
+                  "Home all-bookmarks entry must include personal folder hierarchy and browser imports")
+            let bookmark = coordinator.roots.first { $0.site?.title == "Root bookmark" }!
+            let row = table.row(forItem: bookmark)
+            table.scrollRowToVisible(row)
+            table.layoutSubtreeIfNeeded()
+            let cell = table.view(atColumn: 0, row: row, makeIfNecessary: true) as! BookmarkCell
+            let point = cell.openButton.convert(NSPoint(x: cell.openButton.bounds.midX,
+                                                       y: cell.openButton.bounds.midY), to: nil)
+            let root = sheet.contentView!
+            var hit = root.hitTest(root.superview?.convert(point, from: nil) ?? point)
+            while let view = hit, view !== cell.openButton { hit = view.superview }
+            check(hit != nil && !cell.openButton.isHidden, "The hidden-shortcut bookmark open button must receive the native click")
+            events(at: point)
+            await settle()
+            let expectedAddress = URLInput.parse(bookmark.site!.address, search: false)!.absoluteString
+            let openedAddress = store.tabs.first { $0.id == homeID }?.address
+            check(store.library == nil && store.libraryBookmarkScope == .root && store.selected == homeID &&
+                  openedAddress == expectedAddress,
+                  "Opening a hidden-shortcut bookmark must use the current home tab and close/reset the manager (library \(String(describing: store.library)), scope \(store.libraryBookmarkScope), same tab \(store.selected == homeID), address \(String(describing: openedAddress)))")
+            print("PASS: home all-bookmarks native button, complete personal/imported tree and hidden-shortcut bookmark navigation in the current home tab")
+            fflush(stdout)
+            return
         }
         await click("Chrome")
         let imported = coordinator.roots[0]

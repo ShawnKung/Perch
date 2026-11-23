@@ -918,7 +918,7 @@ struct NativeBookmarks: NSViewRepresentable {
     }
 }
 
-private enum BookmarkScope: Equatable {
+enum BookmarkScope: Equatable {
     case all, root, folder(UUID), imported(String), history, group(UUID)
 }
 
@@ -955,7 +955,7 @@ struct BookmarksPage: View {
 
     init(store: Store) {
         self.store = store
-        _scope = State(initialValue: store.libraryShowsHistory ? .history : .root)
+        _scope = State(initialValue: store.libraryBookmarkScope)
     }
 
     private var currentFolder: UUID? {
@@ -1161,7 +1161,7 @@ struct BookmarksPage: View {
             .onChange(of: search) { _ in selection.removeAll() }
             .onChange(of: scope) { value in
                 selection.removeAll(); editing = nil; adding = false; search = ""
-                store.libraryShowsHistory = value == .history
+                store.libraryBookmarkScope = value
             }
             .onChange(of: store.bookmarkItemIDs) { ids in selection.formIntersection(ids) }
             .alert("清空全部历史记录？", isPresented: $clearHistory) {

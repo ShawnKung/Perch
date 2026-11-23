@@ -613,7 +613,7 @@ struct SettingsPage: View {
                 Toggle("记录历史记录", isOn: $draft.historyRecordingEnabled)
                 HStack {
                     Button("清除全部历史记录") { clearHistory = true }
-                    Button("查看历史记录") { store.openBookmarks(history: true) }
+                    Button("查看历史记录") { store.openBookmarks(scope: .history) }
                 }
             }
             Section("密码") {

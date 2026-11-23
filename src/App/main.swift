@@ -546,11 +546,11 @@ final class Store: ObservableObject {
     @Published var pinned = false
     @Published var adding = false
     @Published var notice: String?
-    @Published var libraryShowsHistory = false
+    @Published var libraryBookmarkScope = BookmarkScope.root
     @Published var library: LibraryPage? { didSet {
         if library != nil { bookmarkEditor.close() }
         if library != nil { browser?.passwordBridge.dismiss() }
-        if library != .bookmarks { libraryShowsHistory = false }
+        if library != .bookmarks { libraryBookmarkScope = .root }
     } }
     @Published var importing = false
     @Published var recentlyClosed: [Tab] = []
@@ -560,8 +560,8 @@ final class Store: ObservableObject {
     private var activationHistory: [UUID] = []
     let defaults: UserDefaults
     func cachedFavicon(_ address: String) -> NSImage? { FaviconCache.image(for: address, defaults: defaults) }
-    func openBookmarks(history: Bool = false) {
-        libraryShowsHistory = history
+    func openBookmarks(scope: BookmarkScope = .root) {
+        libraryBookmarkScope = scope
         library = .bookmarks
     }
     private var protectedKeys = Set<String>()
@@ -1939,6 +1939,10 @@ struct HomeScreen: View {
                         HStack {
                             Text("快捷入口").font(.system(size: 13, weight: .semibold))
                             Spacer()
+                            Button { store.openBookmarks(scope: .all) } label: {
+                                Label("全部书签", systemImage: "bookmark")
+                            }.buttonStyle(.plain).font(.system(size: 12)).foregroundStyle(Style.accent)
+                                .accessibilityLabel("全部书签")
                             Button { store.adding = true } label: { Label("添加", systemImage: "plus") }
                                 .buttonStyle(.plain).font(.system(size: 12)).foregroundStyle(Style.accent)
                         }
@@ -2034,7 +2038,7 @@ struct WindowTools: View {
             }
             Menu {
                 Button("书签管理") { store.openBookmarks() }
-                Button("历史记录") { store.openBookmarks(history: true) }
+                Button("历史记录") { store.openBookmarks(scope: .history) }
                 Button("密码管理") { store.library = .passwords }
                 Divider()
                 Button("在新标签页打开") {
@@ -2701,7 +2705,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     @objc func reopenTab() { guard store.library == nil && !store.adding else { return }; store.reopen() }
     @objc func settings() { store.library = .settings }
-    @objc func history() { store.openBookmarks(history: true) }
+    @objc func history() { store.openBookmarks(scope: .history) }
     @objc func focusAddress() { NotificationCenter.default.post(name: .focusAddress, object: nil) }
     private var activeBrowser: Browser? { panel?.attachedSheet == nil && store.library == nil && !store.adding ? store.browser : nil }
     @objc func reloadPage() { activeBrowser?.webView.reload() }
