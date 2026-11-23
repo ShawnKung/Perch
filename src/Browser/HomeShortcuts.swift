@@ -248,19 +248,6 @@ final class HomeShortcutCell: NSView {
         }
     }
     func dragImage() -> NSImage? {
-        guard let bitmap = bitmapImageRepForCachingDisplay(in: bounds) else { return nil }
-        cacheDisplay(in: bounds, to: bitmap)
-        let snapshot = NSImage(size: bounds.size); snapshot.addRepresentation(bitmap)
-        return NSImage(size: bounds.size, flipped: isFlipped) { rect in
-            NSGraphicsContext.saveGraphicsState()
-            let path = NSBezierPath(roundedRect: rect, xRadius: 12, yRadius: 12)
-            path.addClip()
-            snapshot.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 0.88,
-                          respectFlipped: true, hints: nil)
-            PerchTheme.shared.selection.accent.withAlphaComponent(0.38).setStroke()
-            NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: 12, yRadius: 12).stroke()
-            NSGraphicsContext.restoreGraphicsState()
-            return true
-        }
+        dragPreview(radius: 12)
     }
 }

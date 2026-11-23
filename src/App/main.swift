@@ -1398,6 +1398,27 @@ final class Store: ObservableObject {
     }
 
     @discardableResult
+    func reorderBookmarkSites(_ ids: [UUID]) -> Bool {
+        let selected = Set(ids)
+        let existing = Set(sites.map(\.id))
+        guard !ids.isEmpty, selected.count == ids.count, existing.count == sites.count, selected.isSubset(of: existing),
+              !protectedKeys.contains("sites"), !protectedKeys.contains("homeShortcutOrder") else { return false }
+        let current = Dictionary(sites.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        var iterator = ids.makeIterator()
+        let updated = sites.map { selected.contains($0.id) ? current[iterator.next()!]! : $0 }
+        guard updated.map(\.id) != sites.map(\.id) else { return true }
+        do {
+            // Freeze the homepage's current order before changing the bookmark fallback order.
+            let homeOrder = orderedHomeIDs
+            let homeData = try JSONEncoder().encode(homeOrder)
+            guard save(updated) else { return false }
+            defaults.set(homeData, forKey: "homeShortcutOrder")
+            homeShortcutOrder = homeOrder; sites = updated
+            return true
+        } catch { notice = "保存书签顺序失败：\(error.localizedDescription)"; return false }
+    }
+
+    @discardableResult
     func deleteBookmarkItems(_ ids: Set<UUID>) -> Bool {
         let folders = bookmarkFolders.filter { ids.contains($0.id) }
             .reduce(into: Set<UUID>()) { $0.formUnion(bookmarkFolderDescendants($1.id)) }

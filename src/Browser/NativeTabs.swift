@@ -93,7 +93,7 @@ final class TabTable: NSTableView {
         for row in ids.indices {
             let placeholder = ids[row] == dragID
             (view(atColumn: 0, row: row, makeIfNecessary: false) as? TabCell)?.content.isHidden = placeholder
-            (view(atColumn: 0, row: row, makeIfNecessary: false) as? TabGroupCell)?.alphaValue = placeholder ? 0.35 : 1
+            (view(atColumn: 0, row: row, makeIfNecessary: false) as? TabGroupCell)?.alphaValue = placeholder ? 0 : 1
             if let view = rowView(atRow: row, makeIfNecessary: false) as? TabSelectionRow {
                 view.dragPlaceholder = placeholder
                 view.needsDisplay = true
@@ -618,24 +618,8 @@ final class TabCell: NSTableCellView {
         layoutSubtreeIfNeeded()
     }
     func dragImage() -> NSImage {
-        layoutSubtreeIfNeeded()
         let size = NSSize(width: max(1, bounds.width - 2), height: bounds.height)
-        let snapshot = bitmapImageRepForCachingDisplay(in: bounds)
-        if let snapshot { cacheDisplay(in: bounds, to: snapshot) }
-        let content = NSImage(size: bounds.size)
-        if let snapshot { content.addRepresentation(snapshot) }
-        return NSImage(size: size, flipped: true) { bounds in
-            let card = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 9, yRadius: 9)
-            NSGraphicsContext.saveGraphicsState()
-            card.addClip()
-            NSColor(Style.sidebar).withAlphaComponent(0.88).setFill(); card.fill()
-            content.draw(in: bounds, from: .zero, operation: .sourceOver, fraction: 0.88,
-                         respectFlipped: true, hints: nil)
-            NSGraphicsContext.restoreGraphicsState()
-            NSColor(Style.accent).withAlphaComponent(0.38).setStroke()
-            card.lineWidth = 1; card.stroke()
-            return true
-        }
+        return dragPreview(size: size, radius: 9, background: NSColor(Style.sidebar)) ?? NSImage(size: size)
     }
 }
 
@@ -1269,7 +1253,7 @@ struct NativeTabList: NSViewRepresentable {
                                                  count: tabs.filter { $0.groupID == id }.count)
                 (view as? TabGroupCell)?.dropTarget = groupDropValid && dropGroup == id
                 (view as? TabGroupCell)?.toggle = { [weak store] in store?.toggleTabGroup(id) }
-                view?.alphaValue = id == table.dragID ? 0.35 : 1
+                view?.alphaValue = id == table.dragID ? 0 : 1
             }
         }
         private func displayedTab(_ id: UUID) -> Tab? {
@@ -1297,12 +1281,7 @@ struct NativeTabList: NSViewRepresentable {
             table.beginDrag(at: row)
             let image: NSImage
             if let cell = cell as? TabCell { image = cell.dragImage() }
-            else {
-                image = NSImage(size: cell.bounds.size)
-                if let bitmap = cell.bitmapImageRepForCachingDisplay(in: cell.bounds) {
-                    cell.cacheDisplay(in: cell.bounds, to: bitmap); image.addRepresentation(bitmap)
-                }
-            }
+            else { image = cell.dragPreview(radius: 9) ?? NSImage(size: cell.bounds.size) }
             session.enumerateDraggingItems(options: [], for: table, classes: [NSPasteboardItem.self], searchOptions: [:]) {
                 item, _, _ in
                 let frame = table.rect(ofRow: row).insetBy(dx: 1, dy: 0)
