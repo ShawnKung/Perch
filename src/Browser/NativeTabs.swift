@@ -375,16 +375,21 @@ final class TabRowWipe: NSView {
 final class TabListContainer: NSView {
     static let railGutter: CGFloat = 3
     static let groupAnimationDuration = 0.28
+    static let bottomFadeHeight: CGFloat = 18
     let scroll = TabScrollView()
     var expansion: CGFloat = 1 { didSet { railViews.values.forEach { $0.expansion = expansion } } }
     private(set) var rails: [(id: UUID, rows: ClosedRange<Int>, color: NSColor, expanded: Bool, retained: Bool)] = []
     private(set) var railViews: [UUID: TabGroupRailView] = [:]
     private var boundsObserver: NSObjectProtocol?
+    private let bottomFade = CAGradientLayer()
     override var isFlipped: Bool { true }
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.masksToBounds = true
+        bottomFade.colors = [NSColor.white.cgColor, NSColor.white.cgColor, NSColor.clear.cgColor]
+        bottomFade.startPoint = CGPoint(x: 0.5, y: 0)
+        bottomFade.endPoint = CGPoint(x: 0.5, y: 1)
         addSubview(scroll)
         scroll.contentView.postsBoundsChangedNotifications = true
         boundsObserver = NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification,
@@ -401,6 +406,13 @@ final class TabListContainer: NSView {
     }
     private func layoutRails() {
         guard let table = scroll.documentView as? TabTable else { return }
+        // Mask the viewport and group rails together without adding a hit-testing overlay.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        bottomFade.frame = bounds
+        bottomFade.locations = [0, NSNumber(value: max(0, 1 - Self.bottomFadeHeight / max(1, bounds.height))), 1]
+        layer?.mask = table.bounds.maxY > scroll.contentView.bounds.maxY + 1 ? bottomFade : nil
+        CATransaction.commit()
         for rail in rails {
             guard let view = railViews[rail.id] else { continue }
             view.frame = bounds
@@ -852,6 +864,7 @@ struct NativeTabList: NSViewRepresentable {
         context.coordinator.store = store
         context.coordinator.expansion = expansion
         context.coordinator.update(table, compact: compact, theme: theme.selection)
+        container.needsLayout = true
     }
 
     @MainActor final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {

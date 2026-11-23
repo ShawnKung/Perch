@@ -669,6 +669,7 @@ struct SettingsPage: View {
             if !message.isEmpty {
                 Text(message).font(.caption).foregroundStyle(Style.muted)
             }
+            AboutSettingsGroup(store: store) { store.checkForUpdates(manual: true) }
         }.formStyle(.grouped).scrollContentBackground(.hidden)
             .alert("清除全部历史记录？", isPresented: $clearHistory) {
                 Button("取消", role: .cancel) {}
