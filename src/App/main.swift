@@ -1137,6 +1137,11 @@ final class Store: ObservableObject {
         persist(history, key: "history")
     }
 
+    func deleteHistory(ids: Set<UUID>) {
+        history.removeAll { ids.contains($0.id) }
+        persist(history, key: "history")
+    }
+
     func saveSettings(_ value: BrowserSettings) throws {
         guard !protectedKeys.contains("settings") else {
             throw PerchError("设置数据无法读取，已保留原数据。请先备份并修复设置。")
