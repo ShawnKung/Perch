@@ -20,6 +20,15 @@ enum BackupSelfCheck {
             PerchTheme.shared.selection = oldTheme; PerchTheme.shared.chatFontSize = oldFont
         }
         let store = Store(defaults: defaults)
+        precondition(store.ai.providers.isEmpty)
+        let emptyBackup = try store.settingsBackup(launchAtLogin: false)
+        try emptyBackup.validate()
+        try store.restoreSettingsBackup(emptyBackup, setLaunchAtLogin: { _ in })
+        precondition(store.ai.providers.isEmpty && AIController(defaults: defaults).providers.isEmpty)
+        store.ai.addProvider(.custom)
+        store.ai.deleteProvider(store.ai.configuration.id)
+        precondition(store.ai.providers.isEmpty && AIController(defaults: defaults).providers.isEmpty)
+        print("PASS: empty AI providers survive backup, restore, add and deletion")
         var settings = store.settings
         settings.chatFontSize = 18; settings.theme = .purple
         settings.followMouseOnShow = true; settings.linkPreviewDelay = 0.25

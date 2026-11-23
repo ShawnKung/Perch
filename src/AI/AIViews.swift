@@ -255,6 +255,7 @@ struct AIChatScrollPosition: NSViewRepresentable {
 
 struct AISettingsPage: View {
     @ObservedObject private var theme = PerchTheme.shared
+    @ObservedObject var store: Store
     @ObservedObject var ai: AIController
     let openChat: () -> Void
     @State private var editing = false
@@ -269,7 +270,6 @@ struct AISettingsPage: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     Text("模型供应商").font(.title2.weight(.semibold))
-                    Text("配置 API 密钥并选择要使用的模型。").foregroundStyle(Style.muted)
                     ForEach(ai.providers) { value in
                         HStack(spacing: 12) {
                             VStack(alignment: .leading, spacing: 6) {
@@ -282,7 +282,7 @@ struct AISettingsPage: View {
                                   systemImage: ai.keyedProviders.contains(value.id) ? "checkmark.circle.fill" : "circle")
                                 .font(.caption).foregroundStyle(Style.accent)
                             Button("编辑") { ai.select(value.id); editing = true }
-                            Button("删除", role: .destructive) { ai.deleteProvider(value.id) }.disabled(ai.providers.count < 2)
+                            Button("删除", role: .destructive) { ai.deleteProvider(value.id) }
                         }.padding(16).background(Style.sidebar, in: RoundedRectangle(cornerRadius: 12))
                     }
                     Menu {
@@ -312,7 +312,6 @@ struct AISettingsPage: View {
                     if let directory = ai.conversationDirectory {
                         VStack(alignment: .leading, spacing: 12) {
                             Text("对话存储").font(.title2.weight(.semibold))
-                            Text("对话和附件保存在此位置。").foregroundStyle(Style.muted)
                             HStack(spacing: 16) {
                                 VStack(alignment: .leading, spacing: 6) {
                                     Text("存储位置").font(.caption).foregroundStyle(Style.muted)
@@ -332,6 +331,22 @@ struct AISettingsPage: View {
                             if let storageError { Text(storageError).font(.callout).foregroundStyle(.red) }
                         }.padding(.top, 18)
                     }
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("常规").font(.title2.weight(.semibold))
+                        HStack {
+                            Text("发送消息按键").font(.headline)
+                            Spacer()
+                            Picker("发送消息按键", selection: Binding(get: { store.settings.aiSendWithCommand }, set: { enabled in
+                                var settings = store.settings
+                                settings.aiSendWithCommand = enabled
+                                do { try store.saveSettings(settings) }
+                                catch { store.notice = "尚未生效，保留上次设置：\(error.localizedDescription)" }
+                            })) {
+                                Text("回车").tag(false)
+                                Text("Command + 回车").tag(true)
+                            }.labelsHidden().accessibilityLabel("发送消息按键")
+                        }.padding(16).background(Style.sidebar, in: RoundedRectangle(cornerRadius: 12))
+                    }.padding(.top, 18)
                 }.padding(24)
             }.background(SettingsFocusDismissal())
             .onAppear {

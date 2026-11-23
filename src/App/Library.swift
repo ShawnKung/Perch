@@ -188,7 +188,7 @@ struct LibraryView: View {
             }.labelsHidden().pickerStyle(.segmented).padding(.horizontal, 20).padding(.bottom, 14).disabled(store.importing)
             Divider()
             switch page {
-            case .ai: AISettingsPage(ai: store.ai) {
+            case .ai: AISettingsPage(store: store, ai: store.ai) {
                 store.aiVisible = true; store.library = nil
             }
             case .settings: SettingsPage(store: store, openPasswords: { page = .passwords })

@@ -952,6 +952,7 @@ struct BookmarksPage: View {
     @State private var renamingFolder = false
     @State private var folderToDelete: BookmarkFolder?
     @State private var clearHistory = false
+    @State private var deletingHistory = false
 
     init(store: Store) {
         self.store = store
@@ -1045,6 +1046,13 @@ struct BookmarksPage: View {
                 HStack {
                     Button("清空全部历史记录…", role: .destructive) { clearHistory = true }
                         .disabled(store.history.isEmpty)
+                    Toggle("记录历史记录", isOn: Binding(get: { store.settings.historyRecordingEnabled }, set: { enabled in
+                        var settings = store.settings
+                        settings.historyRecordingEnabled = enabled
+                        do { try store.saveSettings(settings) }
+                        catch { store.notice = "尚未生效，保留上次设置：\(error.localizedDescription)" }
+                    }))
+                    .fixedSize()
                     Spacer()
                 }
             } else {
@@ -1126,8 +1134,16 @@ struct BookmarksPage: View {
                 }
             }
             if scope == .history {
-                Text("\(store.history.count) 条记录 · 最多保留最近 10,000 条")
-                    .font(.caption).foregroundStyle(Style.muted).frame(maxWidth: .infinity, alignment: .leading)
+                HStack {
+                    Button("打开所选") {
+                        let visits = store.history.filter { selection.contains($0.id) }
+                        for visit in visits { store.newTab(address: visit.address, title: visit.title) }
+                        store.library = nil
+                    }.disabled(selection.isEmpty)
+                    Button("删除所选…", role: .destructive) { deletingHistory = true }
+                        .disabled(selection.isEmpty)
+                    Spacer()
+                }
             } else if isGroupScope {
                 HStack {
                     if case .group(let id) = scope, let group = store.tabGroups.first(where: { $0.id == id }) {
@@ -1163,11 +1179,18 @@ struct BookmarksPage: View {
                 selection.removeAll(); editing = nil; adding = false; search = ""
                 store.libraryBookmarkScope = value
             }
-            .onChange(of: store.bookmarkItemIDs) { ids in selection.formIntersection(ids) }
+            .onChange(of: store.bookmarkItemIDs) { ids in if scope != .history { selection.formIntersection(ids) } }
+            .onChange(of: store.history.map(\.id)) { ids in if scope == .history { selection.formIntersection(ids) } }
             .alert("清空全部历史记录？", isPresented: $clearHistory) {
                 Button("取消", role: .cancel) {}
                 Button("清空", role: .destructive) { store.deleteHistory() }
             } message: { Text("此操作不可撤销。书签和 Cookie 不受影响。") }
+            .alert("删除所选历史记录？", isPresented: $deletingHistory) {
+                Button("取消", role: .cancel) {}
+                Button("删除", role: .destructive) {
+                    store.deleteHistory(ids: selection); selection.removeAll()
+                }
+            } message: { Text("此操作不可撤销。") }
             .alert("删除 \(deletable.count) 个所选项目？", isPresented: $deleting) {
                 Button("取消", role: .cancel) {}
                 Button("删除", role: .destructive) {
@@ -1317,12 +1340,8 @@ struct BookmarksPage: View {
     private var historyRecords: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(scopeTitle).font(.system(size: 13, weight: .semibold)).lineLimit(1).padding(.leading, 6)
-            List {
+            List(selection: $selection) {
                 ForEach(store.history.filter { matches($0.title, $0.address) }) { visit in
-                    Button {
-                        store.newTab(address: visit.address, title: visit.title)
-                        store.library = nil
-                    } label: {
                         HStack {
                             Image(systemName: "clock").foregroundStyle(Style.accent).frame(width: 24)
                             VStack(alignment: .leading, spacing: 4) {
@@ -1334,7 +1353,11 @@ struct BookmarksPage: View {
                             Text(visit.date.formatted(date: .abbreviated, time: .shortened))
                                 .font(.caption).foregroundStyle(Style.muted)
                         }.padding(.vertical, 5).contentShape(Rectangle())
-                    }.buttonStyle(.plain).contextMenu {
+                    .tag(visit.id)
+                    .onTapGesture(count: 2) {
+                        store.newTab(address: visit.address, title: visit.title)
+                        store.library = nil
+                    }.contextMenu {
                         Button("在新标签页中打开") {
                             store.newTab(address: visit.address, title: visit.title)
                             store.library = nil

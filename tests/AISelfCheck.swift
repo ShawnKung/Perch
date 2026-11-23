@@ -645,7 +645,7 @@ enum AISelfCheck {
         ai.addProvider(.custom)
         var other = ai.configuration
         other.baseURL = config.baseURL; other.model = "fixture"; other.models = ["fixture", "alternate"]
-        precondition(ai.save(other) && !ai.ready && ai.providers.count == 3)
+        precondition(ai.save(other) && !ai.ready && ai.providers.count == 2)
         precondition(ai.save(other, key: "synthetic-key"))
         ai.select(original)
         let chosen = UUID()
@@ -2622,7 +2622,7 @@ enum AISelfCheck {
         try await readingUI(config: config)
         if let directory = ProcessInfo.processInfo.environment["PERCH_LAYOUT_EVIDENCE"] {
             let settingsAI = AIController(defaults: defaults, conversationDirectory: URL(fileURLWithPath: "/tmp/Perch/Conversations"))
-            window.contentView = NSHostingView(rootView: AISettingsPage(ai: settingsAI, openChat: {}))
+            window.contentView = NSHostingView(rootView: AISettingsPage(store: store, ai: settingsAI, openChat: {}))
             try await Task.sleep(nanoseconds: 150_000_000)
             let root = window.contentView!
             root.layoutSubtreeIfNeeded()

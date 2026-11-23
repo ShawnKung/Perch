@@ -410,7 +410,7 @@ final class TabListContainer: NSView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         bottomFade.frame = bounds
-        bottomFade.locations = [0, NSNumber(value: max(0, 1 - Self.bottomFadeHeight / max(1, bounds.height))), 1]
+        bottomFade.locations = [0, NSNumber(value: max(CGFloat.zero, CGFloat(1) - Self.bottomFadeHeight / max(CGFloat(1), bounds.height))), 1]
         layer?.mask = table.bounds.maxY > scroll.contentView.bounds.maxY + 1 ? bottomFade : nil
         CATransaction.commit()
         for rail in rails {

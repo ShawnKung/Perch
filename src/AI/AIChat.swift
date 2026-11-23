@@ -743,21 +743,20 @@ final class AIController: ObservableObject {
             FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Perch/Conversations", isDirectory: true) : nil)
         keys = AIKeyStore(memoryOnly: defaults !== UserDefaults.standard)
         if let data = defaults.data(forKey: "aiProviders") {
-            if let saved = try? JSONDecoder().decode([AIConfiguration].self, from: data), !saved.isEmpty,
+            if let saved = try? JSONDecoder().decode([AIConfiguration].self, from: data),
                Set(saved.map(\.id)).count == saved.count {
-                providers = saved; configuration = saved.first(where: { $0.id.uuidString == defaults.string(forKey: "aiSelectedProvider") }) ?? saved[0]
+                providers = saved; configuration = saved.first(where: { $0.id.uuidString == defaults.string(forKey: "aiSelectedProvider") }) ?? saved.first ?? AIConfiguration()
             } else {
                 configuration = AIConfiguration(); damaged = true
                 settingsError = "AI 配置无法读取，原始数据已保留。请重置 AI 配置后重试。"
             }
         } else if let data = defaults.data(forKey: "aiConfiguration") {
-            if let saved = try? JSONDecoder().decode(AIConfiguration.self, from: data) { configuration = saved }
+            if let saved = try? JSONDecoder().decode(AIConfiguration.self, from: data) { configuration = saved; providers = [saved] }
             else {
                 configuration = AIConfiguration(); damaged = true
                 settingsError = "AI 配置无法读取，原始数据已保留。请重置 AI 配置后重试。"
             }
         } else { configuration = AIConfiguration() }
-        if providers.isEmpty { providers = [configuration] }
         if let data = defaults.data(forKey: "aiSearchProvider") {
             do { searchConfiguration = try JSONDecoder().decode(AISearchConfiguration.self, from: data) }
             catch { damagedSearch = true; searchSettingsError = "搜索配置无法读取，原始数据已保留。请备份后修复配置。" }
@@ -925,7 +924,7 @@ final class AIController: ObservableObject {
 
     func restoreSettings(_ backup: SettingsBackup) {
         providers = backup.providers
-        configuration = providers.first(where: { $0.id == backup.selectedProvider }) ?? providers[0]
+        configuration = providers.first(where: { $0.id == backup.selectedProvider }) ?? providers.first ?? AIConfiguration()
         searchConfiguration = backup.search
         keyedProviders = Set(backup.providers.filter { backup.credentials?.providers[$0.id.uuidString] != nil }.map(\.id))
         hasKey = keyedProviders.contains(configuration.id); searchHasKey = backup.credentials?.search != nil
@@ -951,7 +950,7 @@ final class AIController: ObservableObject {
                 if let key = try keys.read(old) { try keys.write(key, account: "provider|\(providers[index].id.uuidString)") }
                 providers[index].legacyAccount = nil
             }
-            configuration = providers.first(where: { $0.id == configuration.id }) ?? providers[0]
+            configuration = providers.first(where: { $0.id == configuration.id }) ?? providers.first ?? AIConfiguration()
             try persist()
         } catch { settingsError = error.localizedDescription }
     }
@@ -1094,11 +1093,11 @@ final class AIController: ObservableObject {
         do { try persist() } catch { settingsError = error.localizedDescription }
     }
     func deleteProvider(_ id: UUID) {
-        guard providers.count > 1, let value = providers.first(where: { $0.id == id }) else { return }
+        guard let value = providers.first(where: { $0.id == id }) else { return }
         do {
             if let account = value.account { try keys.write(nil, account: account) }
             providers.removeAll { $0.id == id }
-            if configuration.id == id { configuration = providers[0] }
+            if configuration.id == id { configuration = providers.first ?? AIConfiguration() }
             try persist(); refreshKey()
         } catch { settingsError = error.localizedDescription }
     }
@@ -1138,7 +1137,7 @@ final class AIController: ObservableObject {
     }
     func resetConfiguration() {
         damaged = false; defaults.removeObject(forKey: "aiConfiguration"); defaults.removeObject(forKey: "aiProviders")
-        configuration = AIConfiguration(); providers = [configuration]; settingsError = nil; refreshKey()
+        configuration = AIConfiguration(); providers = []; settingsError = nil; refreshKey()
     }
     func stop(_ tab: UUID) {
         tasks.removeValue(forKey: tab)?.cancel()

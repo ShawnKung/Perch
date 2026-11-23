@@ -553,7 +553,6 @@ struct SettingsPage: View {
     @State private var pendingSave: Task<Void, Never>?
     @State private var themePreview: Task<Void, Never>?
     @State private var hoveredTheme: ThemeColor?
-    @State private var clearHistory = false
     @StateObject private var recorder = KeyRecorder()
     var body: some View {
         Form {
@@ -609,22 +608,9 @@ struct SettingsPage: View {
                     Text("用 {query} 代表搜索关键词。").font(.caption).foregroundStyle(.secondary)
                 }
             }
-            Section("历史记录") {
-                Toggle("记录历史记录", isOn: $draft.historyRecordingEnabled)
-                HStack {
-                    Button("清除全部历史记录") { clearHistory = true }
-                    Button("查看历史记录") { store.openBookmarks(scope: .history) }
-                }
-            }
             Section("密码") {
                 Toggle("询问是否保存网站密码", isOn: $draft.savePasswords)
                 Button("管理已保存的密码", action: openPasswords)
-            }
-            Section("AI 聊天") {
-                Picker("发送消息", selection: $draft.aiSendWithCommand) {
-                    Text("回车").tag(false)
-                    Text("Command + 回车").tag(true)
-                }
             }
             Section("链接临时预览") {
                 HStack(spacing: 6) {
@@ -671,10 +657,6 @@ struct SettingsPage: View {
             }
             AboutSettingsGroup(store: store) { store.checkForUpdates(manual: true) }
         }.formStyle(.grouped).scrollContentBackground(.hidden)
-            .alert("清除全部历史记录？", isPresented: $clearHistory) {
-                Button("取消", role: .cancel) {}
-                Button("清除", role: .destructive) { store.deleteHistory() }
-            } message: { Text("此操作不可撤销。书签和 Cookie 不受影响。") }
             .background(Style.paper).background(SettingsFocusDismissal()).onAppear {
             draft = store.settings; refreshLogin(); recorder.recordingChanged = store.shortcutRecording
         }.onChange(of: draft) { value in

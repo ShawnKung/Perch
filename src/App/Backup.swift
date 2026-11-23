@@ -114,10 +114,10 @@ struct SettingsBackup: Codable {
             }
         }
         if scope.contains(.ai) {
-            guard !providers.isEmpty, providers.count <= 100,
+            guard providers.count <= 100,
                   Set(providers.map(\.id)).count == providers.count,
                   Set(providers.map(\.providerID)).count == providers.count,
-                  providers.contains(where: { $0.id == selectedProvider }) else {
+                  (providers.isEmpty || providers.contains(where: { $0.id == selectedProvider })) else {
                 throw PerchError("备份中的 AI 供应商列表无效。")
             }
             for provider in providers {
