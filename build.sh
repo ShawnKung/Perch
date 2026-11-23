@@ -32,7 +32,7 @@ swiftc -swift-version 5 -parse-as-library -Osize -whole-module-optimization -lto
   "$ROOT/src/AI/AIHistory.swift" "$ROOT/src/AI/AIViews.swift" \
   "$ROOT/src/App/Library.swift" "$ROOT/src/Browser/Bookmarks.swift" "$ROOT/src/Browser/LinkPreview.swift" \
   "$ROOT/src/Browser/Passwords.swift" "$ROOT/src/Browser/ScrollRouting.swift" "$ROOT/src/Browser/AddressSuggestions.swift" \
-  "$ROOT/src/Browser/NativeTabs.swift" "$ROOT/src/Browser/TabContents.swift" "$ROOT/src/Browser/Favicon.swift" "$ROOT/src/Browser/ImportView.swift" \
+  "$ROOT/src/Browser/NativeTabs.swift" "$ROOT/src/Browser/HomeShortcuts.swift" "$ROOT/src/Browser/TabContents.swift" "$ROOT/src/Browser/Favicon.swift" "$ROOT/src/Browser/ImportView.swift" \
   "$ROOT/tests/SelfTests.swift" "$ROOT/tests/BackupSelfCheck.swift" "$ROOT/tests/ScrollSelfCheck.swift" "$ROOT/tests/AISelfCheck.swift" "$ROOT/tests/AIExperienceCheck.swift" \
   "$ROOT/src/App/main.swift" \
   -framework AppKit -framework SwiftUI -framework WebKit -framework PDFKit -framework Carbon -framework ServiceManagement -framework Security -lsqlite3 \

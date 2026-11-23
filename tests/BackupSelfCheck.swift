@@ -8,6 +8,7 @@ enum BackupSelfCheck {
     }
 
     @MainActor static func run() throws {
+        try homeShortcutOrder()
         let suite = "dev.perch.backup-tests." + UUID().uuidString
         let defaults = UserDefaults(suiteName: suite)!
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
@@ -86,7 +87,7 @@ enum BackupSelfCheck {
         rejects { try invalidGroup.validate() }
         var v2 = groupBackup; v2.version = 2
         let oldGroups = try JSONDecoder().decode(SettingsBackup.self, from: encoder.encode(v2))
-        precondition(oldGroups.tabGroups == nil)
+        precondition(oldGroups.tabGroups == nil && oldGroups.homeShortcutOrder == nil)
         let currentGroups = store.tabGroups
         try store.restoreSettingsBackup(oldGroups, setLaunchAtLogin: { _ in })
         precondition(store.tabGroups == currentGroups)
@@ -132,7 +133,9 @@ enum BackupSelfCheck {
             let oldSettings = store.settings, oldProvider = store.ai.configuration
             let oldSites = store.sites.map(\.id)
             if scope == .settings { decoded.settings.chatFontSize = 17 }
-            if scope == .bookmarks { decoded.sites = []; decoded.folders = []; decoded.imported = [:] }
+            if scope == .bookmarks {
+                decoded.sites = []; decoded.folders = []; decoded.imported = [:]; decoded.homeShortcutOrder = []
+            }
             var loginTouched = false
             try store.restoreSettingsBackup(decoded, setLaunchAtLogin: { _ in loginTouched = true })
             precondition(loginTouched == (scope == .settings))
@@ -268,5 +271,62 @@ enum BackupSelfCheck {
         precondition(store.ai.searchConfiguration == nil && defaults.object(forKey: "aiSearchProvider") == nil)
         precondition(LayoutPreference.capture(defaults).isEmpty)
         print("PASS: damaged local models are protected and absent optional preferences restore defaults")
+    }
+
+    @MainActor private static func homeShortcutOrder() throws {
+        let suite = "dev.perch.home-order-tests." + UUID().uuidString
+        let defaults = UserDefaults(suiteName: suite)!
+        let oldTheme = PerchTheme.shared.selection
+        let oldFont = PerchTheme.shared.chatFontSize
+        defer {
+            defaults.removePersistentDomain(forName: suite)
+            PerchTheme.shared.selection = oldTheme; PerchTheme.shared.chatFontSize = oldFont
+        }
+        let sites = (0..<4).map { Site(title: "Shortcut \($0)", address: "https://home.invalid/\($0)") }
+        let data = try JSONEncoder().encode(sites)
+        defaults.set(data, forKey: "sites")
+        let store = Store(defaults: defaults)
+        let ids = sites.map(\.id), order = [ids[2], ids[0], ids[3], ids[1]]
+        store.reorderHomeShortcuts(order)
+        precondition(store.homeShortcuts.map(\.id) == order)
+        precondition(store.sites.map(\.id) == ids && defaults.data(forKey: "sites") == data)
+        precondition(Store(defaults: defaults).homeShortcuts.map(\.id) == order)
+        store.sites[0].showOnHome = false
+        store.reorderHomeShortcuts([ids[1], ids[3], ids[2]])
+        store.sites[0].showOnHome = true
+        precondition(store.homeShortcuts.map(\.id) == [ids[1], ids[0], ids[3], ids[2]])
+        store.sites.removeAll { $0.id == ids[3] }
+        let added = Site(title: "New", address: "https://home.invalid/new")
+        store.sites.append(added)
+        precondition(store.homeShortcuts.map(\.id) == [ids[1], ids[0], ids[2], added.id])
+        let unchanged = store.homeShortcutOrder
+        store.reorderHomeShortcuts([ids[1], ids[1], ids[2], added.id])
+        precondition(store.homeShortcutOrder == unchanged)
+        let backup = try store.settingsBackup(launchAtLogin: false, scope: [.bookmarks])
+        let decoded = try JSONDecoder().decode(SettingsBackup.self, from: JSONEncoder().encode(backup))
+        try store.restoreSettingsBackup(decoded)
+        precondition(store.homeShortcuts.map(\.id) == [ids[1], ids[0], ids[2], added.id])
+        var bad = backup; bad.homeShortcutOrder = [ids[0], ids[0]]
+        rejects { try bad.validate() }
+        bad.homeShortcutOrder = [UUID()]
+        rejects { try bad.validate() }
+        var legacy = backup; legacy.homeShortcutOrder = nil
+        try store.restoreSettingsBackup(legacy)
+        precondition(store.homeShortcutOrder.isEmpty && store.homeShortcuts.map(\.id) == store.sites.map(\.id))
+        for corrupt in [Data("broken".utf8), try JSONEncoder().encode([ids[0], ids[0]])] {
+            defaults.set(corrupt, forKey: "homeShortcutOrder")
+            let protected = Store(defaults: defaults)
+            precondition(!protected.reorderHomeShortcuts(Array(protected.homeShortcuts.map(\.id).reversed())))
+            precondition(defaults.data(forKey: "homeShortcutOrder") == corrupt)
+            rejects { _ = try protected.settingsBackup(launchAtLogin: false, scope: [.bookmarks]) }
+        }
+        defaults.set("unexpected storage type", forKey: "homeShortcutOrder")
+        let protected = Store(defaults: defaults)
+        precondition(!protected.reorderHomeShortcuts(Array(protected.homeShortcuts.map(\.id).reversed())))
+        precondition(defaults.string(forKey: "homeShortcutOrder") == "unexpected storage type")
+        defaults.removeObject(forKey: "homeShortcutOrder")
+        defaults.set(try JSONEncoder().encode([sites[0], sites[0], sites[1]]), forKey: "sites")
+        precondition(Store(defaults: defaults).homeShortcuts.map(\.id) == [ids[0], ids[1]])
+        print("PASS: independent home order persists, preserves bookmark bytes, handles hidden/deleted/new entries, backups and corruption")
     }
 }

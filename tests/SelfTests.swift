@@ -1152,6 +1152,9 @@ final class LayoutSelfCheck {
                 if CommandLine.arguments.contains("--verify-bookmark-editor") {
                     await verifyBookmarkEditor()
                 }
+                if CommandLine.arguments.contains("--verify-home-shortcut-drag") {
+                    await verifyHomeShortcutDrag()
+                }
                 if let index = CommandLine.arguments.firstIndex(of: "--verify-home-navigation"),
                    CommandLine.arguments.count > index + 1 {
                     await verifyHomeNavigation(baseURL: CommandLine.arguments[index + 1])
@@ -1338,6 +1341,7 @@ final class LayoutSelfCheck {
             }
             else {
                 await run()
+                await verifyHomeShortcutDrag()
                 if !CommandLine.arguments.contains("--verify-address-input") { await verifyBookmarkEditor() }
             }
             defaults.removePersistentDomain(forName: suite)
@@ -1353,6 +1357,118 @@ final class LayoutSelfCheck {
         return find(panel.contentView!)!
     }
     func settle() async { try? await Task.sleep(nanoseconds: 350_000_000) }
+    func verifyHomeShortcutDrag() async {
+        func check(_ value: @autoclosure () -> Bool, _ message: String, line: UInt = #line) {
+            guard value() else { fputs("FAIL: home shortcut drag \(line): \(message)\n", stderr); exit(1) }
+        }
+        store.library = nil
+        store.newTab()
+        store.sites = (0..<6).map { Site(title: "Home fixture \($0)", address: "http://127.0.0.1:9/home-\($0)") }
+        let bookmarkData = try! JSONEncoder().encode(store.sites)
+        defaults.set(bookmarkData, forKey: "sites")
+        await settle()
+        func find(_ view: NSView) -> HomeShortcutGridView? {
+            if let grid = view as? HomeShortcutGridView { return grid }
+            for child in view.subviews { if let grid = find(child) { return grid } }
+            return nil
+        }
+        guard let grid = find(panel.contentView!), let first = grid.subviews.first as? HomeShortcutCell else {
+            check(false, "Real homepage must contain native shortcut grid"); return
+        }
+        let ids = grid.ids
+        check(ids == store.sites.map(\.id), "Initial grid follows bookmark order")
+        let start = first.convert(NSPoint(x: first.bounds.midX, y: first.bounds.midY), to: nil)
+        NSApp.activate(ignoringOtherApps: true); panel.focusWindow()
+        await settle()
+        let image = first.dragImage()!
+        let bitmap = NSBitmapImageRep(data: image.tiffRepresentation!)!
+        let alpha = bitmap.colorAt(x: bitmap.pixelsWide / 2, y: bitmap.pixelsHigh / 2)!.alphaComponent
+        check((0.8...0.95).contains(alpha), "Floating card must contain visible semitransparent content")
+        try? bitmap.representation(using: .png, properties: [:])?.write(to:
+            FileManager.default.temporaryDirectory.appendingPathComponent("perch-home-drag-card.png"))
+        func event(_ type: NSEvent.EventType, _ point: NSPoint) -> NSEvent {
+            NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber,
+                context: nil, eventNumber: 1, clickCount: 1, pressure: type == .leftMouseUp ? 0 : 1)!
+        }
+        // Keep the real root hit-test and drag threshold, substituting only system drag capture.
+        // AppKit's capture reads the actual system mouse and cannot be driven by window events.
+        var substituted = false
+        first.dragRequested = { [weak grid] _ in substituted = true; grid?.beginPreview(ids[0]) }
+        NSApp.postEvent(event(.leftMouseDragged, NSPoint(x: start.x + 12, y: start.y)), atStart: true)
+        NSApp.sendEvent(event(.leftMouseDown, start))
+        check(substituted, "Native drag threshold must invoke the substituted capture")
+        check(grid.dragID == ids[0], "Native press/drag events must begin a session")
+        check(first.alphaValue == 0, "Source slot must be transparent while dragging")
+        check(store.homeShortcutOrder.isEmpty, "Beginning a drag must not persist")
+        // Destination callbacks use synthetic local drag info, as in the native bookmark tests.
+        let board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        board.setString(ids[0].uuidString, forType: HomeShortcutGridView.pasteboardType)
+        let drag = BookmarkTestDrag(board: board, table: grid)
+        let foreign = BookmarkTestDrag(board: board, table: first)
+        foreign.draggingLocation = start
+        check(grid.draggingUpdated(foreign).isEmpty, "Only this grid's local drag can reorder")
+        let target = HomeShortcutLayout.frames(count: ids.count, width: grid.bounds.width)[3]
+        drag.draggingLocation = grid.convert(NSPoint(x: target.midX, y: target.midY), to: nil)
+        check(grid.draggingUpdated(drag) == .move, "Local destination accepts drag")
+        check(grid.ids == [ids[1], ids[2], ids[3], ids[0], ids[4], ids[5]], "Preview must move across rows")
+        await settle()
+        check(first.frame == target, "Live preview must move actual card frames across rows")
+        check(first.alphaValue == 0, "Preview must keep the source hidden")
+        check(defaults.data(forKey: "homeShortcutOrder") == nil, "Preview must not persist")
+        grid.draggingExited(drag)
+        await settle()
+        check(grid.ids == ids, "Leaving grid must restore original order")
+        drag.draggingLocation = grid.convert(NSPoint(x: -10, y: -10), to: nil)
+        check(!grid.performDragOperation(drag), "Outside drop must be rejected")
+        drag.draggingLocation = grid.convert(NSPoint(x: target.midX, y: target.midY), to: nil)
+        _ = grid.draggingUpdated(drag)
+        check(grid.performDragOperation(drag), "Valid drop must commit")
+        NSApp.sendEvent(event(.leftMouseUp, drag.draggingLocation))
+        let expected = [ids[1], ids[2], ids[3], ids[0], ids[4], ids[5]]
+        check(store.homeShortcuts.map(\.id) == expected, "Accepted order reaches Store")
+        check(store.browser == nil, "A drag release must not open a webpage")
+        check(store.sites.map(\.id) == ids && defaults.data(forKey: "sites") == bookmarkData,
+              "Home reorder must preserve bookmark order and bytes")
+        grid.cancelPreview()
+        await settle()
+        check(grid.ids == expected && first.frame == target && first.alphaValue == 1,
+              "Session end keeps accepted order, moves frames and restores source")
+        let savedOrder = defaults.data(forKey: "homeShortcutOrder")
+        check(grid.beginPreview(ids[0]), "Another drag can begin after drop")
+        let before = HomeShortcutLayout.frames(count: ids.count, width: grid.bounds.width)[0]
+        drag.draggingLocation = grid.convert(NSPoint(x: before.midX, y: before.midY), to: nil)
+        _ = grid.draggingUpdated(drag)
+        grid.cancelPreview()
+        await settle()
+        check(grid.ids == expected && first.frame == target && defaults.data(forKey: "homeShortcutOrder") == savedOrder,
+              "Cancellation restores preview without persisting")
+        let commit = grid.commit
+        grid.commit = { _ in false }
+        check(grid.beginPreview(ids[0]) && !grid.performDragOperation(drag),
+              "A rejected save must reject the drop")
+        grid.commit = commit
+        check(grid.ids == expected && first.alphaValue == 1 && defaults.data(forKey: "homeShortcutOrder") == savedOrder,
+              "Rejected drop restores the original visible order")
+        if let view = panel.contentView, let snapshot = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+            view.cacheDisplay(in: view.bounds, to: snapshot)
+            try? snapshot.representation(using: .png, properties: [:])?.write(to:
+                FileManager.default.temporaryDirectory.appendingPathComponent("perch-home-shortcuts.png"))
+        }
+        let click = first.convert(NSPoint(x: first.bounds.maxX - 3, y: first.bounds.midY), to: nil)
+        let homeID = store.selected!
+        check(panel.isVisible, "Pointer routing requires a visible isolated window")
+        NSApp.postEvent(event(.leftMouseUp, click), atStart: true)
+        NSApp.sendEvent(event(.leftMouseDown, click))
+        check(store.selected == homeID && store.tabs.first(where: { $0.id == homeID })?.address == store.sites[0].address &&
+              store.cachedBrowser(for: homeID) != nil, "Card edge click must request navigation in the current home tab")
+        await settle()
+        store.newTab()
+        await settle()
+        print("PASS: homepage native drag hit path, translucent image, cross-row preview frames, source placeholder, outside rejection, commit, cancellation and ordinary click; system capture substituted and destination uses synthetic local drag info")
+        fflush(stdout)
+    }
     private func clickInPanel(_ point: NSPoint) async {
         NSApp.activate(ignoringOtherApps: true)
         panel.focusWindow()
