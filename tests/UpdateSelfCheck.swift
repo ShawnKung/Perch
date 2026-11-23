@@ -3,32 +3,48 @@ import SwiftUI
 
 private final class UpdateFixtureProtocol: URLProtocol {
     static var status = 200
-    static var body = Data()
+    static var remaining: String?
+    static var body = Data(#"{"tag_name":"v0.2.10","draft":false,"prerelease":false}"#.utf8)
+    static var fallbackStatus = 200
+    static var responseURL = UpdateCheck.repositoryURL.appendingPathComponent("releases/tag/v0.2.10")
     static var failure: Error?
     static var requests = 0
+    static var urls: [URL] = []
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
         Self.requests += 1
-        precondition(request.url == UpdateCheck.apiURL)
-        precondition(request.value(forHTTPHeaderField: "Accept") == "application/vnd.github+json")
+        Self.urls.append(request.url!)
+        let api = request.url == UpdateCheck.apiURL
+        precondition(api || request.url == UpdateCheck.releaseURL)
+        precondition(request.httpMethod == (api ? "GET" : "HEAD"))
+        if api {
+            precondition(request.value(forHTTPHeaderField: "Accept") == "application/vnd.github+json")
+        }
+        precondition(request.value(forHTTPHeaderField: "Authorization") == nil)
         if let failure = Self.failure {
             client?.urlProtocol(self, didFailWithError: failure)
             return
         }
-        let response = HTTPURLResponse(url: request.url!, statusCode: Self.status,
-                                       httpVersion: "HTTP/1.1", headerFields: nil)!
+        let headers = api ? Self.remaining.map { ["X-RateLimit-Remaining": $0] } : nil
+        let response = HTTPURLResponse(url: api ? request.url! : Self.responseURL,
+                                       statusCode: api ? Self.status : Self.fallbackStatus,
+                                       httpVersion: "HTTP/1.1", headerFields: headers)!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: Self.body)
+        if api { client?.urlProtocol(self, didLoad: Self.body) }
         client?.urlProtocolDidFinishLoading(self)
     }
     override func stopLoading() {}
 }
 
 enum UpdateSelfCheck {
-    private static func release(_ tag: String, draft: Bool = false, prerelease: Bool = false) -> Data {
+    private static func releaseData(_ tag: String, draft: Bool = false, prerelease: Bool = false) -> Data {
         try! JSONSerialization.data(withJSONObject: ["tag_name": tag, "draft": draft, "prerelease": prerelease])
+    }
+
+    private static func release(_ tag: String) -> URL {
+        UpdateCheck.repositoryURL.appendingPathComponent("releases/tag").appendingPathComponent(tag)
     }
 
     @MainActor static func run() async throws {
@@ -37,45 +53,98 @@ enum UpdateSelfCheck {
             ("0.2.5", "v0.3.0", "0.3.0"),
             ("0.9.9", "v1.0.0", "1.0.0"),
             ("0.2.5", "v0.2.5", nil),
-            ("0.3.0", "v0.2.10", nil),
-            ("invalid", "v1.0.0", nil),
-            ("0.2.5", "v01.0.0", nil),
-            ("0.2.5", "v1.0.0-beta", nil),
-            ("0.2.5", "v1..0", nil),
-            ("0.2.5", "v999999999999999999999999999.0.0", nil)
+            ("0.3.0", "v0.2.10", nil)
         ] as [(String, String, String?)] {
-            let actual = try UpdateCheck.newerVersion(in: release(remote), than: current)
+            let actual = try UpdateCheck.newerVersion(at: release(remote), than: current)
             precondition(actual == expected, "Unexpected version comparison: \(current), \(remote)")
+            let api = try UpdateCheck.newerVersion(in: releaseData(remote), than: current)
+            precondition(api == expected)
         }
-        for data in [release("v1.0.0", draft: true), release("v1.0.0", prerelease: true)] {
+        for data in [releaseData("v1.0.0", draft: true), releaseData("v1.0.0", prerelease: true)] {
             let actual = try UpdateCheck.newerVersion(in: data, than: "0.2.5")
             precondition(actual == nil)
+        }
+        for url in [
+            release("v01.0.0"), release("v1.0.0-beta"), release("v1..0"),
+            release("v999999999999999999999999999.0.0"),
+            UpdateCheck.releaseURL,
+            URL(string: "https://github.com/login")!,
+            URL(string: "https://github.com/Other/Perch/releases/tag/v1.0.0")!,
+            URL(string: "https://example.com/ShawnKung/Perch/releases/tag/v1.0.0")!,
+            URL(string: "http://github.com/ShawnKung/Perch/releases/tag/v1.0.0")!
+        ] {
+            do {
+                _ = try UpdateCheck.newerVersion(at: url, than: "0.2.5")
+                preconditionFailure("An invalid release URL must not report an up-to-date version")
+            } catch is PerchError {}
         }
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [UpdateFixtureProtocol.self]
         let session = URLSession(configuration: configuration)
         defer { session.invalidateAndCancel() }
-        UpdateFixtureProtocol.body = release("v0.2.10")
+        UpdateFixtureProtocol.body = releaseData("v0.2.10")
+        let beforeAPI = UpdateFixtureProtocol.requests
         let latest = try await UpdateCheck.latestVersion(current: "0.2.9", session: session)
-        precondition(latest == "0.2.10")
+        precondition(latest == "0.2.10" && UpdateFixtureProtocol.requests == beforeAPI + 1 &&
+                     UpdateFixtureProtocol.urls.last == UpdateCheck.apiURL)
         for status in [404, 403, 429, 500] {
             UpdateFixtureProtocol.status = status
+            let before = UpdateFixtureProtocol.requests
             do {
                 _ = try await UpdateCheck.latestVersion(current: "0.2.9", session: session)
                 preconditionFailure("HTTP failure must not report an up-to-date version")
             } catch is PerchError {}
+            precondition(UpdateFixtureProtocol.requests == before + 1, "Other HTTP errors must not fall back")
         }
         UpdateFixtureProtocol.status = 200
         UpdateFixtureProtocol.body = Data("{}".utf8)
+        let beforeInvalid = UpdateFixtureProtocol.requests
         do {
             _ = try await UpdateCheck.latestVersion(current: "0.2.9", session: session)
-            preconditionFailure("Invalid release data must fail")
+            preconditionFailure("Invalid API data must fail")
         } catch is DecodingError {}
+        precondition(UpdateFixtureProtocol.requests == beforeInvalid + 1)
+        UpdateFixtureProtocol.body = releaseData("v0.2.10")
+        UpdateFixtureProtocol.status = 403
+        UpdateFixtureProtocol.remaining = "1"
+        let beforeForbidden = UpdateFixtureProtocol.requests
+        do {
+            _ = try await UpdateCheck.latestVersion(current: "0.2.9", session: session)
+            preconditionFailure("A non-exhausted 403 must fail")
+        } catch is PerchError {}
+        precondition(UpdateFixtureProtocol.requests == beforeForbidden + 1)
+        UpdateFixtureProtocol.remaining = "0"
+        let beforeFallback = UpdateFixtureProtocol.requests
+        let fallback = try await UpdateCheck.latestVersion(current: "0.2.9", session: session)
+        precondition(fallback == "0.2.10" && UpdateFixtureProtocol.requests == beforeFallback + 2 &&
+                     Array(UpdateFixtureProtocol.urls.suffix(2)) == [UpdateCheck.apiURL, UpdateCheck.releaseURL])
+        for status in [403, 500] {
+            UpdateFixtureProtocol.fallbackStatus = status
+            do {
+                _ = try await UpdateCheck.latestVersion(current: "0.2.9", session: session)
+                preconditionFailure("A failed fallback must not report a current version")
+            } catch is PerchError {}
+        }
+        UpdateFixtureProtocol.fallbackStatus = 200
+        UpdateFixtureProtocol.responseURL = UpdateCheck.releaseURL
+        do {
+            _ = try await UpdateCheck.latestVersion(current: "0.2.9", session: session)
+            preconditionFailure("A missing version redirect must fail")
+        } catch is PerchError {}
+        UpdateFixtureProtocol.responseURL = release("v0.2.10")
+        UpdateFixtureProtocol.status = 200
+        UpdateFixtureProtocol.remaining = nil
+        do {
+            _ = try await UpdateCheck.latestVersion(current: "invalid", session: session)
+            preconditionFailure("An invalid installed version must fail")
+        } catch is PerchError {}
         UpdateFixtureProtocol.failure = URLError(.notConnectedToInternet)
+        let beforeOffline = UpdateFixtureProtocol.requests
         do {
             _ = try await UpdateCheck.latestVersion(current: "0.2.9", session: session)
             preconditionFailure("Offline check must fail")
         } catch is URLError {}
+        precondition(UpdateFixtureProtocol.requests == beforeOffline + 1, "Offline errors must not fall back")
         let suite = "dev.perch.update-tests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
@@ -86,10 +155,10 @@ enum UpdateSelfCheck {
         precondition(store.availableUpdate == nil)
         store.receiveUpdate("0.3.0")
         precondition(store.availableUpdate == "0.3.0")
-        print("PASS: numeric release comparison, stable releases, invalid data, HTTP failures and offline checks without network access")
+        print("PASS: API-first checks, exhausted-403 HEAD fallback only, stable releases, trusted redirects and failure boundaries")
         print("PASS: detected versions control the passive update indicator")
         UpdateFixtureProtocol.failure = nil
-        UpdateFixtureProtocol.body = release("v0.2.9")
+        UpdateFixtureProtocol.body = releaseData("v0.2.9")
         let before = UpdateFixtureProtocol.requests
         store.checkForUpdates(manual: true, current: "0.2.9", session: session)
         precondition(store.checkingUpdate && store.updateCheckMessage == nil)
@@ -105,7 +174,7 @@ enum UpdateSelfCheck {
         try await AISelfCheck.wait { !store.checkingUpdate }
         precondition(store.updateCheckMessage == nil, "Automatic check failures must stay silent")
         UpdateFixtureProtocol.status = 200
-        UpdateFixtureProtocol.body = release("v0.2.10")
+        UpdateFixtureProtocol.body = releaseData("v0.2.10")
         store.checkForUpdates(manual: true, current: "0.2.9", session: session)
         try await AISelfCheck.wait { !store.checkingUpdate }
         precondition(store.availableUpdate == "0.2.10" && store.updateCheckMessage == nil)
@@ -260,8 +329,9 @@ enum UpdateSelfCheck {
         let session = URLSession(configuration: configuration)
         defer { session.invalidateAndCancel() }
         UpdateFixtureProtocol.status = 200
+        UpdateFixtureProtocol.remaining = nil
         UpdateFixtureProtocol.failure = nil
-        UpdateFixtureProtocol.body = release("v0.2.9")
+        UpdateFixtureProtocol.body = releaseData("v0.2.9")
         let root = NSHostingView(rootView: Form {
             AboutSettingsGroup(store: store) {
                 store.checkForUpdates(manual: true, current: "0.2.9", session: session)
@@ -293,7 +363,6 @@ enum UpdateSelfCheck {
         await settle()
         expect(find("Perch 当前版本", in: root) != nil && find("Perch 开源仓库", in: root) != nil,
                "Current version and repository link must be visible")
-        let initial = snapshot(root, rect: root.bounds)
         guard let check = find("检查更新", in: root) else {
             expect(false, "Check for updates must be visible before detection"); return
         }
@@ -302,7 +371,30 @@ enum UpdateSelfCheck {
         await settle()
         expect(store.updateCheckMessage == "当前已是最新版本" && find("更新检查结果", in: root) != nil,
                "A manual check must show its result inline")
-        UpdateFixtureProtocol.body = release("v0.2.10")
+        func expectResultBesideButton() {
+            guard let result = find("更新检查结果", in: root), let check = find("检查更新", in: root) else {
+                expect(false, "Result and check button must remain visible"); return
+            }
+            let resultFrame = (result.value(forKey: "accessibilityFrame") as! NSValue).rectValue
+            let checkFrame = (check.value(forKey: "accessibilityFrame") as! NSValue).rectValue
+            expect(resultFrame.maxX <= checkFrame.minX + 1 && abs(resultFrame.midY - checkFrame.midY) < 3,
+                   "Result must be left of the button on the same row: \(resultFrame), \(checkFrame)")
+        }
+        expectResultBesideButton()
+        let initial = snapshot(root, rect: root.bounds)
+        UpdateFixtureProtocol.status = 403
+        _ = find("检查更新", in: root)?.perform(NSSelectorFromString("accessibilityPerformPress"))
+        try? await AISelfCheck.wait { !store.checkingUpdate }
+        await settle()
+        expect(store.updateCheckMessage?.contains("403") == true, "Manual failure must remain visible")
+        expectResultBesideButton()
+        window.setContentSize(NSSize(width: 400, height: 240))
+        await settle()
+        expectResultBesideButton()
+        window.setContentSize(NSSize(width: 660, height: 240))
+        await settle()
+        UpdateFixtureProtocol.status = 200
+        UpdateFixtureProtocol.body = releaseData("v0.2.10")
         _ = find("检查更新", in: root)?.perform(NSSelectorFromString("accessibilityPerformPress"))
         try? await AISelfCheck.wait { store.availableUpdate != nil }
         await settle()
@@ -328,7 +420,7 @@ enum UpdateSelfCheck {
             do { try data.write(to: URL(fileURLWithPath: CommandLine.arguments[index + 1])) }
             catch { expect(false, "Cannot save About preview: \(error)") }
         }
-        print("PASS: native About group version/link, manual check action, inline result and new-version replacement without dialogs")
+        print("PASS: native About actions, current/error results left of check button at normal/narrow widths, new-version replacement without dialogs")
     }
 
     @MainActor private static func snapshot(_ view: NSView, rect: NSRect) -> NSImage {

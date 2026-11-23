@@ -68,12 +68,27 @@ enum UpdateCheck {
         return numbers.count == 3 ? numbers : nil
     }
 
+    private static func newerVersion(_ tag: String, than current: String) throws -> String? {
+        guard let available = version(tag), let installed = version(current) else {
+            throw PerchError("更新页面未返回有效版本")
+        }
+        guard installed.lexicographicallyPrecedes(available) else { return nil }
+        return String(tag.drop(while: { $0 == "v" }))
+    }
+
     static func newerVersion(in data: Data, than current: String) throws -> String? {
         let release = try JSONDecoder().decode(Release.self, from: data)
-        guard !release.draft, !release.prerelease,
-              let installed = version(current), let available = version(release.tag_name),
-              installed.lexicographicallyPrecedes(available) else { return nil }
-        return String(release.tag_name.drop(while: { $0 == "v" }))
+        guard !release.draft, !release.prerelease else { return nil }
+        return try newerVersion(release.tag_name, than: current)
+    }
+
+    static func newerVersion(at url: URL, than current: String) throws -> String? {
+        guard url.scheme == "https", url.host == repositoryURL.host,
+              url.pathComponents.dropLast().elementsEqual(repositoryURL.appendingPathComponent("releases/tag").pathComponents),
+              let tag = url.pathComponents.last else {
+            throw PerchError("更新页面未返回有效版本")
+        }
+        return try newerVersion(tag, than: current)
     }
 
     static func latestVersion(current: String, session: URLSession = .shared) async throws -> String? {
@@ -82,8 +97,24 @@ enum UpdateCheck {
         request.setValue("Perch/\(current)", forHTTPHeaderField: "User-Agent")
         let (data, response) = try await session.data(for: request)
         guard let response = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        // Only an exhausted API quota warrants falling back to the public release redirect.
+        if response.statusCode == 403, response.value(forHTTPHeaderField: "X-RateLimit-Remaining") == "0" {
+            return try await latestReleaseVersion(current: current, session: session)
+        }
         guard response.statusCode == 200 else { throw PerchError("检查更新失败（HTTP \(response.statusCode)）") }
         return try newerVersion(in: data, than: current)
+    }
+
+    private static func latestReleaseVersion(current: String, session: URLSession) async throws -> String? {
+        var request = URLRequest(url: releaseURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
+        request.httpMethod = "HEAD"
+        request.setValue("Perch/\(current)", forHTTPHeaderField: "User-Agent")
+        let (_, response) = try await session.data(for: request)
+        guard let response = response as? HTTPURLResponse, let url = response.url else {
+            throw URLError(.badServerResponse)
+        }
+        guard response.statusCode == 200 else { throw PerchError("检查更新失败（HTTP \(response.statusCode)）") }
+        return try newerVersion(at: url, than: current)
     }
 
 }
@@ -108,21 +139,23 @@ struct AboutSettingsGroup: View {
                     .accessibilityLabel("Perch 开源仓库")
             }
             HStack {
-                Text("软件更新")
+                Text("软件更新").fixedSize()
                 Spacer()
                 if let version = store.availableUpdate {
                     UpdateIndicator(version: version, compact: false, alignment: .right)
                         .frame(width: 130, height: 28)
                 } else {
+                    if let message = store.updateCheckMessage {
+                        Text(message).font(.caption).foregroundStyle(Style.muted)
+                            .lineLimit(1).truncationMode(.middle).help(message)
+                            .accessibilityLabel("更新检查结果")
+                            .accessibilityValue(message)
+                    }
                     Button(store.checkingUpdate ? "正在检查…" : "检查更新", action: check)
                         .disabled(store.checkingUpdate)
                         .accessibilityLabel(store.checkingUpdate ? "正在检查更新" : "检查更新")
+                        .fixedSize()
                 }
-            }
-            if let message = store.updateCheckMessage, store.availableUpdate == nil {
-                Text(message).font(.caption).foregroundStyle(Style.muted)
-                    .accessibilityLabel("更新检查结果")
-                    .accessibilityValue(message)
             }
         }
     }
