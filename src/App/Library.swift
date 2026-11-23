@@ -126,7 +126,7 @@ struct TabSidebar: View, Animatable {
     var body: some View {
         let palette = theme.selection
         GeometryReader { geometry in
-            let availableHeight = max(0, geometry.size.height - 122)
+            let availableHeight = max(0, geometry.size.height - 122 - (store.availableUpdate == nil ? 0 : 40))
             VStack(alignment: .leading, spacing: 4) {
                 NativeTabList(store: store, compact: compact, expansion: expansion)
                     .frame(height: min(contentHeight, availableHeight))
@@ -144,6 +144,12 @@ struct TabSidebar: View, Animatable {
                 }
                 .buttonStyle(.plain).help("新建标签页 ⌘T").accessibilityLabel("新建标签页")
                 Spacer(minLength: 0)
+                if let version = store.availableUpdate {
+                    UpdateIndicator(version: version, compact: compact)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 36)
+                        .padding(.horizontal, compact ? 0 : 8)
+                }
                 Color(palette.line).frame(height: 1)
                 Button { store.library = .settings } label: {
                     HStack(spacing: 8) {

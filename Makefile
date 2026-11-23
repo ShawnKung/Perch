@@ -33,6 +33,7 @@ verify: build
 
 test: verify
 	@"$(BIN)" --self-test
+	@"$(BIN)" --update-self-test
 
 check: test
 	@"$(BIN)" --ai-typography-self-test
@@ -43,6 +44,7 @@ check: test
 	@"$(BIN)" --web-tabs-self-test
 	@"$(BIN)" --scroll-self-test
 	@"$(BIN)" --ui-self-test --compact
+	@"$(BIN)" --update-ui-self-test
 	@"$(BIN)" --window-self-test
 
 test-web: verify
@@ -60,6 +62,7 @@ test-navigation: verify
 
 test-ui: verify
 	@"$(BIN)" --ui-self-test --compact
+	@"$(BIN)" --update-ui-self-test
 
 test-window: verify
 	@"$(BIN)" --window-self-test

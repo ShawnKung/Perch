@@ -546,6 +546,10 @@ final class Store: ObservableObject {
     @Published var pinned = false
     @Published var adding = false
     @Published var notice: String?
+    @Published private(set) var availableUpdate: String?
+    @Published private(set) var checkingUpdate = false
+    @Published private(set) var updateCheckMessage: String?
+    private var updateTask: Task<Void, Never>?
     @Published var libraryBookmarkScope = BookmarkScope.root
     @Published var library: LibraryPage? { didSet {
         if library != nil { bookmarkEditor.close() }
@@ -559,6 +563,35 @@ final class Store: ObservableObject {
     private var browsers: [UUID: Browser] = [:]
     private var activationHistory: [UUID] = []
     let defaults: UserDefaults
+    func receiveUpdate(_ version: String?) {
+        availableUpdate = version
+    }
+    func checkForUpdates(manual: Bool = false, current: String = UpdateCheck.currentVersion,
+                         session: URLSession = .shared) {
+        guard !checkingUpdate else { return }
+        checkingUpdate = true
+        updateCheckMessage = nil
+        updateTask = Task { @MainActor [weak self] in
+            let result: Result<String?, Error>
+            do { result = .success(try await UpdateCheck.latestVersion(current: current, session: session)) }
+            catch { result = .failure(error) }
+            guard !Task.isCancelled, let self else { return }
+            switch result {
+            case .success(let latest):
+                self.receiveUpdate(latest)
+                if manual && latest == nil { self.updateCheckMessage = "当前已是最新版本" }
+            case .failure(let error):
+                if manual { self.updateCheckMessage = "无法检查更新：\(error.localizedDescription)" }
+            }
+            self.checkingUpdate = false
+            self.updateTask = nil
+        }
+    }
+    func cancelUpdateCheck() {
+        updateTask?.cancel()
+        updateTask = nil
+        checkingUpdate = false
+    }
     func cachedFavicon(_ address: String) -> NSImage? { FaviconCache.image(for: address, defaults: defaults) }
     func openBookmarks(scope: BookmarkScope = .root) {
         libraryBookmarkScope = scope
@@ -2627,6 +2660,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         do { try hotkeys.apply(store.settings) }
         catch { store.notice = error.localizedDescription }
         if store.settings.showWindowOnLaunch { show() }
+        // Isolated previews and self-checks must never contact GitHub or display update prompts.
+        if store.defaults === UserDefaults.standard {
+            store.checkForUpdates()
+        }
     }
 
     func installMenu() {
@@ -2865,7 +2902,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func windowDidChangeScreen(_ notification: Notification) { clampToScreen(); saveWindowPlacement() }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
-    func applicationWillTerminate(_ notification: Notification) { store.ai.saveConversations() }
+    func applicationWillTerminate(_ notification: Notification) {
+        store.cancelUpdateCheck()
+        store.ai.saveConversations()
+    }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         show()
@@ -2880,7 +2920,24 @@ static func main() throws {
 var appearanceDefaults = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
 appearanceDefaults["AppleShowScrollBars"] = "WhenScrolling"
 UserDefaults.standard.setVolatileDomain(appearanceDefaults, forName: UserDefaults.argumentDomain)
-if CommandLine.arguments.contains("--scroll-self-test") {
+if CommandLine.arguments.contains("--update-self-test") {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    Task { @MainActor in
+        do { try await UpdateSelfCheck.run(); exit(0) }
+        catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
+    }
+    app.run()
+} else if CommandLine.arguments.contains("--update-ui-self-test") {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.regular)
+    Task { @MainActor in
+        await UpdateSelfCheck.ui()
+        await UpdateSelfCheck.aboutUI()
+        exit(0)
+    }
+    app.run()
+} else if CommandLine.arguments.contains("--scroll-self-test") {
     let app = NSApplication.shared
     app.setActivationPolicy(.regular)
     Task { @MainActor in
