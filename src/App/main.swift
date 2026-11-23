@@ -218,7 +218,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         menu.addItem(.separator())
         add("复制当前网址", "copy")
         add("在 Perch 中打开", "external")
-        if onBookmark != nil { add(isBookmarked?() == true ? "移除书签" : "加入书签", "bookmark") }
+        if onBookmark != nil { add(isBookmarked?() == true ? "编辑书签…" : "加入书签", "bookmark") }
         add("在页面中查找…", "find")
     }
 
@@ -458,8 +458,35 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
 @MainActor
 final class Store: ObservableObject {
     lazy var linkPreview = LinkPreviewController(store: self)
+    lazy var bookmarkEditor = BookmarkEditorController()
+    @Published var bookmarkEditRequest: BookmarkEditRequest?
     private let bookmarkClipboardSession = UUID()
     @Published var sites: [Site] = [] { didSet { suggestionRevision &+= 1 } }
+    @Published private(set) var homeShortcutOrder: [UUID] = []
+    private var orderedHomeIDs: [UUID] {
+        let valid = Set(sites.map(\.id))
+        var seen = Set<UUID>()
+        return (homeShortcutOrder.filter { valid.contains($0) } + sites.map(\.id))
+            .filter { seen.insert($0).inserted }
+    }
+    var homeShortcuts: [Site] {
+        let visible = Dictionary(sites.filter { $0.showOnHome != false }.map { ($0.id, $0) },
+                                 uniquingKeysWith: { first, _ in first })
+        return orderedHomeIDs.compactMap { visible[$0] }
+    }
+    @discardableResult func reorderHomeShortcuts(_ ids: [UUID]) -> Bool {
+        let visible = Set(homeShortcuts.map(\.id))
+        guard ids.count == visible.count, Set(ids) == visible,
+              !protectedKeys.contains("homeShortcutOrder"), !protectedKeys.contains("sites") else { return false }
+        var iterator = ids.makeIterator()
+        let order = orderedHomeIDs.map { visible.contains($0) ? iterator.next()! : $0 }
+        guard order != orderedHomeIDs else { return true }
+        do {
+            defaults.set(try JSONEncoder().encode(order), forKey: "homeShortcutOrder")
+            homeShortcutOrder = order
+            return true
+        } catch { notice = "保存首页顺序失败：\(error.localizedDescription)"; return false }
+    }
     @Published var tabs: [Tab] = [] { didSet {
         for page in oldValue where !tabs.contains(where: { $0.id == page.id }) {
             var parts = URLComponents(string: page.address)
@@ -501,6 +528,10 @@ final class Store: ObservableObject {
         }
     }
     @Published var selected: UUID? { didSet {
+        if oldValue != selected {
+            if bookmarkEditRequest != nil { bookmarkEditRequest = nil }
+            bookmarkEditor.close()
+        }
         if oldValue != selected, let selected, tabs.contains(where: { $0.id == selected }) {
             activationHistory.removeAll { $0 == selected }
             activationHistory.append(selected)
@@ -515,10 +546,11 @@ final class Store: ObservableObject {
     @Published var pinned = false
     @Published var adding = false
     @Published var notice: String?
-    @Published var libraryShowsHistory = false
+    @Published var libraryBookmarkScope = BookmarkScope.root
     @Published var library: LibraryPage? { didSet {
+        if library != nil { bookmarkEditor.close() }
         if library != nil { browser?.passwordBridge.dismiss() }
-        if library != .bookmarks { libraryShowsHistory = false }
+        if library != .bookmarks { libraryBookmarkScope = .root }
     } }
     @Published var importing = false
     @Published var recentlyClosed: [Tab] = []
@@ -528,8 +560,8 @@ final class Store: ObservableObject {
     private var activationHistory: [UUID] = []
     let defaults: UserDefaults
     func cachedFavicon(_ address: String) -> NSImage? { FaviconCache.image(for: address, defaults: defaults) }
-    func openBookmarks(history: Bool = false) {
-        libraryShowsHistory = history
+    func openBookmarks(scope: BookmarkScope = .root) {
+        libraryBookmarkScope = scope
         library = .bookmarks
     }
     private var protectedKeys = Set<String>()
@@ -557,6 +589,12 @@ final class Store: ObservableObject {
             do { sites = try JSONDecoder().decode([Site].self, from: data) }
             catch { protectedKeys.insert("sites"); notice = "收藏数据无法读取，原始数据已保留。请先备份再添加网站。" }
         } else { sites = Site.defaults }
+        homeShortcutOrder = restore([UUID].self, key: "homeShortcutOrder") ?? []
+        if Set(homeShortcutOrder).count != homeShortcutOrder.count ||
+            (defaults.object(forKey: "homeShortcutOrder") != nil && defaults.data(forKey: "homeShortcutOrder") == nil) {
+            protectedKeys.insert("homeShortcutOrder"); homeShortcutOrder = []
+            notice = "首页顺序数据无法读取，已保留原数据。"
+        }
         let restoredTabs = restore([Tab].self, key: "tabs") ?? []
         let restoredSelection = defaults.string(forKey: "selectedTab").flatMap(UUID.init(uuidString:))
         let chatTab = restoredTabs.first { $0.chatOwner != nil && $0.id == restoredSelection } ??
@@ -653,7 +691,7 @@ final class Store: ObservableObject {
             }
             view.onBookmark = { [weak self, weak view] in
                 guard let self, let view else { return }
-                self.toggleBookmark(title: view.title, address: view.address)
+                self.editCurrentBookmark(title: view.title, address: view.address, tabID: id)
             }
             view.isBookmarked = { [weak self, weak view] in
                 guard let self, let view else { return false }
@@ -1089,7 +1127,7 @@ final class Store: ObservableObject {
 
     private func checkBackupAccess(_ scope: Set<BackupScope>) throws {
         let keys = Set(scope.contains(.settings) ? ["settings"] : [])
-            .union(scope.contains(.bookmarks) ? ["sites", "bookmarkFolders", "importedBookmarks", "tabs", "tabGroups"] : [])
+            .union(scope.contains(.bookmarks) ? ["sites", "homeShortcutOrder", "bookmarkFolders", "importedBookmarks", "tabs", "tabGroups"] : [])
         guard protectedKeys.isDisjoint(with: keys), !scope.contains(.ai) || ai.canRestoreSettings else {
             throw PerchError("当前设置或书签数据损坏，已保留原数据。请先备份并修复原始数据。")
         }
@@ -1107,7 +1145,7 @@ final class Store: ObservableObject {
             tabGroups: tabGroups.map { group in
                 var saved = group; saved.hiddenTabs = tabs(inGroup: group.id)
                 return saved
-            }, scope: scope,
+            }, homeShortcutOrder: orderedHomeIDs, scope: scope,
             credentials: includeKeys && scope.contains(.ai) ? try ai.backupCredentials() : nil)
         try backup.validate()
         return backup
@@ -1124,6 +1162,7 @@ final class Store: ObservableObject {
         if backup.scope.contains(.settings) { encoded["settings"] = try encoder.encode(backup.settings) }
         if backup.scope.contains(.bookmarks) {
             encoded["sites"] = try encoder.encode(backup.sites)
+            encoded["homeShortcutOrder"] = try encoder.encode(backup.homeShortcutOrder ?? [])
             encoded["bookmarkFolders"] = try encoder.encode(backup.folders)
             encoded["importedBookmarks"] = try encoder.encode(backup.imported)
             if let groups = backup.tabGroups {
@@ -1157,6 +1196,7 @@ final class Store: ObservableObject {
         }
         if backup.scope.contains(.bookmarks) {
             sites = backup.sites; bookmarkFolders = backup.folders; importedBookmarks = backup.imported
+            homeShortcutOrder = backup.homeShortcutOrder ?? []
             if let groups = backup.tabGroups {
                 tabGroups = groups
                 for index in tabs.indices { tabs[index].groupID = nil }
@@ -1195,7 +1235,7 @@ final class Store: ObservableObject {
     }
 
     @discardableResult
-    func add(title: String, address: String, folderID: UUID? = nil) -> Bool {
+    func add(title: String, address: String, folderID: UUID? = nil, showOnHome: Bool? = nil) -> Bool {
         guard validBookmarkFolder(folderID) else { return false }
         guard let url = URLInput.parse(address, search: false) else {
             notice = "请输入完整网址，例如 https://example.com。"
@@ -1206,7 +1246,8 @@ final class Store: ObservableObject {
             return false
         }
         let site = Site(title: title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        ? url.host! : String(title.prefix(80)), address: url.absoluteString, folderID: folderID)
+                        ? url.host! : String(title.prefix(80)), address: url.absoluteString,
+                        folderID: folderID, showOnHome: showOnHome)
         let updated = sites + [site]
         guard save(updated) else { return false }
         sites = updated
@@ -1357,6 +1398,27 @@ final class Store: ObservableObject {
     }
 
     @discardableResult
+    func reorderBookmarkSites(_ ids: [UUID]) -> Bool {
+        let selected = Set(ids)
+        let existing = Set(sites.map(\.id))
+        guard !ids.isEmpty, selected.count == ids.count, existing.count == sites.count, selected.isSubset(of: existing),
+              !protectedKeys.contains("sites"), !protectedKeys.contains("homeShortcutOrder") else { return false }
+        let current = Dictionary(sites.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        var iterator = ids.makeIterator()
+        let updated = sites.map { selected.contains($0.id) ? current[iterator.next()!]! : $0 }
+        guard updated.map(\.id) != sites.map(\.id) else { return true }
+        do {
+            // Freeze the homepage's current order before changing the bookmark fallback order.
+            let homeOrder = orderedHomeIDs
+            let homeData = try JSONEncoder().encode(homeOrder)
+            guard save(updated) else { return false }
+            defaults.set(homeData, forKey: "homeShortcutOrder")
+            homeShortcutOrder = homeOrder; sites = updated
+            return true
+        } catch { notice = "保存书签顺序失败：\(error.localizedDescription)"; return false }
+    }
+
+    @discardableResult
     func deleteBookmarkItems(_ ids: Set<UUID>) -> Bool {
         let folders = bookmarkFolders.filter { ids.contains($0.id) }
             .reduce(into: Set<UUID>()) { $0.formUnion(bookmarkFolderDescendants($1.id)) }
@@ -1382,25 +1444,45 @@ final class Store: ObservableObject {
         sites + importedBookmarks.keys.sorted().flatMap { (importedBookmarks[$0] ?? []).flatMap(\.sites) }
     }
 
-    func toggleBookmark(title: String, address: String) {
-        if let url = URLInput.parse(address, search: false),
-           sites.contains(where: { URLInput.parse($0.address, search: false) == url }) {
-            let updated = sites.filter { URLInput.parse($0.address, search: false) != url }
-            guard save(updated) else { return }
-            sites = updated
-        } else if bookmark(for: address) != nil {
+    func editCurrentBookmark(title: String, address: String, tabID: UUID) {
+        guard selected == tabID, URLInput.parse(address, search: false) != nil else { return }
+        let isNew = bookmark(for: address) == nil
+        if isNew, !add(title: title, address: address, showOnHome: false) { return }
+        guard let site = bookmark(for: address), sites.contains(where: { $0.id == site.id }) else {
             notice = "这个书签由浏览器导入，为只读。可以在书签管理中查看，重新导入会更新对应目录。"
-        } else { _ = add(title: title, address: address) }
+            return
+        }
+        bookmarkEditRequest = BookmarkEditRequest(site: site, ownerID: tabID, isNew: isNew)
     }
 
     func edit(_ site: Site, title: String, address: String) -> Bool {
+        guard let current = sites.first(where: { $0.id == site.id }) else { return false }
+        return edit(site, title: title, address: address, folderID: current.folderID, showOnHome: current.showOnHome)
+    }
+
+    func edit(_ site: Site, title: String, address: String, folderID: UUID?, showOnHome: Bool?) -> Bool {
+        guard validBookmarkFolder(folderID) else { return false }
         guard let url = URLInput.parse(address, search: false),
               let index = sites.firstIndex(where: { $0.id == site.id }) else {
             notice = "请输入有效网址。"; return false
         }
+        guard URLInput.parse(sites[index].address, search: false) == url ||
+              !sites.contains(where: { $0.id != site.id && URLInput.parse($0.address, search: false) == url }) else {
+            notice = "这个网站已经在收藏里了。"; return false
+        }
+        if sites[index].folderID != folderID {
+            guard !protectedKeys.contains("bookmarkFolders"),
+                  defaults.data(forKey: "bookmarkFolders").map({
+                      (try? JSONDecoder().decode([BookmarkFolder].self, from: $0)) != nil
+                  }) ?? true else {
+                notice = "书签目录数据损坏，原始数据已保留，暂时禁止修改目录。"; return false
+            }
+        }
         var updated = sites
-        updated[index].title = title.isEmpty ? url.host! : String(title.prefix(80))
+        updated[index].title = title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? url.host! : String(title.prefix(80))
         updated[index].address = url.absoluteString
+        updated[index].folderID = folderID
+        updated[index].showOnHome = showOnHome
         guard save(updated) else { return false }
         sites = updated; return true
     }
@@ -1587,6 +1669,11 @@ struct BrowserAddressBar: View {
     @ObservedObject var store: Store
     let tabID: UUID
 
+    private func closeBookmarkEditor() {
+        if store.bookmarkEditRequest?.ownerID == tabID { store.bookmarkEditRequest = nil }
+        if store.bookmarkEditor.draft?.request.ownerID == tabID { store.bookmarkEditor.close() }
+    }
+
     var body: some View {
         HStack(spacing: 3) {
                 GlyphButton(symbol: "chevron.left", label: "后退", size: 28) { browser.goBack() }
@@ -1601,12 +1688,13 @@ struct BrowserAddressBar: View {
                     PasswordFillButton(store: store, browser: browser)
                     let saved = store.bookmark(for: browser.address) != nil
                     GlyphButton(symbol: saved ? "star.fill" : "star",
-                                label: saved ? "取消收藏当前网页" : "收藏当前网页", active: saved, activeBackground: false, size: 26) {
-                        store.toggleBookmark(title: browser.title, address: browser.address)
+                                label: saved ? "编辑当前网页书签" : "收藏当前网页", active: saved, activeBackground: false, size: 26) {
+                        store.editCurrentBookmark(title: browser.title, address: browser.address, tabID: tabID)
                     }
                     .disabled(URLInput.parse(browser.address, search: false) == nil)
                     .accessibilityValue(saved ? "已收藏" : "未收藏")
                     .anchorPreference(key: BookmarkButtonAnchor.self, value: .bounds) { $0 }
+                    .background(BookmarkEditorAnchor(store: store, ownerID: tabID))
                     .padding(.trailing, 3)
                 }.background(Style.paper, in: RoundedRectangle(cornerRadius: 8))
                     .overlay(RoundedRectangle(cornerRadius: 8).stroke(Style.line, lineWidth: 1).allowsHitTesting(false))
@@ -1621,6 +1709,8 @@ struct BrowserAddressBar: View {
                         }
                     }
         }
+        .onChange(of: browser.address) { _ in closeBookmarkEditor() }
+        .onDisappear { closeBookmarkEditor() }
     }
 }
 
@@ -1803,7 +1893,7 @@ struct HomeScreen: View {
     private let icons: [UUID: NSImage]
     init(store: Store, tabID: UUID) {
         self.store = store; self.tabID = tabID
-        shortcuts = store.sites.filter { $0.showOnHome != false }
+        shortcuts = store.homeShortcuts
         suggestionRevision = store.suggestionRevision
         icons = store.icons
     }
@@ -1844,38 +1934,41 @@ struct HomeScreen: View {
                         .overlay(RoundedRectangle(cornerRadius: 14).stroke(Style.line))
                 }.buttonStyle(.plain)
 
-                if !shortcuts.isEmpty {
+                Group {
                     VStack(alignment: .leading, spacing: 14) {
                         HStack {
                             Text("快捷入口").font(.system(size: 13, weight: .semibold))
                             Spacer()
+                            Button { store.openBookmarks(scope: .all) } label: {
+                                Label("全部书签", systemImage: "bookmark")
+                            }.buttonStyle(.plain).font(.system(size: 12)).foregroundStyle(Style.accent)
+                                .accessibilityLabel("全部书签")
                             Button { store.adding = true } label: { Label("添加", systemImage: "plus") }
                                 .buttonStyle(.plain).font(.system(size: 12)).foregroundStyle(Style.accent)
                         }
-                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 190), spacing: 12)], spacing: 12) {
-                            ForEach(shortcuts) { site in
-                                Button { store.open(site) } label: {
-                                    HStack(spacing: 12) {
-                                        Group {
-                                            if let icon = store.cachedFavicon(site.address) {
-                                                Image(nsImage: icon).resizable().scaledToFit()
-                                                    .frame(width: 20, height: 20)
-                                            } else {
-                                                Image(systemName: site.symbol).font(.system(size: 20))
-                                                    .foregroundStyle(Style.accent)
-                                            }
-                                        }.frame(width: 32).accessibilityHidden(true)
-                                        VStack(alignment: .leading, spacing: 5) {
-                                            Text(site.title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
-                                            Text(URL(string: site.address)?.host ?? site.address)
-                                                .font(.system(size: 10)).foregroundStyle(Style.muted).lineLimit(1)
+                        HomeShortcutGrid(store: store, sites: shortcuts, tabID: tabID) { site in
+                            Button { store.open(site) } label: {
+                                HStack(spacing: 12) {
+                                    Group {
+                                        if let icon = store.cachedFavicon(site.address) {
+                                            Image(nsImage: icon).resizable().scaledToFit()
+                                                .frame(width: 20, height: 20)
+                                        } else {
+                                            Image(systemName: site.symbol).font(.system(size: 20))
+                                                .foregroundStyle(Style.accent)
                                         }
-                                        Spacer(minLength: 0)
-                                    }.padding(17).frame(maxWidth: .infinity, alignment: .leading)
-                                        .background(.white, in: RoundedRectangle(cornerRadius: 12))
-                                }.buttonStyle(.plain)
-                            }
-                        }
+                                    }.frame(width: 32).accessibilityHidden(true)
+                                    VStack(alignment: .leading, spacing: 5) {
+                                        Text(site.title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                                        Text(URL(string: site.address)?.host ?? site.address)
+                                            .font(.system(size: 10)).foregroundStyle(Style.muted).lineLimit(1)
+                                    }
+                                    Spacer(minLength: 0)
+                                }.padding(17).frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(.white, in: RoundedRectangle(cornerRadius: 12))
+                            }.buttonStyle(.plain)
+                                .background(BookmarkEditorAnchor(store: store, ownerID: site.id))
+                        }.id(tabID)
                     }
                 }
             }.padding(28).frame(maxWidth: 760, alignment: .leading).frame(maxWidth: .infinity)
@@ -1945,7 +2038,7 @@ struct WindowTools: View {
             }
             Menu {
                 Button("书签管理") { store.openBookmarks() }
-                Button("历史记录") { store.openBookmarks(history: true) }
+                Button("历史记录") { store.openBookmarks(scope: .history) }
                 Button("密码管理") { store.library = .passwords }
                 Divider()
                 Button("在新标签页打开") {
@@ -2612,7 +2705,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     @objc func reopenTab() { guard store.library == nil && !store.adding else { return }; store.reopen() }
     @objc func settings() { store.library = .settings }
-    @objc func history() { store.openBookmarks(history: true) }
+    @objc func history() { store.openBookmarks(scope: .history) }
     @objc func focusAddress() { NotificationCenter.default.post(name: .focusAddress, object: nil) }
     private var activeBrowser: Browser? { panel?.attachedSheet == nil && store.library == nil && !store.adding ? store.browser : nil }
     @objc func reloadPage() { activeBrowser?.webView.reload() }
@@ -2625,7 +2718,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc func goBack() { navigationBrowser?.goBack() }
     @objc func goForward() { navigationBrowser?.goForward() }
     @objc func bookmarkPage() {
-        if let browser = activeBrowser { store.toggleBookmark(title: browser.title, address: browser.address) }
+        if let browser = activeBrowser, let tabID = store.selected {
+            store.editCurrentBookmark(title: browser.title, address: browser.address, tabID: tabID)
+        }
     }
     @objc func findPage() { activeBrowser?.finding = true }
     @objc func findNext() { activeBrowser?.find() }

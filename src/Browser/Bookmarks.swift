@@ -1,10 +1,240 @@
 import AppKit
 import SwiftUI
+import Combine
 
 struct BookmarkFolder: Identifiable, Codable {
     var id = UUID()
     var title: String
     var parentID: UUID?
+}
+
+struct BookmarkEditRequest: Identifiable {
+    let id = UUID()
+    let site: Site
+    let ownerID: UUID
+    var showAddress = false
+    var isNew = false
+}
+
+// A passive native anchor keeps the editor attached to the button without intercepting clicks.
+struct BookmarkEditorAnchor: NSViewRepresentable {
+    @ObservedObject var store: Store
+    let ownerID: UUID
+    final class Anchor: NSView {
+        weak var controller: BookmarkEditorController?
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if window == nil { controller?.updatePosition(for: self) }
+        }
+    }
+    func makeNSView(context: Context) -> NSView {
+        let view = Anchor()
+        view.controller = store.bookmarkEditor
+        return view
+    }
+    func updateNSView(_ view: NSView, context: Context) {
+        store.bookmarkEditor.updatePosition(for: view)
+        guard let request = store.bookmarkEditRequest, request.ownerID == ownerID else { return }
+        DispatchQueue.main.async { [weak view, weak store] in
+            guard let view, view.window != nil, let store,
+                  store.bookmarkEditRequest?.id == request.id else { return }
+            store.bookmarkEditRequest = nil
+            guard store.library == nil, !store.adding else { return }
+            store.bookmarkEditor.show(request, store: store, anchor: view)
+        }
+    }
+}
+
+@MainActor
+final class BookmarkEditorDraft: ObservableObject {
+    let store: Store
+    let request: BookmarkEditRequest
+    @Published var title: String
+    @Published var address: String
+    @Published var folderID: UUID?
+    @Published var showOnHome: Bool
+    @Published var error: String?
+    var finished = false
+    init(store: Store, request: BookmarkEditRequest) {
+        self.store = store; self.request = request
+        title = request.site.title; address = request.site.address
+        folderID = request.site.folderID; showOnHome = request.site.showOnHome != false
+    }
+    @discardableResult func save() -> Bool {
+        if finished { return true }
+        let site = request.site
+        if title == site.title, address == site.address, folderID == site.folderID,
+           showOnHome == (site.showOnHome != false) {
+            finished = true; return true
+        }
+        guard store.edit(site, title: title, address: address, folderID: folderID, showOnHome: showOnHome) else {
+            error = store.notice ?? "书签保存失败。"
+            store.notice = nil
+            return false
+        }
+        finished = true; return true
+    }
+    func remove() -> Bool {
+        guard store.removeBookmarks([request.site.id]) else {
+            error = store.notice ?? "书签删除失败。"; store.notice = nil; return false
+        }
+        finished = true; return true
+    }
+}
+
+struct BookmarkEditorView: View {
+    @ObservedObject var draft: BookmarkEditorDraft
+    let close: () -> Void
+    @FocusState private var nameFocused: Bool
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text(draft.request.isNew ? "已添加书签" : "编辑书签").font(.system(size: 16, weight: .semibold))
+            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 12) {
+                GridRow {
+                    Text("名称")
+                    TextField("名称", text: $draft.title).focused($nameFocused)
+                        .accessibilityIdentifier("bookmark-editor-name")
+                }
+                if draft.request.showAddress {
+                    GridRow {
+                        Text("网址")
+                        TextField("网址", text: $draft.address).accessibilityIdentifier("bookmark-editor-address")
+                    }
+                }
+                GridRow {
+                    Text("文件夹")
+                    Picker("文件夹", selection: $draft.folderID) {
+                        Text("个人书签").tag(Optional<UUID>.none)
+                        ForEach(draft.store.bookmarkFolders.sorted {
+                            draft.store.bookmarkFolderPath($0.id).localizedStandardCompare(draft.store.bookmarkFolderPath($1.id)) == .orderedAscending
+                        }) { folder in
+                            Text(draft.store.bookmarkFolderPath(folder.id)).tag(Optional(folder.id))
+                        }
+                    }.labelsHidden().accessibilityIdentifier("bookmark-editor-folder")
+                }
+            }
+            Toggle("展示在首页", isOn: $draft.showOnHome)
+                .toggleStyle(.checkbox).accessibilityIdentifier("bookmark-editor-home")
+            if let error = draft.error { Text(error).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true) }
+            HStack {
+                Button("移除") { if draft.remove() { close() } }
+                Spacer()
+                Button("完成") { if draft.save() { close() } }.keyboardShortcut(.defaultAction)
+            }
+        }
+        .textFieldStyle(.roundedBorder).padding(20).frame(width: 340)
+        .background(.white, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Style.line).allowsHitTesting(false))
+        .foregroundStyle(Style.ink).tint(Style.accent).preferredColorScheme(.light)
+        .onAppear { nameFocused = true }
+    }
+}
+
+@MainActor
+final class BookmarkEditorController: NSObject, NSWindowDelegate {
+    private final class EditorPanel: NSPanel {
+        override var canBecomeKey: Bool { true }
+        override var canBecomeMain: Bool { false }
+    }
+    private(set) var window: NSPanel?
+    private(set) var draft: BookmarkEditorDraft?
+    private weak var anchor: NSView?
+    private var eventMonitor: Any?
+    private var observers: [NSObjectProtocol] = []
+    private var draftObservation: AnyCancellable?
+    private var previewController: BookmarkPreviewController?
+    func show(_ request: BookmarkEditRequest, store: Store, anchor: NSView) {
+        guard let parent = anchor.window, close() else { return }
+        let draft = BookmarkEditorDraft(store: store, request: request)
+        let window = EditorPanel(contentRect: .zero, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.isFloatingPanel = true
+        window.hidesOnDeactivate = false
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = true
+        window.animationBehavior = .none
+        window.delegate = self
+        let content = NSHostingView(rootView: BookmarkEditorView(draft: draft) { [weak self] in
+            self?.close()
+        })
+        content.sizingOptions = [.intrinsicContentSize]
+        window.contentView = content
+        self.draft = draft; self.window = window; self.anchor = anchor
+        updatePosition(for: anchor)
+        parent.addChildWindow(window, ordered: .above)
+        window.makeKeyAndOrderFront(nil)
+        draftObservation = draft.objectWillChange.sink { [weak self] _ in
+            DispatchQueue.main.async { [weak self] in
+                guard let self, let anchor = self.anchor else { return }
+                self.updatePosition(for: anchor)
+            }
+        }
+        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown, .keyDown]) { [weak self] event in
+            guard let self, let window = self.window else { return event }
+            if event.type == .keyDown {
+                if event.window === window, event.keyCode == 53 { self.close(); return nil }
+            } else if let target = event.window, target !== window, target.level < .popUpMenu {
+                self.close()
+            }
+            return event
+        }
+        for name in [NSWindow.didMoveNotification, NSWindow.didResizeNotification, NSWindow.willCloseNotification] {
+            observers.append(NotificationCenter.default.addObserver(forName: name, object: parent, queue: .main) { [weak self] note in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    if note.name == NSWindow.willCloseNotification { self.window?.close() }
+                    else if let anchor = self.anchor { self.updatePosition(for: anchor) }
+                }
+            })
+        }
+    }
+    func updatePosition(for anchor: NSView) {
+        guard self.anchor === anchor, let window, let content = window.contentView else { return }
+        guard let parent = anchor.window else { window.close(); return }
+        let rect = parent.convertToScreen(anchor.convert(anchor.bounds, to: nil))
+        let bounds = (NSScreen.screens.first { $0.frame.contains(NSPoint(x: rect.midX, y: rect.midY)) } ?? parent.screen)?.visibleFrame ?? parent.frame
+        let size = content.intrinsicContentSize
+        // Right-align below the trigger; use the space above only at the bottom screen edge.
+        let y = rect.minY - size.height - 6
+        let frame = NSRect(x: rect.maxX - size.width, y: y >= bounds.minY ? y : rect.maxY + 6,
+                           width: size.width, height: size.height)
+        window.setFrame(ScreenPlacement.fit(frame, from: bounds, to: bounds), display: window.isVisible)
+    }
+    @discardableResult func close() -> Bool {
+        guard draft?.save() != false else { window?.makeKeyAndOrderFront(nil); return false }
+        let parent = window?.parent
+        let wasKey = window?.isKeyWindow == true
+        window?.close()
+        if wasKey, parent?.isVisible == true { parent?.makeKeyAndOrderFront(nil) }
+        return true
+    }
+    func windowDidResignKey(_ notification: Notification) { close() }
+    func windowShouldClose(_ sender: NSWindow) -> Bool { close(); return false }
+    func windowWillClose(_ notification: Notification) {
+        guard notification.object as? NSWindow === window else { return }
+        if let draft, !draft.save() { draft.store.notice = draft.error }
+        if let eventMonitor { NSEvent.removeMonitor(eventMonitor) }
+        eventMonitor = nil
+        observers.forEach(NotificationCenter.default.removeObserver)
+        observers = []
+        draftObservation = nil
+        if let window { window.parent?.removeChildWindow(window) }
+        window = nil; draft = nil; anchor = nil
+    }
+    deinit {
+        if let eventMonitor { NSEvent.removeMonitor(eventMonitor) }
+        observers.forEach(NotificationCenter.default.removeObserver)
+    }
+    func preview(_ site: Site, store: Store, parent: NSWindow, tabID: UUID) {
+        guard previewController == nil, let browser = store.bookmarkPreviewBrowser(for: site) else { return }
+        let controller = BookmarkPreviewController(browser: browser, title: site.title, parent: parent, defaults: store.defaults)
+        controller.onOpenTab = { [weak store] site in store?.newTab(address: site.address, after: tabID) }
+        controller.onClose = { [weak self] in self?.previewController = nil }
+        previewController = controller
+        controller.show(in: parent)
+    }
 }
 
 enum BookmarkClipboard {
@@ -51,13 +281,13 @@ enum BookmarkDrag {
 
 final class BookmarkListItem {
     let key: String
-    let title: String
-    let site: Site?
+    var title: String
+    var site: Site?
     let folderID: UUID?
     let editable: Bool
     let groupID: UUID?
     let groupColor: TabGroupColor?
-    let children: [BookmarkListItem]?
+    var children: [BookmarkListItem]?
     init(key: String, title: String = "", site: Site? = nil, folderID: UUID? = nil,
          editable: Bool = false, children: [BookmarkListItem]? = nil,
          groupID: UUID? = nil, groupColor: TabGroupColor? = nil) {
@@ -85,9 +315,34 @@ final class BookmarkListItem {
                 site: node.address.map { Site(id: node.id, title: node.title, address: $0) })
         }
     }
+    static func personal(_ sites: [Site], folders: [BookmarkFolder], parentID: UUID?, query: String) -> [BookmarkListItem] {
+        let sitesByFolder = Dictionary(grouping: sites, by: \.folderID)
+        let foldersByParent = Dictionary(grouping: folders, by: \.parentID)
+        func matches(_ title: String, _ address: String = "") -> Bool {
+            query.isEmpty || title.localizedCaseInsensitiveContains(query) || address.localizedCaseInsensitiveContains(query)
+        }
+        func rows(in parent: UUID?, ancestors: Set<UUID>, includeAll: Bool) -> [BookmarkListItem] {
+            guard ancestors.count < 64 else { return [] }
+            let directories = (foldersByParent[parent] ?? []).compactMap { folder -> BookmarkListItem? in
+                guard !ancestors.contains(folder.id) else { return nil }
+                let matched = includeAll || matches(folder.title)
+                let children = rows(in: folder.id, ancestors: ancestors.union([folder.id]), includeAll: matched)
+                guard matched || !children.isEmpty else { return nil }
+                return BookmarkListItem(key: folder.id.uuidString, title: folder.title, folderID: folder.id, children: children)
+            }
+            return directories + (sitesByFolder[parent] ?? []).filter {
+                includeAll || matches($0.title, $0.address)
+            }.map { BookmarkListItem(key: $0.id.uuidString, site: $0, editable: true) }
+        }
+        return rows(in: parentID, ancestors: Set(parentID.map { [$0] } ?? []), includeAll: query.isEmpty)
+    }
 }
 
 final class BookmarkOutline: NSOutlineView {
+    // Returning false from shouldShowOutlineCell also disables AppKit's collapse operation.
+    override func frameOfOutlineCell(atRow row: Int) -> NSRect { .zero }
+    var updateDragPreview: ((NSDraggingInfo) -> NSDragOperation?)?
+    var cancelDragPreview: (() -> Void)?
     var clipboard = NSPasteboard.general
     var copyItems: ((NSPasteboard) -> Void)?
     var cutItems: ((NSPasteboard) -> Void)?
@@ -145,6 +400,14 @@ final class BookmarkOutline: NSOutlineView {
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
         super.mouseDown(with: event)
+    }
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        let operation = super.draggingUpdated(sender)
+        return updateDragPreview?(sender) ?? operation
+    }
+    override func draggingExited(_ sender: NSDraggingInfo?) {
+        cancelDragPreview?()
+        super.draggingExited(sender)
     }
     override func menu(for event: NSEvent) -> NSMenu? {
         window?.makeFirstResponder(self)
@@ -251,6 +514,7 @@ struct NativeBookmarks: NSViewRepresentable {
     var cut: (Set<UUID>, NSPasteboard) -> Void
     var movable: Set<UUID>
     var move: (Set<UUID>, UUID?) -> Bool
+    var reorder: (([UUID]) -> Bool)?
     var folderAction: (UUID, String) -> Void
     var pasteInto: (NSPasteboard, UUID) -> Void
     var requestDelete: () -> Void
@@ -283,6 +547,11 @@ struct NativeBookmarks: NSViewRepresentable {
         }
         table.registerForDraggedTypes([BookmarkDrag.type])
         table.setDraggingSourceOperationMask(.move, forLocal: true)
+        table.updateDragPreview = { [weak coordinator = context.coordinator] info in
+            guard let coordinator, !coordinator.dragIDs.isEmpty else { return nil }
+            return coordinator.updateDragPreview(info)
+        }
+        table.cancelDragPreview = { [weak coordinator = context.coordinator] in coordinator?.restoreDragOrder() }
         return scroll
     }
     func updateNSView(_ scroll: NSScrollView, context: Context) {
@@ -315,6 +584,7 @@ struct NativeBookmarks: NSViewRepresentable {
                   let cell = coordinator.table.view(atColumn: 0, row: row, makeIfNecessary: false) as? BookmarkCell else { continue }
             cell.configure(item, favicon: item.site.flatMap { favicon($0.address) },
                            expanded: coordinator.table.isItemExpanded(item))
+            cell.isHidden = item.id.map(coordinator.dragIDs.contains) == true
         }
         coordinator.table.enumerateAvailableRowViews { row, _ in
             if let row = row as? TabSelectionRow { row.theme = theme.selection }
@@ -322,6 +592,7 @@ struct NativeBookmarks: NSViewRepresentable {
         }
     }
     static func dismantleNSView(_ nsView: NSScrollView, coordinator: Coordinator) {
+        coordinator.endDragPreview()
         coordinator.previewController?.close()
     }
     final class Coordinator: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
@@ -332,6 +603,15 @@ struct NativeBookmarks: NSViewRepresentable {
         var signature = ""
         var updating = false
         var previewController: BookmarkPreviewController?
+        private(set) var dragIDs = Set<UUID>()
+        private var originalKeys: [String] = []
+        private var originalSiblings: [BookmarkListItem] = []
+        private var dragParent: BookmarkListItem?
+        private var dragSiblings: [BookmarkListItem] {
+            get { dragParent?.children ?? roots }
+            set { if let dragParent { dragParent.children = newValue } else { roots = newValue } }
+        }
+        private var reorderDrop = false
         init(_ parent: NativeBookmarks) { self.parent = parent }
         func flattened(_ items: [BookmarkListItem]) -> [BookmarkListItem] {
             items.flatMap { [$0] + flattened($0.children ?? []) }
@@ -340,6 +620,18 @@ struct NativeBookmarks: NSViewRepresentable {
             updating = true
             defer { updating = false }
             let next = parent.rows.map(\.signature).joined()
+            if !dragIDs.isEmpty {
+                if parent.reorder == nil || flattened(parent.rows).map(\.key) != originalKeys {
+                    endDragPreview()
+                } else {
+                    // NSOutlineView tracks item identity; refresh metadata without replacing dragged items.
+                    let incoming = Dictionary(flattened(parent.rows).map { ($0.key, $0) }, uniquingKeysWith: { first, _ in first })
+                    for existing in flattened(roots) {
+                        if let item = incoming[existing.key] { existing.title = item.title; existing.site = item.site }
+                    }
+                    signature = next
+                }
+            }
             if signature != next {
                 let expanded = Set(flattened(roots).filter { table.isItemExpanded($0) }.map(\.key))
                 let origin = table.enclosingScrollView?.contentView.bounds.origin ?? .zero
@@ -356,6 +648,7 @@ struct NativeBookmarks: NSViewRepresentable {
                 return item.selectable && parent.selection.contains(id)
             })
             if indexes != table.selectedRowIndexes { table.selectRowIndexes(indexes, byExtendingSelection: false) }
+            refreshDragPlaceholder()
         }
         func outlineViewSelectionDidChange(_ notification: Notification) {
             guard !updating else { return }
@@ -383,13 +676,14 @@ struct NativeBookmarks: NSViewRepresentable {
         func outlineView(_ outlineView: NSOutlineView, shouldSelectItem item: Any) -> Bool {
             (item as? BookmarkListItem)?.selectable == true
         }
-        func outlineView(_ outlineView: NSOutlineView, shouldShowOutlineCellForItem item: Any) -> Bool { false }
+        func outlineView(_ outlineView: NSOutlineView, shouldShowOutlineCellForItem item: Any) -> Bool { true }
         func outlineView(_ outlineView: NSOutlineView, rowViewForItem item: Any) -> NSTableRowView? {
             let view = TabSelectionRow()
             view.theme = theme
             view.horizontalInset = 1
             view.extraLeadingInset = 11
             view.verticalInset = 2
+            view.dragPlaceholder = (item as? BookmarkListItem)?.id.map(dragIDs.contains) == true
             return view
         }
         func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
@@ -398,10 +692,15 @@ struct NativeBookmarks: NSViewRepresentable {
                 ?? BookmarkCell()
             cell.configure(item, favicon: item.site.flatMap { parent.favicon($0.address) },
                            expanded: table.isItemExpanded(item))
+            cell.isHidden = item.id.map(dragIDs.contains) == true
             cell.edit = { [weak self] in if let site = item.site { self?.parent.edit(site) } }
             cell.toggleHome = { [weak self] in if let site = item.site { self?.parent.toggleHome(site) } }
-            cell.open = { [weak self] in self?.activate(item) }
+            cell.open = { [weak self] in self?.open(item) }
             return cell
+        }
+        func open(_ item: BookmarkListItem) {
+            if let folder = item.folderID, parent.movable.contains(folder) { parent.navigate(folder) }
+            else { activate(item) }
         }
         func activate(_ item: BookmarkListItem) {
             if item.groupID != nil, let site = item.site { parent.folderAction(site.id, "openTab") }
@@ -416,9 +715,120 @@ struct NativeBookmarks: NSViewRepresentable {
             let writer = NSPasteboardItem(); writer.setString(id.uuidString, forType: BookmarkDrag.type)
             return writer
         }
+        @discardableResult func beginDragPreview(_ ids: Set<UUID>) -> Bool {
+            let items = flattened(roots).filter { $0.id.map(ids.contains) == true }
+            guard dragIDs.isEmpty, parent.reorder != nil, !ids.isEmpty,
+                  items.count == ids.count, items.allSatisfy({ $0.editable && $0.site != nil }),
+                  let first = items.first else { return false }
+            let owner = table.parent(forItem: first) as? BookmarkListItem
+            guard items.allSatisfy({ table.parent(forItem: $0) as? BookmarkListItem === owner }) else { return false }
+            dragParent = owner; originalSiblings = dragSiblings
+            originalKeys = flattened(roots).map(\.key)
+            dragIDs = ids
+            table.draggingDestinationFeedbackStyle = .none
+            refreshDragPlaceholder()
+            return true
+        }
+        private func refreshDragPlaceholder() {
+            for row in 0..<table.numberOfRows {
+                let hidden = (table.item(atRow: row) as? BookmarkListItem)?.id.map(dragIDs.contains) == true
+                table.view(atColumn: 0, row: row, makeIfNecessary: false)?.isHidden = hidden
+                if let view = table.rowView(atRow: row, makeIfNecessary: false) as? TabSelectionRow {
+                    view.dragPlaceholder = hidden; view.needsDisplay = true
+                }
+            }
+        }
+        private func applyDragOrder(_ order: [BookmarkListItem]) {
+            guard dragSiblings.map(\.key) != order.map(\.key) else { refreshDragPlaceholder(); return }
+            let wasUpdating = updating
+            updating = true
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : 0.18
+                for (destination, item) in order.enumerated() {
+                    var siblings = dragSiblings
+                    guard let source = siblings.firstIndex(where: { $0.key == item.key }), source != destination else { continue }
+                    siblings.insert(siblings.remove(at: source), at: destination)
+                    dragSiblings = siblings
+                    table.moveItem(at: source, inParent: dragParent, to: destination, inParent: dragParent)
+                }
+            }
+            let selection = IndexSet((0..<table.numberOfRows).filter {
+                (table.item(atRow: $0) as? BookmarkListItem)?.id.map(parent.selection.contains) == true
+            })
+            table.selectRowIndexes(selection, byExtendingSelection: false)
+            updating = wasUpdating
+            refreshDragPlaceholder()
+        }
+        func restoreDragOrder() {
+            guard !dragIDs.isEmpty else { return }
+            reorderDrop = false
+            table.draggingDestinationFeedbackStyle = .regular
+            applyDragOrder(originalSiblings)
+        }
+        func endDragPreview() {
+            restoreDragOrder()
+            dragIDs = []; originalSiblings = []; originalKeys = []; dragParent = nil; reorderDrop = false
+            table.draggingDestinationFeedbackStyle = .regular
+            refreshDragPlaceholder()
+        }
+        func updateDragPreview(_ info: NSDraggingInfo) -> NSDragOperation {
+            guard !dragIDs.isEmpty, info.draggingSource as? NSOutlineView === table,
+                  BookmarkDrag.ids(info.draggingPasteboard) == dragIDs else { return [] }
+            let point = table.convert(info.draggingLocation, from: nil)
+            guard table.visibleRect.contains(point) else { restoreDragOrder(); return [] }
+            let row = table.row(at: point)
+            if row >= 0, let folder = table.item(atRow: row) as? BookmarkListItem,
+               folder.folderID.map(parent.movable.contains) == true {
+                restoreDragOrder()
+                table.setDropItem(folder, dropChildIndex: NSOutlineViewDropOnItemIndex)
+                return .move
+            }
+            let sites = dragSiblings.filter { $0.editable && $0.site != nil }
+            guard let target = sites.indices.min(by: {
+                abs(table.rect(ofRow: table.row(forItem: sites[$0])).midY - point.y) <
+                    abs(table.rect(ofRow: table.row(forItem: sites[$1])).midY - point.y)
+            }) else { return [] }
+            reorderDrop = true
+            table.draggingDestinationFeedbackStyle = .none
+            table.setDropItem(dragParent, dropChildIndex: dragSiblings.firstIndex { $0 === sites[target] }!)
+            if sites[target].id.map(dragIDs.contains) == true { return .move }
+            let moving = originalSiblings.filter { $0.id.map(dragIDs.contains) == true }
+            var remaining = sites.filter { $0.id.map(dragIDs.contains) != true }
+            remaining.insert(contentsOf: moving, at: min(target, remaining.count))
+            var iterator = remaining.makeIterator()
+            applyDragOrder(dragSiblings.map { $0.editable && $0.site != nil ? iterator.next()! : $0 })
+            return .move
+        }
+        func outlineView(_ outlineView: NSOutlineView, draggingSession session: NSDraggingSession,
+                         willBeginAt screenPoint: NSPoint, forItems items: [Any]) {
+            let ids = Set(items.compactMap { ($0 as? BookmarkListItem)?.id })
+            var previews: [UUID: (NSRect, NSImage)] = [:]
+            for item in items {
+                guard let item = item as? BookmarkListItem, let id = item.id,
+                      let cell = table.view(atColumn: 0, row: table.row(forItem: item), makeIfNecessary: true),
+                      let image = cell.dragPreview(radius: 9, background: NSColor(Style.paper)) else { continue }
+                previews[id] = (table.convert(cell.bounds, from: cell), image)
+            }
+            session.enumerateDraggingItems(options: [], for: table, classes: [NSPasteboardItem.self], searchOptions: [:]) {
+                item, _, _ in
+                guard let writer = item.item as? NSPasteboardItem,
+                      let raw = writer.string(forType: BookmarkDrag.type), let id = UUID(uuidString: raw),
+                      let (frame, image) = previews[id] else { return }
+                item.setDraggingFrame(frame, contents: image)
+            }
+            session.animatesToStartingPositionsOnCancelOrFail = true
+            _ = beginDragPreview(ids)
+        }
+        func outlineView(_ outlineView: NSOutlineView, draggingSession session: NSDraggingSession,
+                         endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+            endDragPreview()
+            update()
+        }
         func outlineView(_ outlineView: NSOutlineView, validateDrop info: NSDraggingInfo,
                          proposedItem item: Any?, proposedChildIndex index: Int) -> NSDragOperation {
-            guard !BookmarkDrag.ids(info.draggingPasteboard).isEmpty else { return [] }
+            let ids = BookmarkDrag.ids(info.draggingPasteboard)
+            guard !ids.isEmpty, ids.isSubset(of: parent.movable) else { return [] }
+            if !dragIDs.isEmpty { return updateDragPreview(info) }
             if let item = item as? BookmarkListItem {
                 guard let folder = item.folderID, parent.movable.contains(folder) else { return [] }
                 outlineView.setDropItem(item, dropChildIndex: NSOutlineViewDropOnItemIndex)
@@ -427,7 +837,21 @@ struct NativeBookmarks: NSViewRepresentable {
         }
         func outlineView(_ outlineView: NSOutlineView, acceptDrop info: NSDraggingInfo,
                          item: Any?, childIndex: Int) -> Bool {
-            parent.move(BookmarkDrag.ids(info.draggingPasteboard), (item as? BookmarkListItem)?.folderID)
+            if !dragIDs.isEmpty {
+                guard info.draggingSource as? NSOutlineView === table,
+                      BookmarkDrag.ids(info.draggingPasteboard) == dragIDs,
+                      table.visibleRect.contains(table.convert(info.draggingLocation, from: nil)) else { return false }
+            }
+            if reorderDrop {
+                let order = dragSiblings.filter { $0.editable && $0.site != nil }.compactMap(\.id)
+                guard parent.reorder?(order) == true else { endDragPreview(); return false }
+                dragIDs = []; originalSiblings = []; originalKeys = []; dragParent = nil; reorderDrop = false
+                refreshDragPlaceholder()
+                return true
+            }
+            let ids = BookmarkDrag.ids(info.draggingPasteboard)
+            guard !ids.isEmpty, ids.isSubset(of: parent.movable) else { return false }
+            return parent.move(ids, (item as? BookmarkListItem)?.folderID)
         }
         @objc func doubleClick() {
             guard let item = table.item(atRow: table.clickedRow) as? BookmarkListItem else { return }
@@ -477,7 +901,7 @@ struct NativeBookmarks: NSViewRepresentable {
             guard let args = sender.representedObject as? [String], args.count == 2,
                   let item = flattened(roots).first(where: { $0.key == args[0] }) else { return }
             switch args[1] {
-            case "open": activate(item)
+            case "open": open(item)
             case "copy": parent.copy(parent.selection, table.clipboard)
             case "cut": parent.cut(parent.selection, table.clipboard)
             case "address": if let site = item.site { copyAddress(site.address) }
@@ -494,7 +918,7 @@ struct NativeBookmarks: NSViewRepresentable {
     }
 }
 
-private enum BookmarkScope: Equatable {
+enum BookmarkScope: Equatable {
     case all, root, folder(UUID), imported(String), history, group(UUID)
 }
 
@@ -531,7 +955,7 @@ struct BookmarksPage: View {
 
     init(store: Store) {
         self.store = store
-        _scope = State(initialValue: store.libraryShowsHistory ? .history : .root)
+        _scope = State(initialValue: store.libraryBookmarkScope)
     }
 
     private var currentFolder: UUID? {
@@ -548,18 +972,6 @@ struct BookmarksPage: View {
         case .group(let id): return store.tabGroups.first { $0.id == id }?.name ?? "标签组"
         }
     }
-    private var personal: [Site] {
-        store.sites.filter { site in
-            let inScope: Bool
-            switch scope {
-            case .all: inScope = true
-            case .root: inScope = site.folderID == nil
-            case .folder(let id): inScope = site.folderID == id
-            case .imported, .history, .group: inScope = false
-            }
-            return inScope && matches(site.title, site.address)
-        }
-    }
     private var sources: [String] {
         switch scope {
         case .all: return store.importedBookmarks.keys.sorted()
@@ -569,9 +981,6 @@ struct BookmarksPage: View {
     }
     private var filteredImports: [String: [BookmarkNode]] {
         store.importedBookmarks.mapValues(filteredNodes)
-    }
-    private var visible: [Site] {
-        personal + sources.flatMap { (filteredImports[$0] ?? []).flatMap(\.sites) }
     }
     private var selected: [Site] { store.bookmarkSelectionPayload(selection).sites }
     private var deletable: Set<UUID> { store.personalBookmarkItemIDs.intersection(selection) }
@@ -586,12 +995,12 @@ struct BookmarksPage: View {
             }
         }
         var result: [BookmarkListItem] = []
-        if search.isEmpty, scope != .all, sources.isEmpty {
-            result += store.bookmarkFolders.filter { $0.parentID == currentFolder }.map {
-                BookmarkListItem(key: $0.id.uuidString, title: $0.title, folderID: $0.id)
-            }
+        switch scope {
+        case .all, .root, .folder:
+            result = BookmarkListItem.personal(store.sites, folders: store.bookmarkFolders,
+                                               parentID: currentFolder, query: search)
+        default: break
         }
-        result += personal.map { BookmarkListItem(key: $0.id.uuidString, site: $0, editable: true) }
         for source in sources {
             let importedRows = BookmarkListItem.imported(filteredImports[source] ?? [], path: source)
             if case .imported = scope {
@@ -653,7 +1062,17 @@ struct BookmarksPage: View {
                     historyRecords
                 } else {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text(scopeTitle).font(.system(size: 13, weight: .semibold)).lineLimit(1).padding(.leading, 6)
+                        HStack(spacing: 10) {
+                            if let currentFolder {
+                                Button {
+                                    scope = store.bookmarkFolders.first { $0.id == currentFolder }?.parentID
+                                        .map(BookmarkScope.folder) ?? .root
+                                } label: {
+                                    Label("返回上一级", systemImage: "arrow.left")
+                                }.buttonStyle(.borderless).accessibilityLabel("返回上一级")
+                            }
+                            Text(scopeTitle).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                        }.padding(.leading, 6)
                         NativeBookmarks(rows: rows, selection: $selection, expandAll: !search.isEmpty,
                             edit: edit, toggleHome: { store.toggleBookmarkHome($0.id) },
                             open: { store.open($0); store.library = nil },
@@ -675,6 +1094,7 @@ struct BookmarksPage: View {
                                 if moved { selection.removeAll() }
                                 return moved
                             },
+                            reorder: isGroupScope ? nil : { store.reorderBookmarkSites($0) },
                             folderAction: { id, action in
                                 if isGroupScope {
                                     groupAction(id, action: action)
@@ -741,7 +1161,7 @@ struct BookmarksPage: View {
             .onChange(of: search) { _ in selection.removeAll() }
             .onChange(of: scope) { value in
                 selection.removeAll(); editing = nil; adding = false; search = ""
-                store.libraryShowsHistory = value == .history
+                store.libraryBookmarkScope = value
             }
             .onChange(of: store.bookmarkItemIDs) { ids in selection.formIntersection(ids) }
             .alert("清空全部历史记录？", isPresented: $clearHistory) {
@@ -819,9 +1239,6 @@ struct BookmarksPage: View {
         List {
             scopeButton("全部书签", icon: "square.stack", target: .all)
             scopeButton("个人书签", icon: "bookmark", target: .root)
-            ForEach(store.bookmarkFolders.filter { $0.parentID == nil }) { folder in
-                folderRow(folder, ancestors: [])
-            }
             Section("标签组") {
                 ForEach(store.tabGroups) { group in
                     scopeButton(group.name.isEmpty ? "未命名分组" : group.name, icon: "folder", target: .group(group.id))
@@ -857,7 +1274,8 @@ struct BookmarksPage: View {
                 Image(systemName: icon).foregroundStyle(scopeColor(target))
             }.lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 5)
-                .background(scope == target ? Style.mint : Color.clear, in: RoundedRectangle(cornerRadius: 5))
+                .background(scope == target || (target == .root && currentFolder != nil) ? Style.mint : Color.clear,
+                            in: RoundedRectangle(cornerRadius: 5))
                 .contentShape(Rectangle())
         }.buttonStyle(.plain)
             .accessibilityLabel(name)
@@ -892,34 +1310,6 @@ struct BookmarksPage: View {
             if store.moveBookmarkItems(ids, to: folder) { selection.removeAll() }
         }
         return !providers.isEmpty
-    }
-    private func folderRow(_ folder: BookmarkFolder, ancestors: Set<UUID>) -> AnyView {
-        let children = store.bookmarkFolders.filter { $0.parentID == folder.id && !ancestors.contains($0.id) && $0.id != folder.id }
-        let label = scopeButton(folder.title, icon: "folder", target: .folder(folder.id))
-            .contextMenu { folderActions(folder) }
-        if children.isEmpty { return AnyView(label) }
-        return AnyView(DisclosureGroup {
-            ForEach(children) { child in folderRow(child, ancestors: ancestors.union([folder.id])) }
-        } label: { label })
-    }
-    @ViewBuilder
-    private func folderActions(_ folder: BookmarkFolder) -> some View {
-        Button("新建子目录…") {
-            scope = .folder(folder.id)
-            folderDraft = BookmarkFolder(title: "", parentID: folder.id); renamingFolder = false; folderPrompt = true
-        }
-        Button("重命名…") { folderDraft = folder; renamingFolder = true; folderPrompt = true }
-        Menu("移动目录到") {
-            Button("个人书签") {
-                var moved = folder; moved.parentID = nil; _ = store.saveBookmarkFolder(moved)
-            }
-            ForEach(sortedFolders.filter { !store.bookmarkFolderDescendants(folder.id).contains($0.id) }) { destination in
-                Button(store.bookmarkFolderPath(destination.id)) {
-                    var moved = folder; moved.parentID = destination.id; _ = store.saveBookmarkFolder(moved)
-                }
-            }
-        }
-        Button("删除目录…", role: .destructive) { folderToDelete = folder }
     }
     private func edit(_ site: Site) {
         editing = site; adding = false; title = site.title; address = site.address

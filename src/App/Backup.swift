@@ -96,6 +96,7 @@ struct SettingsBackup: Codable {
     var folders: [BookmarkFolder]
     var imported: [String: [BookmarkNode]]
     var tabGroups: [TabGroup]?
+    var homeShortcutOrder: [UUID]? = nil
     var scope = Set(BackupScope.allCases)
     var credentials: BackupCredentials?
     var scopeDescription: String { BackupScope.allCases.filter(scope.contains).map(\.title).joined(separator: "、") }
@@ -164,6 +165,11 @@ struct SettingsBackup: Codable {
                 throw PerchError("备份中的书签地址、ID 或所属文件夹无效。")
             }
         }
+        if let order = homeShortcutOrder {
+            guard Set(order).count == order.count, Set(order).isSubset(of: Set(sites.map(\.id))) else {
+                throw PerchError("备份中的首页顺序无效。")
+            }
+        }
         var count = sites.count + folders.count
         func check(_ nodes: [BookmarkNode], depth: Int, ids: inout Set<UUID>) throws {
             guard depth <= 64 else { throw PerchError("导入书签层级过深。") }
@@ -213,7 +219,7 @@ struct SettingsBackup: Codable {
 extension SettingsBackup {
     private enum CodingKeys: String, CodingKey {
         case format, version, created, scope, settings, launchAtLogin, layout, providers, selectedProvider
-        case search, sites, folders, imported, tabGroups, credentials
+        case search, sites, folders, imported, tabGroups, homeShortcutOrder, credentials
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -231,6 +237,7 @@ extension SettingsBackup {
             folders: scope.contains(.bookmarks) ? try c.decode([BookmarkFolder].self, forKey: .folders) : [],
             imported: scope.contains(.bookmarks) ? try c.decode([String: [BookmarkNode]].self, forKey: .imported) : [:],
             tabGroups: version >= 3 && scope.contains(.bookmarks) ? try c.decodeIfPresent([TabGroup].self, forKey: .tabGroups) : nil,
+            homeShortcutOrder: version >= 3 && scope.contains(.bookmarks) ? try c.decodeIfPresent([UUID].self, forKey: .homeShortcutOrder) : nil,
             scope: scope, credentials: try c.decodeIfPresent(BackupCredentials.self, forKey: .credentials))
     }
     func encode(to encoder: Encoder) throws {
@@ -247,7 +254,10 @@ extension SettingsBackup {
         }
         if scope.contains(.bookmarks) {
             try c.encode(sites, forKey: .sites); try c.encode(folders, forKey: .folders); try c.encode(imported, forKey: .imported)
-            if version >= 3 { try c.encodeIfPresent(tabGroups, forKey: .tabGroups) }
+            if version >= 3 {
+                try c.encodeIfPresent(tabGroups, forKey: .tabGroups)
+                try c.encodeIfPresent(homeShortcutOrder, forKey: .homeShortcutOrder)
+            }
         }
     }
 }
