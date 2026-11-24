@@ -3310,6 +3310,50 @@ final class LayoutSelfCheck {
         check(store.ai.draftReferences[owner] == [id], "Repeated Ask AI must not duplicate the page reference")
         let bridge = (try? await browser.webView.evaluateJavaScript("typeof window.webkit?.messageHandlers?.perchSelection")) as? String
         check(bridge == "undefined", "The selection bridge must remain isolated from page scripts")
+        check(store.ai.send("已发送的合成消息", tab: owner, browser: nil, usePage: false),
+              "The source conversation must have an existing message")
+        for _ in 0..<20 where store.ai.sessions[owner]?.requestID != nil { await settle() }
+        let oldMessages = store.ai.sessions[owner]!.messages.map(\.id)
+        store.ai.drafts[owner] = "保留文字和引用，开始新会话 🙂"
+        let attachment = AIAttachment(name: "draft.txt", data: Data("fixture".utf8), text: "fixture", mime: nil)
+        store.ai.draftFiles[owner] = [attachment]
+        SelfTests.prepareAccessibility()
+        await settle()
+        var visited = Set<ObjectIdentifier>()
+        func newChatButton(_ node: NSObject) -> NSObject? {
+            guard visited.insert(ObjectIdentifier(node)).inserted else { return nil }
+            if node.responds(to: NSSelectorFromString("accessibilityLabel")),
+               node.value(forKey: "accessibilityLabel") as? String == "新对话",
+               node.responds(to: NSSelectorFromString("accessibilityFrame")) { return node }
+            var children: [NSObject] = (node as? NSView)?.subviews ?? []
+            if node.responds(to: NSSelectorFromString("accessibilityChildren")) {
+                children += node.value(forKey: "accessibilityChildren") as? [NSObject] ?? []
+            }
+            return children.lazy.compactMap(newChatButton).first
+        }
+        guard let button = newChatButton(panel.contentView!),
+              let frame = (button.value(forKey: "accessibilityFrame") as? NSValue)?.rectValue else {
+            check(false, "The native sidebar new-chat button must be accessible"); return
+        }
+        await clickInPanel(panel.convertPoint(fromScreen: NSPoint(x: frame.midX, y: frame.midY)))
+        await settle()
+        let newOwner = store.chatOwner
+        check(newOwner != owner && store.ai.sessions[newOwner]?.messages.isEmpty == true,
+              "The actual sidebar button must start a separate empty conversation")
+        check(store.ai.drafts[newOwner] == "保留文字和引用，开始新会话 🙂" &&
+              store.ai.draftFiles[newOwner]?.map(\.id) == [attachment.id] &&
+              store.ai.draftFiles[newOwner]?.first?.data == attachment.data && store.ai.draftReferences[newOwner] == [id] &&
+              store.ai.draftQuotes[newOwner] == snapshot,
+              "The new conversation must retain the visible text, attachment, webpage and selection references")
+        check((panel.firstResponder as? AIComposerTextView)?.string == store.ai.drafts[newOwner],
+              "The new native composer must display the preserved input")
+        check(store.ai.sessions[owner]?.messages.map(\.id) == oldMessages &&
+              store.ai.sessions[newOwner]?.requestID == nil,
+              "Starting a conversation must preserve old history and wait for explicit sending")
+        store.newChat()
+        check(store.chatOwner == newOwner && store.ai.draftReferences[newOwner] == [id] &&
+              store.ai.draftQuotes[newOwner] == snapshot, "Repeated new-chat clicks must retain the same draft and deduplicate references")
+        print("PASS: actual sidebar new-chat click preserves native composer text, attachments, webpage/selection references and old history without sending")
         print("PASS: actual selected-text context menu, Chinese cleanup, frozen webpage/text references, preserved drafts, composer focus and isolated selection bridge")
     }
 

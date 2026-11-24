@@ -1078,6 +1078,7 @@ struct AIChatSidebar: View {
                 }
                 if !fullPage {
                     Button(action: newChat) { Image(systemName: "square.and.pencil") }.help("新对话")
+                        .accessibilityLabel("新对话")
                     Menu {
                         let records = ai.conversations(for: store.currentPageURL)
                         if records.isEmpty { Text("此网页暂无历史对话") }

@@ -30,6 +30,7 @@
 - 完整 Chat 为全局唯一标签，打开、恢复、历史、Fork 和网页对话转完整页均复用它。重复旧标签只合并入口，其对应对话仍保存在历史中。
 - 网页 AI 侧栏仅打开时挂载；其会话、草稿、请求和阅读位置保留在 AIController。侧栏开关按网页标签记忆，完整 Chat 与侧栏共用会话状态。
 - Chat 的运行 owner 独立于视图：切换历史、切换或关闭展示标签、新建对话不会取消旧会话；侧栏以可选 `aiOwner` 记录绑定，旧标签默认使用自身 ID。同一会话再次打开复用运行 owner，不从历史快照覆盖正文或重复启动请求。
+- 新建对话共用 `AIController.newChatOwner`：当前输入包含文字、附件或引用时，带入新对话；当前已经是空白会话时保留其 owner。文字、网页/已关闭网页引用及选区引用一起复制，旧会话的历史、草稿和请求保留；不同的既存未发送草稿继续可恢复，不覆盖。没有当前草稿时沿用既有空白草稿复用规则，发送仍需用户确认。数据自检覆盖重启与既存草稿，`--verify-web-selection-ai` 覆盖侧栏新对话按钮的实际点击及原生输入框内容。
 - 侧栏历史按网页 URL（忽略查询参数和片段）筛选，路径变化后旧网页对话仍保存在全局历史。菜单的「全部历史对话」打开完整 Chat 和历史列表，沿用当前会话 owner 保留输入；空白草稿不进入历史。数据自检覆盖新建会话与重启后的旧记录及网页筛选边界。
 - 导航入口复用 Browser.goBack/goForward，未提交导航及连续历史操作由 pendingHistoryItem 管理；旧导航失败不得覆盖新状态。
 - 网页右键在 `Browser.extendContextMenu` 精确移除 WebKit 的导航项，再统一追加中文导航；其他原生链接、图片和编辑项保留。后退、前进、重新加载使用 `NSMenuItem.identifier`；停止加载没有标识，仅匹配 WebKit 转发动作和 macOS 的 Stop tag 11。依据为 WebKit 的 [菜单构造](https://github.com/WebKit/WebKit/blob/main/Source/WebKit/UIProcess/mac/WebContextMenuProxyMac.mm)、[标识定义](https://github.com/WebKit/WebKit/blob/main/Source/WebKit/UIProcess/API/Cocoa/WKMenuItemIdentifiers.mm) 和 [动作枚举](https://github.com/WebKit/WebKit/blob/main/Source/WebCore/platform/ContextMenuItem.h)，系统 WebKit 升级时以实际右键回归复核。`存储为…` 在隔离 JavaScript world 中克隆当前 HTML，保留 doctype、统一 UTF-8 并固定原页面 baseURI，不修改现场 DOM；原生保存面板选择 `.html` 文件，使用原子写入。保存面板期间页面切换不改变已捕获快照；外部图片、样式等资源仍通过原网址加载，不打包为离线资源。`--ui-preview --verify-web-context-menu --verify-preview` 验证实际右键事件、去重、原生项保留与本地 HTML 编码及相对链接回读。

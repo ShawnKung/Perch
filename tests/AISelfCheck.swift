@@ -1628,6 +1628,38 @@ enum AISelfCheck {
         precondition(restored.model(for: owner) == "first")
         precondition(restored.configuration.id == otherProvider.id && restored.configuration.model == "first",
                      "Invalid model choices must not change provider settings")
+        let carriedQuote = AIQuote(messageID: nil, text: "网页选中文字",
+            page: AIPageReference(title: "网页来源", url: URL(string: "https://fixture.invalid/article")))
+        let closedPage = AIPageReference(title: "已关闭网页", url: URL(string: "https://closed.invalid/"))
+        restored.drafts[resumed] = "已有会话里尚未发送的问题 🙂"
+        restored.draftFiles[resumed] = [attachment]
+        restored.draftReferences[resumed] = [page]
+        restored.draftClosedReferences[resumed] = [closedPage]
+        restored.draftQuotes[resumed] = carriedQuote
+        let carried = restored.newChatOwner(context: AIController.homeID, previous: resumed)
+        precondition(carried != resumed && carried != draft && restored.sessions[carried]?.messages.isEmpty == true)
+        precondition(restored.drafts[carried] == restored.drafts[resumed] &&
+                     restored.draftFiles[carried]?.map(\.id) == [attachment.id] &&
+                     restored.draftFiles[carried]?.first?.data == attachment.data && restored.draftReferences[carried] == [page] &&
+                     restored.draftClosedReferences[carried] == [closedPage] && restored.draftQuotes[carried] == carriedQuote)
+        precondition(restored.sessions[resumed]?.messages.map(\.id) == legacy.messages.map(\.id))
+        precondition(restored.drafts[draft] == "尚未发送\n多行草稿 🙂" &&
+                     restored.newChatOwner(context: AIController.homeID, previous: carried) == carried &&
+                     restored.newChatOwner(context: AIController.homeID, previous: otherOwner) == draft,
+                     "Carrying the current input must preserve the saved draft and repeated new-chat clicks")
+        let carriedRestored = AIController(defaults: defaults, conversationDirectory: directory)
+        precondition(carriedRestored.drafts[carried] == restored.drafts[carried] &&
+                     carriedRestored.draftFiles[carried]?.map(\.id) == [attachment.id] &&
+                     carriedRestored.draftFiles[carried]?.first?.data == attachment.data &&
+                     carriedRestored.draftReferences[carried] == [page] &&
+                     carriedRestored.draftClosedReferences[carried] == [closedPage] &&
+                     carriedRestored.draftQuotes[carried] == carriedQuote)
+        restored.drafts[resumed] = ""; restored.draftFiles[resumed] = []
+        restored.draftQuotes[resumed] = nil; restored.draftClosedReferences[resumed] = []
+        let referenceOnly = restored.newChatOwner(context: UUID(), previous: resumed)
+        precondition(referenceOnly != resumed && restored.draftReferences[referenceOnly] == [page],
+                     "A page reference alone must also survive starting a new conversation")
+        print("PASS: new conversations carry unsent text/files/page and selection references, preserve old history/saved drafts, repeat safely and restore after restart")
         let stored = try String(contentsOf: file)
         precondition(!stored.contains("synthetic-key"))
         var reduced = provider
@@ -2522,6 +2554,28 @@ enum AISelfCheck {
         precondition(store.ai.model(for: sentOwner) == "alternate",
                      "The fresh chat and the sent conversation must retain independent model choices")
         print("PASS: accepted send consumes the new-chat draft; the next native plus starts a fresh draft")
+        store.ai.drafts[sentOwner] = "新会话继续这份输入 🙂"
+        store.ai.draftFiles[sentOwner] = [draftFile]
+        let carriedPage = AIPageReference(title: "合成网页", url: URL(string: "https://draft.invalid/article"))
+        let carriedQuote = AIQuote(messageID: nil, text: "合成网页选中文字", page: carriedPage)
+        store.ai.draftClosedReferences[sentOwner] = [carriedPage]
+        store.ai.draftQuotes[sentOwner] = carriedQuote
+        store.openChat(owner: sentOwner)
+        try await wait { editor(in: historyRoot)?.string == "新会话继续这份输入 🙂" }
+        try await clickPlus()
+        let carriedOwner = store.chatOwner
+        try await wait { carriedOwner != sentOwner && editor(in: historyRoot)?.string == "新会话继续这份输入 🙂" }
+        precondition(store.ai.sessions[carriedOwner]?.messages.isEmpty == true &&
+                     store.ai.sessions[carriedOwner]?.requestID == nil &&
+                     store.ai.draftFiles[carriedOwner]?.first?.id == draftFile.id &&
+                     store.ai.draftClosedReferences[carriedOwner] == [carriedPage] &&
+                     store.ai.draftQuotes[carriedOwner] == carriedQuote)
+        precondition(store.ai.drafts[sentOwner] == "新会话继续这份输入 🙂" &&
+                     (store.ai.drafts[newOwner] ?? "").isEmpty,
+                     "The source input and separate saved draft must remain intact")
+        try await clickPlus()
+        precondition(store.chatOwner == carriedOwner && store.ai.draftQuotes[carriedOwner] == carriedQuote)
+        print("PASS: native new-chat button carries existing composer text, attachment and webpage/selection references without sending or overwriting saved drafts")
         precondition(store.ai.sessions[editOwner]!.messages.map(\.id) == preservedIDs)
         let hoverRow = table.conversationIDs.firstIndex { $0 == store.ai.sessions[editOwner]?.id }!
         let hoverCell = table.view(atColumn: 0, row: hoverRow, makeIfNecessary: true) as! AIHistoryCell

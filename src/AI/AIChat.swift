@@ -993,12 +993,24 @@ final class AIController: ObservableObject {
         }
     }
     func newChatOwner(context: UUID, previous: UUID) -> UUID {
-        if let owner = newChatOwners[context], sessions[owner]?.messages.isEmpty == true { return owner }
-        let owner = sessions[previous]?.messages.isEmpty != false ? previous : UUID()
+        let draft = AIChatDraft(text: drafts[previous] ?? "", files: draftFiles[previous] ?? [],
+            references: draftReferences[previous] ?? [], closedReferences: draftClosedReferences[previous] ?? [],
+            quote: draftQuotes[previous])
+        let hasDraft = !draft.text.isEmpty || !draft.files.isEmpty || !draft.references.isEmpty ||
+            !draft.closedReferences.isEmpty || draft.quote != nil
+        let savedOwner = newChatOwners[context].flatMap { sessions[$0]?.messages.isEmpty == true ? $0 : nil }
+        let owner = hasDraft ? (sessions[previous]?.messages.isEmpty != false ? previous : UUID()) :
+            savedOwner ?? (sessions[previous]?.messages.isEmpty != false ? previous : UUID())
         if sessions[owner] == nil {
             sessions[owner] = AISession(providerID: provider(for: owner).id, model: model(for: owner))
         }
-        newChatOwners[context] = owner
+        if hasDraft && owner != previous {
+            drafts[owner] = draft.text; draftFiles[owner] = draft.files
+            draftReferences[owner] = draft.references; draftClosedReferences[owner] = draft.closedReferences
+            draftQuotes[owner] = draft.quote
+        }
+        // Keep a different saved draft available when the current input starts its own conversation.
+        if savedOwner == nil || savedOwner == owner { newChatOwners[context] = owner }
         saveConversations()
         return owner
     }
