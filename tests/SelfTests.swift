@@ -132,6 +132,7 @@ enum SelfTests {
     static func run() throws {
         try BackupSelfCheck.run()
         try savedTabGroups()
+        tabGroupCreation()
         try AISelfCheck.conversationPreferences()
         try addressSuggestions()
         try databaseSnapshot()
@@ -642,6 +643,78 @@ enum SelfTests {
         precondition(defaults.data(forKey: "tabs") == before && defaults.data(forKey: "tabGroups") == invalidData)
         print("PASS: saved groups hide without closed-tab copies, survive restart, reopen once, sync members, dissolve/delete and preserve legacy/corrupt snapshots")
     }
+    @MainActor static func tabGroupCreation() {
+        func precondition(_ condition: @autoclosure () -> Bool, _ message: String = "", line: UInt = #line) {
+            if !condition() { fputs("FAIL: group creation line \(line): \(message)\n", stderr); exit(1) }
+        }
+        let suite = "dev.perch.group-creation." + UUID().uuidString
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = Store(defaults: defaults)
+        store.newTab(title: "颜色轮询")
+        let id = store.selected!
+        let coordinator = NativeTabList.Coordinator(store: store)
+        func groupMenu(_ store: Store, tabID: UUID) -> NSMenu {
+            coordinator.store = store
+            coordinator.tabs = store.tabs
+            coordinator.rows = store.tabRows
+            let row = coordinator.rows.firstIndex(of: .tab(tabID))!
+            return coordinator.menu(row)!.items.first { $0.submenu != nil }!.submenu!
+        }
+        let initialMenu = groupMenu(store, tabID: id)
+        precondition(initialMenu.items.map(\.title) == ["新建组"],
+                     "No open groups means no trailing separator")
+        initialMenu.performActionForItem(at: 0)
+        precondition(store.tabGroups.first?.color == .blue, "The native new-group action must use the shared default")
+        for color in Array(TabGroupColor.allCases.dropFirst()) + [.blue] {
+            let group = store.createTabGroup(id)!
+            precondition(store.tabGroups.first { $0.id == group }?.color == color)
+        }
+        let restarted = Store(defaults: defaults)
+        let resumed = restarted.createTabGroup(id)!
+        precondition(restarted.tabGroups.first { $0.id == resumed }?.color == .purple,
+                     "The next color must survive restart and wrap around")
+        restarted.editTabGroup(resumed, color: .gray)
+        let next = defaults.object(forKey: "nextTabGroupColor") as! String
+        restarted.pin(id)
+        precondition(restarted.createTabGroup(id) == nil && restarted.createTabGroup(UUID()) == nil &&
+                     defaults.object(forKey: "nextTabGroupColor") as? String == next,
+                     "Failed creation must not consume a color")
+        restarted.pin(id)
+        let edited = restarted.createTabGroup(id)!
+        precondition(restarted.tabGroups.first { $0.id == edited }?.color == .pink,
+                     "Manual recoloring must not change the creation sequence")
+        for invalid in ["", "unknown", "BLUE", 42, -1, 1.5, true, Data([0]),
+                        ["blue"], ["color": "blue"]] as [Any] {
+            defaults.set(invalid, forKey: "nextTabGroupColor")
+            let group = restarted.createTabGroup(id)!
+            precondition(restarted.tabGroups.first { $0.id == group }?.color == .blue &&
+                         defaults.object(forKey: "nextTabGroupColor") as? String == "purple",
+                         "Invalid rotation state must recover from blue")
+        }
+        defaults.removeObject(forKey: "nextTabGroupColor")
+        let open = restarted.createTabGroup(id)!
+        restarted.editTabGroup(open, name: "打开组")
+        restarted.toggleTabGroup(open)
+        restarted.newTab(title: "隐藏组标签")
+        let hidden = restarted.createTabGroup(restarted.selected!)!
+        restarted.editTabGroup(hidden, name: "隐藏组")
+        restarted.hideTabGroup(hidden)
+        if restarted.tabGroups.first(where: { $0.id == open })?.collapsed == false {
+            restarted.toggleTabGroup(open)
+        }
+        let menu = groupMenu(restarted, tabID: id)
+        precondition(menu.items.map(\.title) == ["新建组", "", "打开组"] && menu.items[1].isSeparatorItem,
+                     "New group must precede a separator and only open groups, including collapsed ones")
+        let action = menu.items[2].representedObject as! [String]
+        precondition(action == [id.uuidString, "group:" + open.uuidString])
+        restarted.hideTabGroup(open)
+        restarted.newTab(title: "未分组标签")
+        precondition(groupMenu(restarted, tabID: restarted.selected!).items.map(\.title) == ["新建组"],
+                     "Hidden groups must never appear in the submenu")
+        print("PASS: native new-group action, persistent color rotation/wraparound, invalid-state recovery and open-only group submenu")
+    }
+
     static func databaseSnapshot() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("perch-locked-fixture-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)

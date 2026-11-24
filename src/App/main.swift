@@ -956,13 +956,19 @@ final class Store: ObservableObject {
 
     @discardableResult func createTabGroup(_ id: UUID) -> UUID? {
         guard let index = tabs.firstIndex(where: { $0.id == id }), !tabs[index].pinned else { return nil }
-        let group = TabGroup()
+        var group = TabGroup()
         // Detach at the boundary of the old group before creating a new one.
         moveTab(id, to: index, groupID: nil)
         guard let newIndex = tabs.firstIndex(where: { $0.id == id }) else { return nil }
+        if let raw = defaults.object(forKey: "nextTabGroupColor") as? String,
+           let color = TabGroupColor(rawValue: raw) {
+            group.color = color
+        }
         tabGroups.append(group)
         tabs[newIndex].groupID = group.id
         normalizeTabGroups(); persistTabs()
+        let nextColor = TabGroupColor.allCases.drop(while: { $0 != group.color }).dropFirst().first ?? .blue
+        defaults.set(nextColor.rawValue, forKey: "nextTabGroupColor")
         return group.id
     }
 
