@@ -1553,7 +1553,9 @@ enum AISelfCheck {
             try? FileManager.default.removeItem(at: directory)
         }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let legacy = AISession(messages: [AIMessage(role: "user", text: "Legacy")])
+        let historyPage = URL(string: "https://fixture.invalid/chat/previous")!
+        let differentPage = URL(string: "https://fixture.invalid/chat/current")!
+        let legacy = AISession(messages: [AIMessage(role: "user", text: "Legacy")], webPageURLs: [historyPage])
         let second = AISession(messages: [AIMessage(role: "user", text: "Second")])
         let owner = UUID(), otherOwner = UUID(), legacyAlias = UUID()
         let file = directory.appendingPathComponent("conversations.json")
@@ -1599,6 +1601,11 @@ enum AISelfCheck {
         precondition(restored.draftReferences[draft] == [page] && restored.draftClosedReferences[draft]?.first?.title == "Closed")
         precondition(restored.draftQuotes[draft]?.text == "Quoted fixture" && restored.model(for: draft) == "second")
         precondition(!restored.searchEnabled(for: draft) && restored.activeConversations.count == 2)
+        precondition(restored.conversations(for: historyPage).map(\.id) == [legacy.id] &&
+                     restored.conversations(for: differentPage).isEmpty &&
+                     restored.activeConversations.contains { $0.id == legacy.id },
+                     "After new chat and restart, a previous page's conversation remains in all history while page history stays scoped")
+        print("PASS: previous conversation survives new chat and restart; URL changes only filter page history")
         let sidebar = restored.newChatOwner(context: page, previous: otherOwner)
         precondition(sidebar != draft && restored.newChatOwner(context: page, previous: owner) == sidebar)
         precondition(restored.provider(for: sidebar).id == provider.id && restored.model(for: sidebar) == "second",

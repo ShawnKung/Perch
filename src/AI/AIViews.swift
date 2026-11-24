@@ -1091,9 +1091,11 @@ struct AIChatSidebar: View {
                                 else { Text(record.title) }
                             }
                         }
+                        Divider()
+                        Button("全部历史对话…") { store.openChat(owner: tab) }
                     } label: { Image(systemName: "clock") }
                         .menuStyle(.borderlessButton).fixedSize()
-                        .help("此网页的历史对话").accessibilityLabel("此网页的历史对话")
+                        .help("历史对话").accessibilityLabel("历史对话")
                 }
                 if !fullPage {
                     Button { store.openChat(owner: tab) } label: { Image(systemName: "arrow.up.left.and.arrow.down.right") }.help("打开完整 Chat")
