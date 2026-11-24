@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import WebKit
+import UniformTypeIdentifiers
 
 enum Style {
     static let ink = Color(red: 0.12, green: 0.20, blue: 0.19)
@@ -205,6 +206,17 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
 
     func extendContextMenu(_ menu: NSMenu) {
         guard !menu.items.contains(where: { $0.target === self }) else { return }
+        // WebKit gives Stop no identifier; its forwarded ContextMenuItemTagStop is 11 on macOS.
+        let navigationIDs = ["WKMenuItemIdentifierGoBack", "WKMenuItemIdentifierGoForward", "WKMenuItemIdentifierReload"]
+        for item in menu.items where navigationIDs.contains(item.identifier?.rawValue ?? "") ||
+            (item.tag == 11 && item.action == NSSelectorFromString("forwardContextMenuAction:")) {
+            menu.removeItem(item)
+        }
+        for index in menu.items.indices.reversed() where menu.items[index].isSeparatorItem {
+            if index == 0 || index == menu.items.count - 1 || menu.items[index - 1].isSeparatorItem {
+                menu.removeItem(at: index)
+            }
+        }
         if !menu.items.isEmpty { menu.addItem(.separator()) }
         func add(_ title: String, _ action: String) {
             let item = menu.addItem(withTitle: title, action: #selector(performContextMenu(_:)), keyEquivalent: "")
@@ -217,7 +229,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         add(loading ? "停止加载" : "重新加载", loading ? "stop" : "reload")
         menu.addItem(.separator())
         add("复制当前网址", "copy")
-        add("在 Perch 中打开", "external")
+        add("存储为…", "save")
         if onBookmark != nil { add(isBookmarked?() == true ? "编辑书签…" : "加入书签", "bookmark") }
         add("在页面中查找…", "find")
     }
@@ -228,7 +240,8 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         case "back": syncNavigationState(); return canGoBack
         case "forward": syncNavigationState(); return canGoForward
         case "stop": return webView.isLoading
-        case "copy", "external", "bookmark", "reload": return URLInput.parse(values[1], search: false) != nil
+        case "copy", "bookmark", "reload": return URLInput.parse(values[1], search: false) != nil
+        case "save": return webView.url != nil && !isHome
         case "find": return true
         default: return false
         }
@@ -242,14 +255,70 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         case "reload": webView.reload()
         case "stop": webView.stopLoading()
         case "copy": clipboard.clearContents(); clipboard.setString(values[1], forType: .string)
-        case "external":
-            if let url = URLInput.parse(values[1], search: false) {
-                if let onOpenInPerch { onOpenInPerch(url) }
-                else { onNewTab?(url, false) }
-            }
+        case "save": saveHTML()
         case "bookmark": onBookmark?()
         case "find": finding = true
         default: break
+        }
+    }
+
+    func htmlSnapshot() async throws -> (title: String, html: String) {
+        let url = webView.url
+        let navigation = activeNavigation
+        let result = try await webView.callAsyncJavaScript("""
+        if (!document.documentElement || document.contentType !== 'text/html')
+          throw new Error('当前页面不是 HTML 网页。');
+        const root = document.documentElement.cloneNode(true);
+        let head = root.querySelector('head');
+        if (!head) { head = document.createElement('head'); root.prepend(head); }
+        head.querySelectorAll('meta[charset], meta[http-equiv]').forEach(meta => {
+          if (meta.hasAttribute('charset') || meta.httpEquiv.toLowerCase() === 'content-type') meta.remove();
+        });
+        const charset = document.createElement('meta');
+        charset.setAttribute('charset', 'utf-8');
+        head.prepend(charset);
+        let base = head.querySelector('base[href]');
+        if (!base) { base = document.createElement('base'); charset.after(base); }
+        base.setAttribute('href', document.baseURI);
+        const doctype = document.doctype ? new XMLSerializer().serializeToString(document.doctype) + '\\n' : '';
+        return {title: document.title, html: doctype + root.outerHTML};
+        """, arguments: [:], in: nil, contentWorld: .defaultClient)
+        guard webView.url == url, activeNavigation === navigation,
+              let snapshot = result as? [String: String],
+              let html = snapshot["html"], let title = snapshot["title"] else {
+            throw PerchError("页面已切换或无法读取 HTML，请重试。")
+        }
+        return (title, html)
+    }
+
+    private func saveHTML() {
+        let window = webView.window
+        Task { @MainActor in
+            do {
+                let snapshot = try await htmlSnapshot()
+                let panel = NSSavePanel()
+                panel.allowedContentTypes = [.html]
+                let name = snapshot.title.components(separatedBy: CharacterSet(charactersIn: "/:\n\r")).joined(separator: "-")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                panel.nameFieldStringValue = "\(name.isEmpty ? "网页" : String(name.prefix(120))).html"
+                let response: NSApplication.ModalResponse = await withCheckedContinuation { continuation in
+                    if let window { panel.beginSheetModal(for: window) { continuation.resume(returning: $0) } }
+                    else { panel.begin { continuation.resume(returning: $0) } }
+                }
+                panel.orderOut(nil)
+                guard response == .OK, let url = panel.url else { return }
+                let scoped = url.startAccessingSecurityScopedResource()
+                defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                try await Task.detached(priority: .userInitiated) {
+                    try snapshot.html.write(to: url, atomically: true, encoding: .utf8)
+                }.value
+            } catch {
+                let alert = NSAlert()
+                alert.messageText = "存储网页失败"
+                alert.informativeText = error.localizedDescription
+                if let window { alert.beginSheetModal(for: window, completionHandler: nil) }
+                else { alert.runModal() }
+            }
         }
     }
 

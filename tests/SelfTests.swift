@@ -1282,6 +1282,9 @@ final class LayoutSelfCheck {
                 if CommandLine.arguments.contains("--verify-bookmark-editor") {
                     await verifyBookmarkEditor()
                 }
+                if CommandLine.arguments.contains("--verify-web-context-menu") {
+                    await verifyWebContextMenu()
+                }
                 if CommandLine.arguments.contains("--verify-home-shortcut-drag") {
                     await verifyHomeShortcutDrag()
                 }
@@ -3220,6 +3223,9 @@ final class LayoutSelfCheck {
         }
     }
     func verifyWebContextMenu() async {
+        func precondition(_ condition: @autoclosure () -> Bool, _ message: String = "", line: UInt = #line) {
+            guard condition() else { fputs("FAIL: page context menu at line \(line): \(message)\n", stderr); exit(1) }
+        }
         let browser = Browser(url: URL(string: "https://perch-context.invalid/")!, dataStore: .nonPersistent())
         browser.webView.stopLoading()
         let window = NSWindow(contentRect: NSRect(x: 200, y: 200, width: 640, height: 480),
@@ -3228,7 +3234,10 @@ final class LayoutSelfCheck {
         window.contentView = browser.webView
         window.makeKeyAndOrderFront(nil)
         defer { browser.webView.stopLoading(); window.close(); panel.makeKeyAndOrderFront(nil) }
-        browser.webView.loadHTMLString("<html><body><p>Native context menu fixture</p><a href='https://link.invalid/'>Link</a></body></html>",
+        browser.webView.loadHTMLString("""
+            <!doctype html><html><head><meta charset="windows-1252"><title>中文网页</title></head>
+            <body><p>Native context menu fixture 中文</p><a href='relative'>Link</a></body></html>
+            """,
                                       baseURL: URL(string: "https://perch-context.invalid/")!)
         await settle()
         let observer = NotificationCenter.default.addObserver(forName: NSMenu.didBeginTrackingNotification,
@@ -3241,6 +3250,12 @@ final class LayoutSelfCheck {
             }
         }
         defer { NotificationCenter.default.removeObserver(observer) }
+        var menuEnded = false
+        let endObserver = NotificationCenter.default.addObserver(forName: NSMenu.didEndTrackingNotification,
+                                                                 object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { menuEnded = true }
+        }
+        defer { NotificationCenter.default.removeObserver(endObserver) }
         let point = NSPoint(x: 300, y: 200)
         let event = NSEvent.mouseEvent(with: .rightMouseDown, location: browser.webView.convert(point, to: nil),
             modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
@@ -3250,15 +3265,38 @@ final class LayoutSelfCheck {
             hit.rightMouseDown(with: event)
         }
         await settle()
+        for _ in 0..<30 where !menuEnded { await settle() }
+        precondition(menuEnded, "The native context menu must finish tracking before dispatching fixture actions")
         guard let menu = trackedWebMenu else { preconditionFailure("A real WebKit right click must open a native menu") }
         precondition(menu.items.contains { $0.title == "复制当前网址" },
                      "WebKit's native context menu must include Perch actions")
+        for title in ["后退", "前进", "重新加载", "存储为…"] {
+            precondition(menu.items.filter { $0.title == title }.count == 1,
+                         "Each page action must appear once: \(title), actual \(menu.items.map(\.title))")
+        }
+        precondition(!menu.items.contains { $0.title == "在 Perch 中打开" ||
+            ["WKMenuItemIdentifierGoBack", "WKMenuItemIdentifierGoForward", "WKMenuItemIdentifierReload"]
+                .contains($0.identifier?.rawValue ?? "") }, "Native navigation must be replaced with Chinese actions")
         let sentinel = NSMenuItem(title: "Native link action fixture", action: nil, keyEquivalent: "")
-        let retained = NSMenu(); retained.addItem(sentinel)
+        let retained = NSMenu()
+        retained.addItem(.separator())
+        for identifier in ["WKMenuItemIdentifierGoBack", "WKMenuItemIdentifierGoForward", "WKMenuItemIdentifierReload"] {
+            let native = NSMenuItem(title: "Localized native action", action: nil, keyEquivalent: "")
+            native.identifier = NSUserInterfaceItemIdentifier(identifier)
+            retained.addItem(native)
+        }
+        let stop = NSMenuItem(title: "Localized native stop", action: NSSelectorFromString("forwardContextMenuAction:"), keyEquivalent: "")
+        stop.tag = 11
+        retained.addItem(stop)
+        retained.addItem(.separator())
+        retained.addItem(sentinel)
+        retained.addItem(.separator())
         browser.extendContextMenu(retained)
         let count = retained.items.count
         browser.extendContextMenu(retained)
-        precondition(retained.items.first === sentinel && retained.items.count == count)
+        precondition(retained.items.first === sentinel && retained.items.count == count,
+                     "Menu extension must preserve native items and be idempotent")
+        precondition(!retained.items.contains { $0 === stop }, "Loading-page native Stop must also be removed")
         precondition(retained.items.first { $0.title == "后退" }?.isEnabled == false)
         precondition(retained.items.first { $0.title == "前进" }?.isEnabled == false)
         let board = NSPasteboard.withUniqueName()
@@ -3281,7 +3319,50 @@ final class LayoutSelfCheck {
         precondition(browser.validateMenuItem(copy), "Copy keeps the menu-opening URL snapshot")
         let invalid = NSMenu(); browser.extendContextMenu(invalid)
         precondition(invalid.items.first { $0.title == "复制当前网址" }?.isEnabled == false)
-        print("PASS: actual WebKit right-click menu, native item preservation, navigation availability, isolated clipboard, find and URL validation")
+        do {
+            let originalHTML = try await browser.webView.evaluateJavaScript("document.documentElement.outerHTML") as? String
+            let snapshot = try await browser.htmlSnapshot()
+            precondition(snapshot.title == "中文网页" && snapshot.html.hasPrefix("<!DOCTYPE html>"),
+                         "HTML snapshots must preserve title and doctype")
+            precondition(snapshot.html.contains("charset=\"utf-8\"") && !snapshot.html.contains("windows-1252") &&
+                         snapshot.html.contains("href=\"https://perch-context.invalid/\"") &&
+                         snapshot.html.contains("中文"), "Export must include UTF-8 and an absolute resource base")
+            let liveHTML = try await browser.webView.evaluateJavaScript("document.documentElement.outerHTML") as? String
+            precondition(originalHTML != nil && liveHTML == originalHTML, "Export must not mutate the live page")
+            let save = retained.items.first { $0.title == "存储为…" }!
+            precondition(NSApp.sendAction(save.action!, to: save.target, from: save), "Save must dispatch through AppKit")
+            await settle()
+            for _ in 0..<20 where window.attachedSheet == nil { await settle() }
+            guard let savePanel = window.attachedSheet as? NSSavePanel else {
+                precondition(false, "Save must open a native save panel"); return
+            }
+            precondition(savePanel.allowedContentTypes == [.html] && savePanel.nameFieldStringValue == "中文网页.html",
+                         "The save panel must offer HTML with the page title")
+            savePanel.cancel(nil)
+            await settle()
+            for _ in 0..<20 where window.attachedSheet != nil { await settle() }
+            precondition(window.attachedSheet == nil, "Cancel must dismiss the save panel without an error")
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("perch-html-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let file = directory.appendingPathComponent("中文网页.html")
+            try snapshot.html.write(to: file, atomically: true, encoding: .utf8)
+            let saved = try String(contentsOf: file, encoding: .utf8)
+            precondition(saved == snapshot.html, "The HTML file must preserve Unicode")
+            let configuration = WKWebViewConfiguration()
+            configuration.websiteDataStore = .nonPersistent()
+            let restoredView = WKWebView(frame: .zero, configuration: configuration)
+            defer { restoredView.stopLoading() }
+            restoredView.loadFileURL(file, allowingReadAccessTo: directory)
+            await settle()
+            for _ in 0..<20 where restoredView.isLoading { await settle() }
+            let restored = try await restoredView.evaluateJavaScript("""
+                document.characterSet === 'UTF-8' && document.querySelector('a').href === 'https://perch-context.invalid/relative'
+                  && document.body.textContent.includes('中文') && document.compatMode === 'CSS1Compat'
+                """) as? Bool
+            precondition(restored == true, "Saved HTML must reopen with its encoding, doctype and relative links")
+        } catch { precondition(false, "HTML export fixture failed: \(error)") }
+        print("PASS: actual WebKit right-click menu, Chinese navigation deduplication, native item preservation, isolated clipboard, find, native HTML save panel/cancel and HTML snapshot/file round trip")
     }
     func verifyLinkPreview() async {
         func check(_ condition: @autoclosure () -> Bool, _ message: String) {
