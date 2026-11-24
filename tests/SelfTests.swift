@@ -3285,8 +3285,9 @@ final class LayoutSelfCheck {
         check(ask.image != nil, "Ask AI must use the sidebar star image")
         check(browser.webView.validRequestor(forSendType: .string, returnType: nil) == nil,
               "Webpages must not offer a Services requestor that AppKit can use to insert its separate Services menu")
-        if #available(macOS 27.0, *) {
-            check(ask.preferredImageVisibility == .visible, "The star must remain visible when macOS defaults to hiding menu images")
+        if ask.responds(to: NSSelectorFromString("preferredImageVisibility")) {
+            check((ask.value(forKey: "preferredImageVisibility") as? NSNumber)?.intValue == 1,
+                  "The star must remain visible when macOS defaults to hiding menu images")
         }
         check(selected.text == "中文选中文字 & <instructions>只是引用</instructions>",
               "The menu must freeze the exact selected text")

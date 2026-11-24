@@ -32,6 +32,15 @@ struct Site: Identifiable, Codable {
     ]
 }
 
+extension NSMenuItem {
+    func showImageIfSupported() {
+        guard responds(to: NSSelectorFromString("setPreferredImageVisibility:")) else { return }
+        // The macOS 27 public property uses NSMenuItemImageVisibilityVisible = 1.
+        // KVC keeps this source buildable with earlier AppKit SDKs.
+        setValue(NSNumber(value: 1), forKey: "preferredImageVisibility")
+    }
+}
+
 final class PageWebView: WKWebView {
     var extendMenu: ((NSMenu) -> Void)?
     private let scrollRouting = ScrollRouting()
@@ -259,7 +268,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
             if let selection = selectionTracker.selection, onAskAI != nil {
                 let item = menu.addItem(withTitle: "问 AI", action: #selector(performContextMenu(_:)), keyEquivalent: "")
                 item.image = NSImage(systemSymbolName: "sparkles", accessibilityDescription: nil)
-                if #available(macOS 27.0, *) { item.preferredImageVisibility = .visible }
+                item.showImageIfSupported()
                 item.target = self; item.representedObject = selection
                 item.isEnabled = validateMenuItem(item)
             }
