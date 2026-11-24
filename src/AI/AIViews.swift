@@ -1311,10 +1311,10 @@ struct AIChatSidebar: View {
                             Image(systemName: "quote.opening").foregroundStyle(Style.accent)
                             Text(quote.text).lineLimit(3).frame(maxWidth: .infinity, alignment: .leading).help(quote.text)
                             Button { ai.draftQuotes[tab] = nil } label: { Image(systemName: "xmark") }
-                                .buttonStyle(.plain).arrowCursor().help("移除回答引用").accessibilityLabel("移除回答引用")
+                                .buttonStyle(.plain).arrowCursor().help("移除\(quote.label)").accessibilityLabel("移除\(quote.label)")
                         }.font(.system(size: theme.chatDetailFontSize)).padding(8)
                             .background(Style.mint, in: RoundedRectangle(cornerRadius: 7))
-                            .accessibilityElement(children: .contain).accessibilityLabel("引用的回答")
+                            .accessibilityElement(children: .contain).accessibilityLabel(quote.label)
                     }
                     ForEach(ai.draftClosedReferences[tab] ?? []) { reference in
                         HStack(spacing: 5) {
@@ -1407,8 +1407,14 @@ struct AIChatSidebar: View {
             fileError = nil; showModelPicker = false; showReferences = false; mention = nil
         }
         .onAppear {
+            if let request = ai.composerFocusRequests.removeValue(forKey: tab) { focusComposer = request }
             ai.classifyWebConversations(owners: Set(store.tabs.filter { !$0.address.isEmpty && $0.chatOwner == nil }.map { $0.aiOwner ?? $0.id }))
             if CommandLine.arguments.contains("--preview-model-picker") { showModelPicker = true }
+        }
+        .onChange(of: ai.composerFocusRequests[tab]) { request in
+            guard let request else { return }
+            focusComposer = request
+            ai.composerFocusRequests[tab] = nil
         }
         .onDisappear { fileTask?.cancel() }
     }

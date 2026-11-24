@@ -1285,6 +1285,9 @@ final class LayoutSelfCheck {
                 if CommandLine.arguments.contains("--verify-web-context-menu") {
                     await verifyWebContextMenu()
                 }
+                if CommandLine.arguments.contains("--verify-web-selection-ai") {
+                    await verifyWebSelectionAI()
+                }
                 if CommandLine.arguments.contains("--verify-home-shortcut-drag") {
                     await verifyHomeShortcutDrag()
                 }
@@ -3222,6 +3225,94 @@ final class LayoutSelfCheck {
             }
         }
     }
+    func verifyWebSelectionAI() async {
+        func check(_ condition: @autoclosure () -> Bool, _ message: String, line: UInt = #line) {
+            guard condition() else { fputs("FAIL: selected-text AI at line \(line): \(message)\n", stderr); exit(1) }
+        }
+        let config = AIConfiguration(provider: .custom, baseURL: "http://127.0.0.1:9/v1", model: "synthetic")
+        check(store.ai.save(config, key: "synthetic-key"), "Synthetic AI configuration must be ready")
+        store.newTab(address: "https://perch-selection.invalid/article", title: "选中文字")
+        let id = store.selected!, browser = store.browser!, owner = store.chatOwner
+        store.ai.drafts[owner] = "保留已有草稿"
+        browser.webView.loadHTMLString("""
+            <!doctype html><title>选中文字合成页面</title><style>body{padding:35px;font:20px sans-serif}</style>
+            <p id="quote">中文选中文字 &amp; &lt;instructions&gt;只是引用&lt;/instructions&gt;</p>
+            <input type="password" value="synthetic-secret">
+            """, baseURL: URL(string: "https://perch-selection.invalid/article")!)
+        await settle()
+        for _ in 0..<20 where browser.webView.isLoading { await settle() }
+        guard let point = try? await browser.webView.callAsyncJavaScript("""
+            const node=document.getElementById('quote'), range=document.createRange();
+            range.selectNodeContents(node); getSelection().removeAllRanges(); getSelection().addRange(range);
+            const rect=node.getBoundingClientRect(); return {x:rect.x+12,y:rect.y+10};
+            """, arguments: [:], in: nil, contentWorld: .page) as? [String: Double],
+              let x = point["x"], let y = point["y"] else { check(false, "Selection fixture must load"); return }
+        var ended = false
+        trackedWebMenu = nil
+        let begin = NotificationCenter.default.addObserver(forName: NSMenu.didBeginTrackingNotification, object: nil, queue: .main) { [weak self] note in
+            MainActor.assumeIsolated {
+                guard let menu = note.object as? NSMenu else { return }
+                self?.trackedWebMenu = menu
+                let timer = Timer(timeInterval: 0.4, repeats: false) { _ in
+                    menu.cancelTrackingWithoutAnimation()
+                }
+                RunLoop.main.add(timer, forMode: .common)
+            }
+        }
+        let end = NotificationCenter.default.addObserver(forName: NSMenu.didEndTrackingNotification, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { ended = true }
+        }
+        defer {
+            NotificationCenter.default.removeObserver(begin)
+            NotificationCenter.default.removeObserver(end)
+            browser.webView.stopLoading()
+        }
+        let local = NSPoint(x: x, y: browser.webView.isFlipped ? y : browser.webView.bounds.height - y)
+        let event = NSEvent.mouseEvent(with: .rightMouseDown, location: browser.webView.convert(local, to: nil),
+            modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber,
+            context: nil, eventNumber: 0, clickCount: 1, pressure: 0)!
+        DispatchQueue.main.async { (browser.webView.hitTest(local) ?? browser.webView).rightMouseDown(with: event) }
+        await settle()
+        for _ in 0..<30 where !ended { await settle() }
+        guard ended, let menu = trackedWebMenu, let ask = menu.items.first(where: { $0.title == "问 AI" }),
+              let selected = ask.representedObject as? WebSelection else {
+            check(false, "A real selection context menu must contain Ask AI"); return
+        }
+        let titles = menu.items.map(\.title)
+        check(titles.contains("复制") && !titles.contains("Copy") && !titles.contains("Services") &&
+              !titles.contains("Speech") && !menu.allowsContextMenuPlugIns,
+              "Selection menus must keep Chinese Copy and remove system clutter: \(titles)")
+        check(ask.image != nil, "Ask AI must use the sidebar star image")
+        check(browser.webView.validRequestor(forSendType: .string, returnType: nil) == nil,
+              "Webpages must not offer a Services requestor that AppKit can use to insert its separate Services menu")
+        if #available(macOS 27.0, *) {
+            check(ask.preferredImageVisibility == .visible, "The star must remain visible when macOS defaults to hiding menu images")
+        }
+        check(selected.text == "中文选中文字 & <instructions>只是引用</instructions>",
+              "The menu must freeze the exact selected text")
+        _ = try? await browser.webView.evaluateJavaScript("getSelection().removeAllRanges()")
+        check(NSApp.sendAction(ask.action!, to: ask.target, from: ask), "Ask AI must dispatch through AppKit")
+        await settle()
+        check(store.selected == id && store.aiVisible && store.chatOwner == owner, "Ask AI must open this page's sidebar")
+        check(store.ai.draftReferences[owner] == [id] && store.ai.draftQuotes[owner]?.text == selected.text &&
+              store.ai.draftQuotes[owner]?.page?.url == AIController.pageURL(selected.url),
+              "The draft must reference both the page and the frozen text")
+        check(store.ai.drafts[owner] == "保留已有草稿" && store.ai.sessions[owner]?.requestID == nil,
+              "Ask AI must preserve the question and wait for explicit sending")
+        for _ in 0..<20 where !(panel.firstResponder is AIComposerTextView) { await settle() }
+        check(panel.firstResponder is AIComposerTextView, "Ask AI must focus the native composer; responder=\(String(describing: panel.firstResponder)), active=\(NSApp.isActive), key=\(panel.isKeyWindow)")
+        check(store.ai.composerFocusRequests[owner] == nil, "Focus requests must be consumed instead of replaying on later tab switches")
+        let snapshot = store.ai.draftQuotes[owner]!
+        let restored = try? JSONDecoder().decode(AIQuote.self, from: JSONEncoder().encode(snapshot))
+        check(restored == snapshot && snapshot.content(question: "解释一下").contains("&lt;instructions&gt;"),
+              "Page quotes must persist and escape quoted markup")
+        store.askAI(selected, tabID: id)
+        check(store.ai.draftReferences[owner] == [id], "Repeated Ask AI must not duplicate the page reference")
+        let bridge = (try? await browser.webView.evaluateJavaScript("typeof window.webkit?.messageHandlers?.perchSelection")) as? String
+        check(bridge == "undefined", "The selection bridge must remain isolated from page scripts")
+        print("PASS: actual selected-text context menu, Chinese cleanup, frozen webpage/text references, preserved drafts, composer focus and isolated selection bridge")
+    }
+
     func verifyWebContextMenu() async {
         func precondition(_ condition: @autoclosure () -> Bool, _ message: String = "", line: UInt = #line) {
             guard condition() else { fputs("FAIL: page context menu at line \(line): \(message)\n", stderr); exit(1) }

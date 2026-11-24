@@ -35,6 +35,10 @@ struct Site: Identifiable, Codable {
 final class PageWebView: WKWebView {
     var extendMenu: ((NSMenu) -> Void)?
     private let scrollRouting = ScrollRouting()
+    // AppKit builds Services outside NSMenu.items from the view's Services requestor.
+    override func validRequestor(forSendType sendType: NSPasteboard.PasteboardType?, returnType: NSPasteboard.PasteboardType?) -> Any? {
+        nil
+    }
     override func scrollWheel(with event: NSEvent) {
         for routed in scrollRouting.events(for: event) { super.scrollWheel(with: routed) }
     }
@@ -46,6 +50,36 @@ final class PageWebView: WKWebView {
         super.willOpenMenu(menu, with: event)
         extendMenu?(menu)
     }
+}
+
+struct WebSelection {
+    let url: URL
+    let title: String
+    let text: String
+}
+
+final class WebSelectionTracker: NSObject, WKScriptMessageHandler {
+    private(set) var selection: WebSelection?
+    func clear() { selection = nil }
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        selection = nil
+        guard let values = message.body as? [String: String], let text = values["text"],
+              !text.isEmpty, text.count <= 12000, let web = message.webView,
+              let url = web.url, AIController.pageURL(url) != nil,
+              !message.frameInfo.isMainFrame || values["url"] == url.absoluteString else { return }
+        selection = WebSelection(url: url, title: web.title ?? url.host ?? "网页", text: text)
+    }
+    static let script = """
+    window.addEventListener('contextmenu', () => {
+      const selection = getSelection();
+      const element = selection?.anchorNode?.nodeType === Node.ELEMENT_NODE
+        ? selection.anchorNode : selection?.anchorNode?.parentElement;
+      const editable = 'input,textarea,select,[contenteditable]';
+      const text = document.activeElement?.matches(editable) || element?.closest(editable)
+        ? '' : (selection?.toString() || '').trim().slice(0, 12000);
+      window.webkit.messageHandlers.perchSelection.postMessage({text, url: location.href});
+    }, true);
+    """
 }
 
 enum WebsiteCookies {
@@ -138,7 +172,9 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     var onNewTab: ((URL, Bool) -> Void)?
     var onOpenInPerch: ((URL) -> Void)?
     var onBookmark: (() -> Void)?
+    var onAskAI: ((WebSelection) -> Void)?
     var isBookmarked: (() -> Bool)?
+    let selectionTracker = WebSelectionTracker()
     var clipboard = NSPasteboard.general
     let favicon = FaviconLoader()
     private var observations: [NSKeyValueObservation] = []
@@ -163,6 +199,9 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         let configuration = WKWebViewConfiguration()
         if startsAtHome { configuration.setURLSchemeHandler(HomeHistoryPage(), forURLScheme: "perch-home") }
         configuration.websiteDataStore = dataStore ?? .default()
+        configuration.userContentController.add(selectionTracker, contentWorld: .defaultClient, name: "perchSelection")
+        configuration.userContentController.addUserScript(WKUserScript(source: WebSelectionTracker.script,
+            injectionTime: .atDocumentStart, forMainFrameOnly: false, in: .defaultClient))
         configuration.userContentController.add(bridge, contentWorld: .defaultClient, name: "perchPassword")
         configuration.userContentController.addUserScript(WKUserScript(source: PasswordBridge.script,
             injectionTime: .atDocumentStart, forMainFrameOnly: true, in: .defaultClient))
@@ -206,6 +245,25 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
 
     func extendContextMenu(_ menu: NSMenu) {
         guard !menu.items.contains(where: { $0.target === self }) else { return }
+        menu.allowsContextMenuPlugIns = false
+        if #available(macOS 15.2, *) { menu.automaticallyInsertsWritingToolsItems = false }
+        let selectionIDs = ["WKMenuItemIdentifierLookUp", "WKMenuItemIdentifierTranslate",
+            "WKMenuItemIdentifierSearchWeb", "WKMenuItemIdentifierCopyLinkWithHighlight",
+            "WKMenuItemIdentifierShareMenu", "WKMenuItemIdentifierSpeechMenu",
+            "WKMenuItemIdentifierAddHighlightToCurrentQuickNote", "WKMenuItemIdentifierAddHighlightToNewQuickNote",
+            "WKMenuItemIdentifierWritingTools", "__NSTextViewContextSubmenuIdentifierWritingTools"]
+        let hasSelection = menu.items.contains { $0.identifier?.rawValue == "WKMenuItemIdentifierCopy" }
+        if hasSelection {
+            for item in menu.items where selectionIDs.contains(item.identifier?.rawValue ?? "") { menu.removeItem(item) }
+            menu.items.first { $0.identifier?.rawValue == "WKMenuItemIdentifierCopy" }?.title = "复制"
+            if let selection = selectionTracker.selection, onAskAI != nil {
+                let item = menu.addItem(withTitle: "问 AI", action: #selector(performContextMenu(_:)), keyEquivalent: "")
+                item.image = NSImage(systemSymbolName: "sparkles", accessibilityDescription: nil)
+                if #available(macOS 27.0, *) { item.preferredImageVisibility = .visible }
+                item.target = self; item.representedObject = selection
+                item.isEnabled = validateMenuItem(item)
+            }
+        }
         // WebKit gives Stop no identifier; its forwarded ContextMenuItemTagStop is 11 on macOS.
         let navigationIDs = ["WKMenuItemIdentifierGoBack", "WKMenuItemIdentifierGoForward", "WKMenuItemIdentifierReload"]
         for item in menu.items where navigationIDs.contains(item.identifier?.rawValue ?? "") ||
@@ -235,6 +293,9 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     }
 
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        if let selection = item.representedObject as? WebSelection {
+            return onAskAI != nil && selection.url == webView.url
+        }
         guard let values = item.representedObject as? [String], values.count == 2 else { return false }
         switch values[0] {
         case "back": syncNavigationState(); return canGoBack
@@ -248,6 +309,10 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     }
 
     @objc private func performContextMenu(_ item: NSMenuItem) {
+        if let selection = item.representedObject as? WebSelection {
+            if validateMenuItem(item) { onAskAI?(selection) }
+            return
+        }
         guard validateMenuItem(item), let values = item.representedObject as? [String] else { return }
         switch values[0] {
         case "back": goBack()
@@ -387,6 +452,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         activeNavigation = navigation
+        selectionTracker.clear()
         hoverLinks?.clear()
         passwordBridge.dismiss()
         error = nil
@@ -795,6 +861,7 @@ final class Store: ObservableObject {
                 guard let self, let view else { return }
                 self.editCurrentBookmark(title: view.title, address: view.address, tabID: id)
             }
+            view.onAskAI = { [weak self] selection in self?.askAI(selection, tabID: id) }
             view.isBookmarked = { [weak self, weak view] in
                 guard let self, let view else { return false }
                 return self.bookmark(for: view.address) != nil
@@ -869,6 +936,22 @@ final class Store: ObservableObject {
         if !(ai.draftReferences[chatOwner] ?? []).contains(selected) {
             ai.draftReferences[chatOwner, default: []].append(selected)
         }
+    }
+    func askAI(_ selection: WebSelection, tabID: UUID) {
+        guard tabs.contains(where: { $0.id == tabID && $0.chatOwner == nil }),
+              browsers[tabID]?.webView.url == selection.url,
+              let url = AIController.pageURL(selection.url), !selection.text.isEmpty else { return }
+        let quote = AIQuote(messageID: nil, text: selection.text,
+                            page: AIPageReference(title: selection.title, url: url))
+        guard quote.valid else { return }
+        activate(tabID)
+        if ai.sessions[chatOwner]?.isArchived == true { newChat() }
+        aiVisible = true
+        if !(ai.draftReferences[chatOwner] ?? []).contains(tabID) {
+            ai.draftReferences[chatOwner, default: []].append(tabID)
+        }
+        ai.draftQuotes[chatOwner] = quote
+        ai.composerFocusRequests[chatOwner] = UUID()
     }
     func newChat() {
         let previous = chatOwner
