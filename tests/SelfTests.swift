@@ -132,6 +132,7 @@ enum SelfTests {
     static func run() throws {
         try BackupSelfCheck.run()
         try savedTabGroups()
+        tabGroupCreation()
         try AISelfCheck.conversationPreferences()
         try addressSuggestions()
         try databaseSnapshot()
@@ -642,6 +643,78 @@ enum SelfTests {
         precondition(defaults.data(forKey: "tabs") == before && defaults.data(forKey: "tabGroups") == invalidData)
         print("PASS: saved groups hide without closed-tab copies, survive restart, reopen once, sync members, dissolve/delete and preserve legacy/corrupt snapshots")
     }
+    @MainActor static func tabGroupCreation() {
+        func precondition(_ condition: @autoclosure () -> Bool, _ message: String = "", line: UInt = #line) {
+            if !condition() { fputs("FAIL: group creation line \(line): \(message)\n", stderr); exit(1) }
+        }
+        let suite = "dev.perch.group-creation." + UUID().uuidString
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = Store(defaults: defaults)
+        store.newTab(title: "颜色轮询")
+        let id = store.selected!
+        let coordinator = NativeTabList.Coordinator(store: store)
+        func groupMenu(_ store: Store, tabID: UUID) -> NSMenu {
+            coordinator.store = store
+            coordinator.tabs = store.tabs
+            coordinator.rows = store.tabRows
+            let row = coordinator.rows.firstIndex(of: .tab(tabID))!
+            return coordinator.menu(row)!.items.first { $0.submenu != nil }!.submenu!
+        }
+        let initialMenu = groupMenu(store, tabID: id)
+        precondition(initialMenu.items.map(\.title) == ["新建组"],
+                     "No open groups means no trailing separator")
+        initialMenu.performActionForItem(at: 0)
+        precondition(store.tabGroups.first?.color == .blue, "The native new-group action must use the shared default")
+        for color in Array(TabGroupColor.allCases.dropFirst()) + [.blue] {
+            let group = store.createTabGroup(id)!
+            precondition(store.tabGroups.first { $0.id == group }?.color == color)
+        }
+        let restarted = Store(defaults: defaults)
+        let resumed = restarted.createTabGroup(id)!
+        precondition(restarted.tabGroups.first { $0.id == resumed }?.color == .purple,
+                     "The next color must survive restart and wrap around")
+        restarted.editTabGroup(resumed, color: .gray)
+        let next = defaults.object(forKey: "nextTabGroupColor") as! String
+        restarted.pin(id)
+        precondition(restarted.createTabGroup(id) == nil && restarted.createTabGroup(UUID()) == nil &&
+                     defaults.object(forKey: "nextTabGroupColor") as? String == next,
+                     "Failed creation must not consume a color")
+        restarted.pin(id)
+        let edited = restarted.createTabGroup(id)!
+        precondition(restarted.tabGroups.first { $0.id == edited }?.color == .pink,
+                     "Manual recoloring must not change the creation sequence")
+        for invalid in ["", "unknown", "BLUE", 42, -1, 1.5, true, Data([0]),
+                        ["blue"], ["color": "blue"]] as [Any] {
+            defaults.set(invalid, forKey: "nextTabGroupColor")
+            let group = restarted.createTabGroup(id)!
+            precondition(restarted.tabGroups.first { $0.id == group }?.color == .blue &&
+                         defaults.object(forKey: "nextTabGroupColor") as? String == "purple",
+                         "Invalid rotation state must recover from blue")
+        }
+        defaults.removeObject(forKey: "nextTabGroupColor")
+        let open = restarted.createTabGroup(id)!
+        restarted.editTabGroup(open, name: "打开组")
+        restarted.toggleTabGroup(open)
+        restarted.newTab(title: "隐藏组标签")
+        let hidden = restarted.createTabGroup(restarted.selected!)!
+        restarted.editTabGroup(hidden, name: "隐藏组")
+        restarted.hideTabGroup(hidden)
+        if restarted.tabGroups.first(where: { $0.id == open })?.collapsed == false {
+            restarted.toggleTabGroup(open)
+        }
+        let menu = groupMenu(restarted, tabID: id)
+        precondition(menu.items.map(\.title) == ["新建组", "", "打开组"] && menu.items[1].isSeparatorItem,
+                     "New group must precede a separator and only open groups, including collapsed ones")
+        let action = menu.items[2].representedObject as! [String]
+        precondition(action == [id.uuidString, "group:" + open.uuidString])
+        restarted.hideTabGroup(open)
+        restarted.newTab(title: "未分组标签")
+        precondition(groupMenu(restarted, tabID: restarted.selected!).items.map(\.title) == ["新建组"],
+                     "Hidden groups must never appear in the submenu")
+        print("PASS: native new-group action, persistent color rotation/wraparound, invalid-state recovery and open-only group submenu")
+    }
+
     static func databaseSnapshot() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("perch-locked-fixture-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
@@ -1208,6 +1281,12 @@ final class LayoutSelfCheck {
                 await settle()
                 if CommandLine.arguments.contains("--verify-bookmark-editor") {
                     await verifyBookmarkEditor()
+                }
+                if CommandLine.arguments.contains("--verify-web-context-menu") {
+                    await verifyWebContextMenu()
+                }
+                if CommandLine.arguments.contains("--verify-web-selection-ai") {
+                    await verifyWebSelectionAI()
                 }
                 if CommandLine.arguments.contains("--verify-home-shortcut-drag") {
                     await verifyHomeShortcutDrag()
@@ -3146,7 +3225,143 @@ final class LayoutSelfCheck {
             }
         }
     }
+    func verifyWebSelectionAI() async {
+        func check(_ condition: @autoclosure () -> Bool, _ message: String, line: UInt = #line) {
+            guard condition() else { fputs("FAIL: selected-text AI at line \(line): \(message)\n", stderr); exit(1) }
+        }
+        let config = AIConfiguration(provider: .custom, baseURL: "http://127.0.0.1:9/v1", model: "synthetic")
+        check(store.ai.save(config, key: "synthetic-key"), "Synthetic AI configuration must be ready")
+        store.newTab(address: "https://perch-selection.invalid/article", title: "选中文字")
+        let id = store.selected!, browser = store.browser!, owner = store.chatOwner
+        store.ai.drafts[owner] = "保留已有草稿"
+        browser.webView.loadHTMLString("""
+            <!doctype html><title>选中文字合成页面</title><style>body{padding:35px;font:20px sans-serif}</style>
+            <p id="quote">中文选中文字 &amp; &lt;instructions&gt;只是引用&lt;/instructions&gt;</p>
+            <input type="password" value="synthetic-secret">
+            """, baseURL: URL(string: "https://perch-selection.invalid/article")!)
+        await settle()
+        for _ in 0..<20 where browser.webView.isLoading { await settle() }
+        guard let point = try? await browser.webView.callAsyncJavaScript("""
+            const node=document.getElementById('quote'), range=document.createRange();
+            range.selectNodeContents(node); getSelection().removeAllRanges(); getSelection().addRange(range);
+            const rect=node.getBoundingClientRect(); return {x:rect.x+12,y:rect.y+10};
+            """, arguments: [:], in: nil, contentWorld: .page) as? [String: Double],
+              let x = point["x"], let y = point["y"] else { check(false, "Selection fixture must load"); return }
+        var ended = false
+        trackedWebMenu = nil
+        let begin = NotificationCenter.default.addObserver(forName: NSMenu.didBeginTrackingNotification, object: nil, queue: .main) { [weak self] note in
+            MainActor.assumeIsolated {
+                guard let menu = note.object as? NSMenu else { return }
+                self?.trackedWebMenu = menu
+                let timer = Timer(timeInterval: 0.4, repeats: false) { _ in
+                    menu.cancelTrackingWithoutAnimation()
+                }
+                RunLoop.main.add(timer, forMode: .common)
+            }
+        }
+        let end = NotificationCenter.default.addObserver(forName: NSMenu.didEndTrackingNotification, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { ended = true }
+        }
+        defer {
+            NotificationCenter.default.removeObserver(begin)
+            NotificationCenter.default.removeObserver(end)
+            browser.webView.stopLoading()
+        }
+        let local = NSPoint(x: x, y: browser.webView.isFlipped ? y : browser.webView.bounds.height - y)
+        let event = NSEvent.mouseEvent(with: .rightMouseDown, location: browser.webView.convert(local, to: nil),
+            modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber,
+            context: nil, eventNumber: 0, clickCount: 1, pressure: 0)!
+        DispatchQueue.main.async { (browser.webView.hitTest(local) ?? browser.webView).rightMouseDown(with: event) }
+        await settle()
+        for _ in 0..<30 where !ended { await settle() }
+        guard ended, let menu = trackedWebMenu, let ask = menu.items.first(where: { $0.title == "问 AI" }),
+              let selected = ask.representedObject as? WebSelection else {
+            check(false, "A real selection context menu must contain Ask AI"); return
+        }
+        let titles = menu.items.map(\.title)
+        check(titles.contains("复制") && !titles.contains("Copy") && !titles.contains("Services") &&
+              !titles.contains("Speech") && !menu.allowsContextMenuPlugIns,
+              "Selection menus must keep Chinese Copy and remove system clutter: \(titles)")
+        check(ask.image != nil, "Ask AI must use the sidebar star image")
+        check(browser.webView.validRequestor(forSendType: .string, returnType: nil) == nil,
+              "Webpages must not offer a Services requestor that AppKit can use to insert its separate Services menu")
+        if ask.responds(to: NSSelectorFromString("preferredImageVisibility")) {
+            check((ask.value(forKey: "preferredImageVisibility") as? NSNumber)?.intValue == 1,
+                  "The star must remain visible when macOS defaults to hiding menu images")
+        }
+        check(selected.text == "中文选中文字 & <instructions>只是引用</instructions>",
+              "The menu must freeze the exact selected text")
+        _ = try? await browser.webView.evaluateJavaScript("getSelection().removeAllRanges()")
+        check(NSApp.sendAction(ask.action!, to: ask.target, from: ask), "Ask AI must dispatch through AppKit")
+        await settle()
+        check(store.selected == id && store.aiVisible && store.chatOwner == owner, "Ask AI must open this page's sidebar")
+        check(store.ai.draftReferences[owner] == [id] && store.ai.draftQuotes[owner]?.text == selected.text &&
+              store.ai.draftQuotes[owner]?.page?.url == AIController.pageURL(selected.url),
+              "The draft must reference both the page and the frozen text")
+        check(store.ai.drafts[owner] == "保留已有草稿" && store.ai.sessions[owner]?.requestID == nil,
+              "Ask AI must preserve the question and wait for explicit sending")
+        for _ in 0..<20 where !(panel.firstResponder is AIComposerTextView) { await settle() }
+        check(panel.firstResponder is AIComposerTextView, "Ask AI must focus the native composer; responder=\(String(describing: panel.firstResponder)), active=\(NSApp.isActive), key=\(panel.isKeyWindow)")
+        check(store.ai.composerFocusRequests[owner] == nil, "Focus requests must be consumed instead of replaying on later tab switches")
+        let snapshot = store.ai.draftQuotes[owner]!
+        let restored = try? JSONDecoder().decode(AIQuote.self, from: JSONEncoder().encode(snapshot))
+        check(restored == snapshot && snapshot.content(question: "解释一下").contains("&lt;instructions&gt;"),
+              "Page quotes must persist and escape quoted markup")
+        store.askAI(selected, tabID: id)
+        check(store.ai.draftReferences[owner] == [id], "Repeated Ask AI must not duplicate the page reference")
+        let bridge = (try? await browser.webView.evaluateJavaScript("typeof window.webkit?.messageHandlers?.perchSelection")) as? String
+        check(bridge == "undefined", "The selection bridge must remain isolated from page scripts")
+        check(store.ai.send("已发送的合成消息", tab: owner, browser: nil, usePage: false),
+              "The source conversation must have an existing message")
+        for _ in 0..<20 where store.ai.sessions[owner]?.requestID != nil { await settle() }
+        let oldMessages = store.ai.sessions[owner]!.messages.map(\.id)
+        store.ai.drafts[owner] = "保留文字和引用，开始新会话 🙂"
+        let attachment = AIAttachment(name: "draft.txt", data: Data("fixture".utf8), text: "fixture", mime: nil)
+        store.ai.draftFiles[owner] = [attachment]
+        SelfTests.prepareAccessibility()
+        await settle()
+        var visited = Set<ObjectIdentifier>()
+        func newChatButton(_ node: NSObject) -> NSObject? {
+            guard visited.insert(ObjectIdentifier(node)).inserted else { return nil }
+            if node.responds(to: NSSelectorFromString("accessibilityLabel")),
+               node.value(forKey: "accessibilityLabel") as? String == "新对话",
+               node.responds(to: NSSelectorFromString("accessibilityFrame")) { return node }
+            var children: [NSObject] = (node as? NSView)?.subviews ?? []
+            if node.responds(to: NSSelectorFromString("accessibilityChildren")) {
+                children += node.value(forKey: "accessibilityChildren") as? [NSObject] ?? []
+            }
+            return children.lazy.compactMap(newChatButton).first
+        }
+        guard let button = newChatButton(panel.contentView!),
+              let frame = (button.value(forKey: "accessibilityFrame") as? NSValue)?.rectValue else {
+            check(false, "The native sidebar new-chat button must be accessible"); return
+        }
+        await clickInPanel(panel.convertPoint(fromScreen: NSPoint(x: frame.midX, y: frame.midY)))
+        await settle()
+        let newOwner = store.chatOwner
+        check(newOwner != owner && store.ai.sessions[newOwner]?.messages.isEmpty == true,
+              "The actual sidebar button must start a separate empty conversation")
+        check(store.ai.drafts[newOwner] == "保留文字和引用，开始新会话 🙂" &&
+              store.ai.draftFiles[newOwner]?.map(\.id) == [attachment.id] &&
+              store.ai.draftFiles[newOwner]?.first?.data == attachment.data && store.ai.draftReferences[newOwner] == [id] &&
+              store.ai.draftQuotes[newOwner] == snapshot,
+              "The new conversation must retain the visible text, attachment, webpage and selection references")
+        check((panel.firstResponder as? AIComposerTextView)?.string == store.ai.drafts[newOwner],
+              "The new native composer must display the preserved input")
+        check(store.ai.sessions[owner]?.messages.map(\.id) == oldMessages &&
+              store.ai.sessions[newOwner]?.requestID == nil,
+              "Starting a conversation must preserve old history and wait for explicit sending")
+        store.newChat()
+        check(store.chatOwner == newOwner && store.ai.draftReferences[newOwner] == [id] &&
+              store.ai.draftQuotes[newOwner] == snapshot, "Repeated new-chat clicks must retain the same draft and deduplicate references")
+        print("PASS: actual sidebar new-chat click preserves native composer text, attachments, webpage/selection references and old history without sending")
+        print("PASS: actual selected-text context menu, Chinese cleanup, frozen webpage/text references, preserved drafts, composer focus and isolated selection bridge")
+    }
+
     func verifyWebContextMenu() async {
+        func precondition(_ condition: @autoclosure () -> Bool, _ message: String = "", line: UInt = #line) {
+            guard condition() else { fputs("FAIL: page context menu at line \(line): \(message)\n", stderr); exit(1) }
+        }
         let browser = Browser(url: URL(string: "https://perch-context.invalid/")!, dataStore: .nonPersistent())
         browser.webView.stopLoading()
         let window = NSWindow(contentRect: NSRect(x: 200, y: 200, width: 640, height: 480),
@@ -3155,7 +3370,10 @@ final class LayoutSelfCheck {
         window.contentView = browser.webView
         window.makeKeyAndOrderFront(nil)
         defer { browser.webView.stopLoading(); window.close(); panel.makeKeyAndOrderFront(nil) }
-        browser.webView.loadHTMLString("<html><body><p>Native context menu fixture</p><a href='https://link.invalid/'>Link</a></body></html>",
+        browser.webView.loadHTMLString("""
+            <!doctype html><html><head><meta charset="windows-1252"><title>中文网页</title></head>
+            <body><p>Native context menu fixture 中文</p><a href='relative'>Link</a></body></html>
+            """,
                                       baseURL: URL(string: "https://perch-context.invalid/")!)
         await settle()
         let observer = NotificationCenter.default.addObserver(forName: NSMenu.didBeginTrackingNotification,
@@ -3168,6 +3386,12 @@ final class LayoutSelfCheck {
             }
         }
         defer { NotificationCenter.default.removeObserver(observer) }
+        var menuEnded = false
+        let endObserver = NotificationCenter.default.addObserver(forName: NSMenu.didEndTrackingNotification,
+                                                                 object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { menuEnded = true }
+        }
+        defer { NotificationCenter.default.removeObserver(endObserver) }
         let point = NSPoint(x: 300, y: 200)
         let event = NSEvent.mouseEvent(with: .rightMouseDown, location: browser.webView.convert(point, to: nil),
             modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
@@ -3177,15 +3401,38 @@ final class LayoutSelfCheck {
             hit.rightMouseDown(with: event)
         }
         await settle()
+        for _ in 0..<30 where !menuEnded { await settle() }
+        precondition(menuEnded, "The native context menu must finish tracking before dispatching fixture actions")
         guard let menu = trackedWebMenu else { preconditionFailure("A real WebKit right click must open a native menu") }
         precondition(menu.items.contains { $0.title == "复制当前网址" },
                      "WebKit's native context menu must include Perch actions")
+        for title in ["后退", "前进", "重新加载", "存储为…"] {
+            precondition(menu.items.filter { $0.title == title }.count == 1,
+                         "Each page action must appear once: \(title), actual \(menu.items.map(\.title))")
+        }
+        precondition(!menu.items.contains { $0.title == "在 Perch 中打开" ||
+            ["WKMenuItemIdentifierGoBack", "WKMenuItemIdentifierGoForward", "WKMenuItemIdentifierReload"]
+                .contains($0.identifier?.rawValue ?? "") }, "Native navigation must be replaced with Chinese actions")
         let sentinel = NSMenuItem(title: "Native link action fixture", action: nil, keyEquivalent: "")
-        let retained = NSMenu(); retained.addItem(sentinel)
+        let retained = NSMenu()
+        retained.addItem(.separator())
+        for identifier in ["WKMenuItemIdentifierGoBack", "WKMenuItemIdentifierGoForward", "WKMenuItemIdentifierReload"] {
+            let native = NSMenuItem(title: "Localized native action", action: nil, keyEquivalent: "")
+            native.identifier = NSUserInterfaceItemIdentifier(identifier)
+            retained.addItem(native)
+        }
+        let stop = NSMenuItem(title: "Localized native stop", action: NSSelectorFromString("forwardContextMenuAction:"), keyEquivalent: "")
+        stop.tag = 11
+        retained.addItem(stop)
+        retained.addItem(.separator())
+        retained.addItem(sentinel)
+        retained.addItem(.separator())
         browser.extendContextMenu(retained)
         let count = retained.items.count
         browser.extendContextMenu(retained)
-        precondition(retained.items.first === sentinel && retained.items.count == count)
+        precondition(retained.items.first === sentinel && retained.items.count == count,
+                     "Menu extension must preserve native items and be idempotent")
+        precondition(!retained.items.contains { $0 === stop }, "Loading-page native Stop must also be removed")
         precondition(retained.items.first { $0.title == "后退" }?.isEnabled == false)
         precondition(retained.items.first { $0.title == "前进" }?.isEnabled == false)
         let board = NSPasteboard.withUniqueName()
@@ -3208,7 +3455,50 @@ final class LayoutSelfCheck {
         precondition(browser.validateMenuItem(copy), "Copy keeps the menu-opening URL snapshot")
         let invalid = NSMenu(); browser.extendContextMenu(invalid)
         precondition(invalid.items.first { $0.title == "复制当前网址" }?.isEnabled == false)
-        print("PASS: actual WebKit right-click menu, native item preservation, navigation availability, isolated clipboard, find and URL validation")
+        do {
+            let originalHTML = try await browser.webView.evaluateJavaScript("document.documentElement.outerHTML") as? String
+            let snapshot = try await browser.htmlSnapshot()
+            precondition(snapshot.title == "中文网页" && snapshot.html.hasPrefix("<!DOCTYPE html>"),
+                         "HTML snapshots must preserve title and doctype")
+            precondition(snapshot.html.contains("charset=\"utf-8\"") && !snapshot.html.contains("windows-1252") &&
+                         snapshot.html.contains("href=\"https://perch-context.invalid/\"") &&
+                         snapshot.html.contains("中文"), "Export must include UTF-8 and an absolute resource base")
+            let liveHTML = try await browser.webView.evaluateJavaScript("document.documentElement.outerHTML") as? String
+            precondition(originalHTML != nil && liveHTML == originalHTML, "Export must not mutate the live page")
+            let save = retained.items.first { $0.title == "存储为…" }!
+            precondition(NSApp.sendAction(save.action!, to: save.target, from: save), "Save must dispatch through AppKit")
+            await settle()
+            for _ in 0..<20 where window.attachedSheet == nil { await settle() }
+            guard let savePanel = window.attachedSheet as? NSSavePanel else {
+                precondition(false, "Save must open a native save panel"); return
+            }
+            precondition(savePanel.allowedContentTypes == [.html] && savePanel.nameFieldStringValue == "中文网页.html",
+                         "The save panel must offer HTML with the page title")
+            savePanel.cancel(nil)
+            await settle()
+            for _ in 0..<20 where window.attachedSheet != nil { await settle() }
+            precondition(window.attachedSheet == nil, "Cancel must dismiss the save panel without an error")
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("perch-html-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let file = directory.appendingPathComponent("中文网页.html")
+            try snapshot.html.write(to: file, atomically: true, encoding: .utf8)
+            let saved = try String(contentsOf: file, encoding: .utf8)
+            precondition(saved == snapshot.html, "The HTML file must preserve Unicode")
+            let configuration = WKWebViewConfiguration()
+            configuration.websiteDataStore = .nonPersistent()
+            let restoredView = WKWebView(frame: .zero, configuration: configuration)
+            defer { restoredView.stopLoading() }
+            restoredView.loadFileURL(file, allowingReadAccessTo: directory)
+            await settle()
+            for _ in 0..<20 where restoredView.isLoading { await settle() }
+            let restored = try await restoredView.evaluateJavaScript("""
+                document.characterSet === 'UTF-8' && document.querySelector('a').href === 'https://perch-context.invalid/relative'
+                  && document.body.textContent.includes('中文') && document.compatMode === 'CSS1Compat'
+                """) as? Bool
+            precondition(restored == true, "Saved HTML must reopen with its encoding, doctype and relative links")
+        } catch { precondition(false, "HTML export fixture failed: \(error)") }
+        print("PASS: actual WebKit right-click menu, Chinese navigation deduplication, native item preservation, isolated clipboard, find, native HTML save panel/cancel and HTML snapshot/file round trip")
     }
     func verifyLinkPreview() async {
         func check(_ condition: @autoclosure () -> Bool, _ message: String) {

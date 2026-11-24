@@ -168,20 +168,30 @@ final class AIKeyStore {
     }
 }
 
-struct AIPageReference: Codable, Identifiable {
+struct AIPageReference: Codable, Identifiable, Equatable {
     var id = UUID()
     let title: String
     let url: URL?
 }
 
 struct AIQuote: Codable, Equatable {
-    let messageID: UUID
+    let messageID: UUID?
     let text: String
-    var valid: Bool { !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && text.count <= 12000 }
+    var page: AIPageReference? = nil
+    var label: String { page == nil ? "引用的回答" : "引用的网页文字" }
+    var valid: Bool {
+        (messageID != nil || page?.url.flatMap(AIController.pageURL) != nil) &&
+            !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && text.count <= 12000
+    }
     func content(question: String) -> String {
         let escaped = text.replacingOccurrences(of: "&", with: "&amp;")
             .replacingOccurrences(of: "<", with: "&lt;").replacingOccurrences(of: ">", with: "&gt;")
-        return "用户选中了先前助手回复的以下片段，作为本次问题的讨论对象：\n<quoted_response message_id=\"\(messageID.uuidString)\">\n\(escaped)\n</quoted_response>\n\n用户本次问题：\(question)"
+        if let page {
+            let url = page.url.flatMap(AIController.pageURL)?.absoluteString ?? ""
+            let source = url.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "\"", with: "&quot;")
+            return "用户选中了网页中的以下片段，作为本次问题的讨论对象：\n<quoted_webpage url=\"\(source)\">\n\(escaped)\n</quoted_webpage>\n\n用户本次问题：\(question)"
+        }
+        return "用户选中了先前助手回复的以下片段，作为本次问题的讨论对象：\n<quoted_response message_id=\"\(messageID?.uuidString ?? "")\">\n\(escaped)\n</quoted_response>\n\n用户本次问题：\(question)"
     }
 }
 
@@ -324,7 +334,7 @@ struct AISession: Codable, Identifiable {
                 sections.append("搜索来源：[\(title)](<\(source.url.absoluteString)>)")
             }
             if let quote = message.quote {
-                sections.append("引用的回答：\n" + quote.text.components(separatedBy: "\n").map { "> " + $0 }.joined(separator: "\n"))
+                sections.append(quote.label + "：\n" + quote.text.components(separatedBy: "\n").map { "> " + $0 }.joined(separator: "\n"))
             }
             for reference in message.references {
                 let title = reference.title.replacingOccurrences(of: "[", with: "\\[").replacingOccurrences(of: "]", with: "\\]")
@@ -689,6 +699,7 @@ final class AIController: ObservableObject {
     @Published private(set) var storageError: String?
     @Published var drafts: [UUID: String] = [:] { didSet { scheduleConversationSave() } }
     @Published var draftQuotes: [UUID: AIQuote] = [:] { didSet { scheduleConversationSave() } }
+    @Published var composerFocusRequests: [UUID: UUID] = [:]
     @Published var draftFiles: [UUID: [AIAttachment]] = [:] { didSet { scheduleConversationSave() } }
     @Published var draftReferences: [UUID: [UUID]] = [:] { didSet { scheduleConversationSave() } }
     @Published var draftClosedReferences: [UUID: [AIPageReference]] = [:] { didSet { scheduleConversationSave() } }
@@ -793,7 +804,7 @@ final class AIController: ObservableObject {
     }
     var activeConversations: [AISession] { recentConversations.filter { $0.isArchived != true } }
     var archivedConversations: [AISession] { recentConversations.filter { $0.isArchived == true } }
-    static func pageURL(_ url: URL) -> URL? {
+    nonisolated static func pageURL(_ url: URL) -> URL? {
         guard var parts = URLComponents(url: url, resolvingAgainstBaseURL: false),
               ["http", "https"].contains(parts.scheme?.lowercased() ?? ""), parts.host != nil else { return nil }
         parts.user = nil; parts.password = nil; parts.query = nil; parts.fragment = nil
@@ -982,12 +993,24 @@ final class AIController: ObservableObject {
         }
     }
     func newChatOwner(context: UUID, previous: UUID) -> UUID {
-        if let owner = newChatOwners[context], sessions[owner]?.messages.isEmpty == true { return owner }
-        let owner = sessions[previous]?.messages.isEmpty != false ? previous : UUID()
+        let draft = AIChatDraft(text: drafts[previous] ?? "", files: draftFiles[previous] ?? [],
+            references: draftReferences[previous] ?? [], closedReferences: draftClosedReferences[previous] ?? [],
+            quote: draftQuotes[previous])
+        let hasDraft = !draft.text.isEmpty || !draft.files.isEmpty || !draft.references.isEmpty ||
+            !draft.closedReferences.isEmpty || draft.quote != nil
+        let savedOwner = newChatOwners[context].flatMap { sessions[$0]?.messages.isEmpty == true ? $0 : nil }
+        let owner = hasDraft ? (sessions[previous]?.messages.isEmpty != false ? previous : UUID()) :
+            savedOwner ?? (sessions[previous]?.messages.isEmpty != false ? previous : UUID())
         if sessions[owner] == nil {
             sessions[owner] = AISession(providerID: provider(for: owner).id, model: model(for: owner))
         }
-        newChatOwners[context] = owner
+        if hasDraft && owner != previous {
+            drafts[owner] = draft.text; draftFiles[owner] = draft.files
+            draftReferences[owner] = draft.references; draftClosedReferences[owner] = draft.closedReferences
+            draftQuotes[owner] = draft.quote
+        }
+        // Keep a different saved draft available when the current input starts its own conversation.
+        if savedOwner == nil || savedOwner == owner { newChatOwners[context] = owner }
         saveConversations()
         return owner
     }

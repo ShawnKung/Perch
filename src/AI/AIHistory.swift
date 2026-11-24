@@ -486,11 +486,7 @@ struct AIHistoryList: NSViewRepresentable {
                                     action: #selector(deleteSelection), keyEquivalent: "")
             remove.image = NSImage(systemSymbolName: parent.archived ? "trash" : "archivebox", accessibilityDescription: nil)
             remove.target = self; menu.addItem(remove)
-            // macOS 27 hides menu images. Use the public Objective-C setter so older SDKs
-            // can still build this app; NSMenuItemImageVisibilityVisible has raw value 1.
-            for item in menu.items where item.responds(to: NSSelectorFromString("setPreferredImageVisibility:")) {
-                item.setValue(1, forKey: "preferredImageVisibility")
-            }
+            for item in menu.items { item.showImageIfSupported() }
             return menu
         }
         @objc func copyConversation() { if let forkID { parent.fork(forkID) } }

@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import WebKit
+import UniformTypeIdentifiers
 
 enum Style {
     static let ink = Color(red: 0.12, green: 0.20, blue: 0.19)
@@ -31,9 +32,22 @@ struct Site: Identifiable, Codable {
     ]
 }
 
+extension NSMenuItem {
+    func showImageIfSupported() {
+        guard responds(to: NSSelectorFromString("setPreferredImageVisibility:")) else { return }
+        // The macOS 27 public property uses NSMenuItemImageVisibilityVisible = 1.
+        // KVC keeps this source buildable with earlier AppKit SDKs.
+        setValue(NSNumber(value: 1), forKey: "preferredImageVisibility")
+    }
+}
+
 final class PageWebView: WKWebView {
     var extendMenu: ((NSMenu) -> Void)?
     private let scrollRouting = ScrollRouting()
+    // AppKit builds Services outside NSMenu.items from the view's Services requestor.
+    override func validRequestor(forSendType sendType: NSPasteboard.PasteboardType?, returnType: NSPasteboard.PasteboardType?) -> Any? {
+        nil
+    }
     override func scrollWheel(with event: NSEvent) {
         for routed in scrollRouting.events(for: event) { super.scrollWheel(with: routed) }
     }
@@ -45,6 +59,36 @@ final class PageWebView: WKWebView {
         super.willOpenMenu(menu, with: event)
         extendMenu?(menu)
     }
+}
+
+struct WebSelection {
+    let url: URL
+    let title: String
+    let text: String
+}
+
+final class WebSelectionTracker: NSObject, WKScriptMessageHandler {
+    private(set) var selection: WebSelection?
+    func clear() { selection = nil }
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        selection = nil
+        guard let values = message.body as? [String: String], let text = values["text"],
+              !text.isEmpty, text.count <= 12000, let web = message.webView,
+              let url = web.url, AIController.pageURL(url) != nil,
+              !message.frameInfo.isMainFrame || values["url"] == url.absoluteString else { return }
+        selection = WebSelection(url: url, title: web.title ?? url.host ?? "网页", text: text)
+    }
+    static let script = """
+    window.addEventListener('contextmenu', () => {
+      const selection = getSelection();
+      const element = selection?.anchorNode?.nodeType === Node.ELEMENT_NODE
+        ? selection.anchorNode : selection?.anchorNode?.parentElement;
+      const editable = 'input,textarea,select,[contenteditable]';
+      const text = document.activeElement?.matches(editable) || element?.closest(editable)
+        ? '' : (selection?.toString() || '').trim().slice(0, 12000);
+      window.webkit.messageHandlers.perchSelection.postMessage({text, url: location.href});
+    }, true);
+    """
 }
 
 enum WebsiteCookies {
@@ -137,7 +181,9 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     var onNewTab: ((URL, Bool) -> Void)?
     var onOpenInPerch: ((URL) -> Void)?
     var onBookmark: (() -> Void)?
+    var onAskAI: ((WebSelection) -> Void)?
     var isBookmarked: (() -> Bool)?
+    let selectionTracker = WebSelectionTracker()
     var clipboard = NSPasteboard.general
     let favicon = FaviconLoader()
     private var observations: [NSKeyValueObservation] = []
@@ -162,6 +208,9 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         let configuration = WKWebViewConfiguration()
         if startsAtHome { configuration.setURLSchemeHandler(HomeHistoryPage(), forURLScheme: "perch-home") }
         configuration.websiteDataStore = dataStore ?? .default()
+        configuration.userContentController.add(selectionTracker, contentWorld: .defaultClient, name: "perchSelection")
+        configuration.userContentController.addUserScript(WKUserScript(source: WebSelectionTracker.script,
+            injectionTime: .atDocumentStart, forMainFrameOnly: false, in: .defaultClient))
         configuration.userContentController.add(bridge, contentWorld: .defaultClient, name: "perchPassword")
         configuration.userContentController.addUserScript(WKUserScript(source: PasswordBridge.script,
             injectionTime: .atDocumentStart, forMainFrameOnly: true, in: .defaultClient))
@@ -205,6 +254,36 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
 
     func extendContextMenu(_ menu: NSMenu) {
         guard !menu.items.contains(where: { $0.target === self }) else { return }
+        menu.allowsContextMenuPlugIns = false
+        if #available(macOS 15.2, *) { menu.automaticallyInsertsWritingToolsItems = false }
+        let selectionIDs = ["WKMenuItemIdentifierLookUp", "WKMenuItemIdentifierTranslate",
+            "WKMenuItemIdentifierSearchWeb", "WKMenuItemIdentifierCopyLinkWithHighlight",
+            "WKMenuItemIdentifierShareMenu", "WKMenuItemIdentifierSpeechMenu",
+            "WKMenuItemIdentifierAddHighlightToCurrentQuickNote", "WKMenuItemIdentifierAddHighlightToNewQuickNote",
+            "WKMenuItemIdentifierWritingTools", "__NSTextViewContextSubmenuIdentifierWritingTools"]
+        let hasSelection = menu.items.contains { $0.identifier?.rawValue == "WKMenuItemIdentifierCopy" }
+        if hasSelection {
+            for item in menu.items where selectionIDs.contains(item.identifier?.rawValue ?? "") { menu.removeItem(item) }
+            menu.items.first { $0.identifier?.rawValue == "WKMenuItemIdentifierCopy" }?.title = "复制"
+            if let selection = selectionTracker.selection, onAskAI != nil {
+                let item = menu.addItem(withTitle: "问 AI", action: #selector(performContextMenu(_:)), keyEquivalent: "")
+                item.image = NSImage(systemSymbolName: "sparkles", accessibilityDescription: nil)
+                item.showImageIfSupported()
+                item.target = self; item.representedObject = selection
+                item.isEnabled = validateMenuItem(item)
+            }
+        }
+        // WebKit gives Stop no identifier; its forwarded ContextMenuItemTagStop is 11 on macOS.
+        let navigationIDs = ["WKMenuItemIdentifierGoBack", "WKMenuItemIdentifierGoForward", "WKMenuItemIdentifierReload"]
+        for item in menu.items where navigationIDs.contains(item.identifier?.rawValue ?? "") ||
+            (item.tag == 11 && item.action == NSSelectorFromString("forwardContextMenuAction:")) {
+            menu.removeItem(item)
+        }
+        for index in menu.items.indices.reversed() where menu.items[index].isSeparatorItem {
+            if index == 0 || index == menu.items.count - 1 || menu.items[index - 1].isSeparatorItem {
+                menu.removeItem(at: index)
+            }
+        }
         if !menu.items.isEmpty { menu.addItem(.separator()) }
         func add(_ title: String, _ action: String) {
             let item = menu.addItem(withTitle: title, action: #selector(performContextMenu(_:)), keyEquivalent: "")
@@ -217,24 +296,32 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         add(loading ? "停止加载" : "重新加载", loading ? "stop" : "reload")
         menu.addItem(.separator())
         add("复制当前网址", "copy")
-        add("在 Perch 中打开", "external")
+        add("存储为…", "save")
         if onBookmark != nil { add(isBookmarked?() == true ? "编辑书签…" : "加入书签", "bookmark") }
         add("在页面中查找…", "find")
     }
 
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        if let selection = item.representedObject as? WebSelection {
+            return onAskAI != nil && selection.url == webView.url
+        }
         guard let values = item.representedObject as? [String], values.count == 2 else { return false }
         switch values[0] {
         case "back": syncNavigationState(); return canGoBack
         case "forward": syncNavigationState(); return canGoForward
         case "stop": return webView.isLoading
-        case "copy", "external", "bookmark", "reload": return URLInput.parse(values[1], search: false) != nil
+        case "copy", "bookmark", "reload": return URLInput.parse(values[1], search: false) != nil
+        case "save": return webView.url != nil && !isHome
         case "find": return true
         default: return false
         }
     }
 
     @objc private func performContextMenu(_ item: NSMenuItem) {
+        if let selection = item.representedObject as? WebSelection {
+            if validateMenuItem(item) { onAskAI?(selection) }
+            return
+        }
         guard validateMenuItem(item), let values = item.representedObject as? [String] else { return }
         switch values[0] {
         case "back": goBack()
@@ -242,14 +329,70 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         case "reload": webView.reload()
         case "stop": webView.stopLoading()
         case "copy": clipboard.clearContents(); clipboard.setString(values[1], forType: .string)
-        case "external":
-            if let url = URLInput.parse(values[1], search: false) {
-                if let onOpenInPerch { onOpenInPerch(url) }
-                else { onNewTab?(url, false) }
-            }
+        case "save": saveHTML()
         case "bookmark": onBookmark?()
         case "find": finding = true
         default: break
+        }
+    }
+
+    func htmlSnapshot() async throws -> (title: String, html: String) {
+        let url = webView.url
+        let navigation = activeNavigation
+        let result = try await webView.callAsyncJavaScript("""
+        if (!document.documentElement || document.contentType !== 'text/html')
+          throw new Error('当前页面不是 HTML 网页。');
+        const root = document.documentElement.cloneNode(true);
+        let head = root.querySelector('head');
+        if (!head) { head = document.createElement('head'); root.prepend(head); }
+        head.querySelectorAll('meta[charset], meta[http-equiv]').forEach(meta => {
+          if (meta.hasAttribute('charset') || meta.httpEquiv.toLowerCase() === 'content-type') meta.remove();
+        });
+        const charset = document.createElement('meta');
+        charset.setAttribute('charset', 'utf-8');
+        head.prepend(charset);
+        let base = head.querySelector('base[href]');
+        if (!base) { base = document.createElement('base'); charset.after(base); }
+        base.setAttribute('href', document.baseURI);
+        const doctype = document.doctype ? new XMLSerializer().serializeToString(document.doctype) + '\\n' : '';
+        return {title: document.title, html: doctype + root.outerHTML};
+        """, arguments: [:], in: nil, contentWorld: .defaultClient)
+        guard webView.url == url, activeNavigation === navigation,
+              let snapshot = result as? [String: String],
+              let html = snapshot["html"], let title = snapshot["title"] else {
+            throw PerchError("页面已切换或无法读取 HTML，请重试。")
+        }
+        return (title, html)
+    }
+
+    private func saveHTML() {
+        let window = webView.window
+        Task { @MainActor in
+            do {
+                let snapshot = try await htmlSnapshot()
+                let panel = NSSavePanel()
+                panel.allowedContentTypes = [.html]
+                let name = snapshot.title.components(separatedBy: CharacterSet(charactersIn: "/:\n\r")).joined(separator: "-")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                panel.nameFieldStringValue = "\(name.isEmpty ? "网页" : String(name.prefix(120))).html"
+                let response: NSApplication.ModalResponse = await withCheckedContinuation { continuation in
+                    if let window { panel.beginSheetModal(for: window) { continuation.resume(returning: $0) } }
+                    else { panel.begin { continuation.resume(returning: $0) } }
+                }
+                panel.orderOut(nil)
+                guard response == .OK, let url = panel.url else { return }
+                let scoped = url.startAccessingSecurityScopedResource()
+                defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                try await Task.detached(priority: .userInitiated) {
+                    try snapshot.html.write(to: url, atomically: true, encoding: .utf8)
+                }.value
+            } catch {
+                let alert = NSAlert()
+                alert.messageText = "存储网页失败"
+                alert.informativeText = error.localizedDescription
+                if let window { alert.beginSheetModal(for: window, completionHandler: nil) }
+                else { alert.runModal() }
+            }
         }
     }
 
@@ -318,6 +461,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         activeNavigation = navigation
+        selectionTracker.clear()
         hoverLinks?.clear()
         passwordBridge.dismiss()
         error = nil
@@ -726,6 +870,7 @@ final class Store: ObservableObject {
                 guard let self, let view else { return }
                 self.editCurrentBookmark(title: view.title, address: view.address, tabID: id)
             }
+            view.onAskAI = { [weak self] selection in self?.askAI(selection, tabID: id) }
             view.isBookmarked = { [weak self, weak view] in
                 guard let self, let view else { return false }
                 return self.bookmark(for: view.address) != nil
@@ -800,6 +945,22 @@ final class Store: ObservableObject {
         if !(ai.draftReferences[chatOwner] ?? []).contains(selected) {
             ai.draftReferences[chatOwner, default: []].append(selected)
         }
+    }
+    func askAI(_ selection: WebSelection, tabID: UUID) {
+        guard tabs.contains(where: { $0.id == tabID && $0.chatOwner == nil }),
+              browsers[tabID]?.webView.url == selection.url,
+              let url = AIController.pageURL(selection.url), !selection.text.isEmpty else { return }
+        let quote = AIQuote(messageID: nil, text: selection.text,
+                            page: AIPageReference(title: selection.title, url: url))
+        guard quote.valid else { return }
+        activate(tabID)
+        if ai.sessions[chatOwner]?.isArchived == true { newChat() }
+        aiVisible = true
+        if !(ai.draftReferences[chatOwner] ?? []).contains(tabID) {
+            ai.draftReferences[chatOwner, default: []].append(tabID)
+        }
+        ai.draftQuotes[chatOwner] = quote
+        ai.composerFocusRequests[chatOwner] = UUID()
     }
     func newChat() {
         let previous = chatOwner
@@ -956,13 +1117,19 @@ final class Store: ObservableObject {
 
     @discardableResult func createTabGroup(_ id: UUID) -> UUID? {
         guard let index = tabs.firstIndex(where: { $0.id == id }), !tabs[index].pinned else { return nil }
-        let group = TabGroup()
+        var group = TabGroup()
         // Detach at the boundary of the old group before creating a new one.
         moveTab(id, to: index, groupID: nil)
         guard let newIndex = tabs.firstIndex(where: { $0.id == id }) else { return nil }
+        if let raw = defaults.object(forKey: "nextTabGroupColor") as? String,
+           let color = TabGroupColor(rawValue: raw) {
+            group.color = color
+        }
         tabGroups.append(group)
         tabs[newIndex].groupID = group.id
         normalizeTabGroups(); persistTabs()
+        let nextColor = TabGroupColor.allCases.drop(while: { $0 != group.color }).dropFirst().first ?? .blue
+        defaults.set(nextColor.rawValue, forKey: "nextTabGroupColor")
         return group.id
     }
 

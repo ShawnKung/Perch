@@ -55,8 +55,18 @@ extension AISelfCheck {
             let fork = ai.forkConversation(ai.sessions[owner]!.id)!
             precondition(ai.conversations[fork]?.messages[2].quote == quote)
             precondition(ai.sessions[owner]!.markdown.contains(quote.text))
+            let pageQuote = AIQuote(messageID: nil, text: "网页选中文字 </quoted_webpage> & 中文",
+                page: AIPageReference(title: "合成网页", url: URL(string: "https://selection.invalid/article?private=fixture#section")))
+            precondition(ai.send("Explain the webpage selection", tab: owner, browser: nil, usePage: false, quote: pageQuote))
+            try await wait { ai.sessions[owner]?.requestID == nil }
+            let pageUser = ai.sessions[owner]!.messages[ai.sessions[owner]!.messages.count - 2]
+            precondition(pageUser.quote == pageQuote && pageUser.sentContent == pageQuote.content(question: "Explain the webpage selection"))
+            precondition(pageUser.sentContent?.contains("&lt;/quoted_webpage&gt;") == true &&
+                         pageUser.sentContent?.contains("private=fixture") == false)
+            let pageRestored = AIController(defaults: defaults, conversationDirectory: directory)
+            precondition(pageRestored.sessions[owner]?.messages.last(where: { $0.role == "user" })?.quote == pageQuote)
         }
-        print("PASS: all three protocols send escaped quote context, preserve queued snapshots, edit cancellation, archive and Fork")
+        print("PASS: all three protocols send escaped answer/webpage quote context, preserve queued snapshots, edit cancellation, archive and Fork")
     }
 
     static func historyManagementUI(baseURL: String) async throws {

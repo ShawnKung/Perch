@@ -1441,31 +1441,33 @@ struct NativeTabList: NSViewRepresentable {
                 item.representedObject = [tab.id.uuidString, action]
                 item.isEnabled = enabled
             }
-            add("在下方新建标签页", "new")
-            menu.addItem(.separator())
-            add("重新加载", "reload", enabled: !tab.address.isEmpty)
-            add("复制标签页", "duplicate")
-            add(tab.pinned ? "取消固定标签页" : "固定标签页", "pin")
+            add("在下方新增标签页", "new")
             if !tab.pinned {
                 let groups = NSMenu()
                 func groupItem(_ title: String, action: String) {
                     let item = groups.addItem(withTitle: title, action: #selector(performMenu(_:)), keyEquivalent: "")
                     item.target = self; item.representedObject = [tab.id.uuidString, action]
                 }
-                groupItem("新建分组", action: "group")
-                for group in store.openTabGroups {
+                groupItem("新建组", action: "group")
+                let openGroups = store.openTabGroups
+                if !openGroups.isEmpty { groups.addItem(.separator()) }
+                for group in openGroups {
                     groupItem(group.name.isEmpty ? "未命名分组" : group.name, action: "group:" + group.id.uuidString)
                     groups.items.last?.state = tab.groupID == group.id ? .on : .off
                 }
-                let item = menu.addItem(withTitle: "添加到标签分组", action: nil, keyEquivalent: "")
+                let item = menu.addItem(withTitle: "向群组中添加标签页", action: nil, keyEquivalent: "")
                 item.submenu = groups
                 if tab.groupID != nil { add("移出分组", "ungroup") }
             }
             menu.addItem(.separator())
+            add("重新加载", "reload", enabled: !tab.address.isEmpty)
+            add("复制", "duplicate")
+            add(tab.pinned ? "取消固定" : "固定", "pin")
+            menu.addItem(.separator())
             add("将此标签页加入书签", "bookmark", enabled: !tab.address.isEmpty)
             add("复制网址", "copy", enabled: !tab.address.isEmpty)
             menu.addItem(.separator())
-            add("关闭标签页", "close")
+            add("关闭", "close")
             add("关闭其他标签页", "others")
             add("关闭下方标签页", "below")
             menu.addItem(.separator())
