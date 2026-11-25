@@ -135,7 +135,7 @@ struct TabContentView: View {
                     .padding(.vertical, 8).background(Style.paper).background(WindowDragArea()).zIndex(10)
                     ZStack {
                         if let browser {
-                            BrowserTabContent(browser: browser, downloads: store.downloads)
+                            BrowserTabContent(browser: browser)
                         } else { HomeScreen(store: store, tabID: tabID) }
                     }.modifier(ContentTopChrome(enabled: true))
                 }
@@ -157,15 +157,8 @@ struct TabContentView: View {
 
 struct BrowserTabContent: View {
     @ObservedObject var browser: Browser
-    let downloads: DownloadController
     var body: some View {
-        if DownloadsPage.matches(URL(string: browser.address)) {
-            DownloadsList(downloads: downloads)
-                .frame(maxWidth: 860).frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Style.paper)
-        } else {
-            WebContent(browser: browser)
-            BrowserScreen(browser: browser)
-        }
+        WebContent(browser: browser)
+        BrowserScreen(browser: browser)
     }
 }

@@ -133,6 +133,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     let hoverLinks: HoverLinkTracker?
     let previewDefaults: UserDefaults
     let downloads: DownloadController?
+    let downloadsPage = DownloadsPageBridge()
     @Published var address = ""
     @Published var title = ""
     @Published var loading = false
@@ -211,6 +212,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         passwordBridge = bridge
         let configuration = WKWebViewConfiguration()
         configuration.setURLSchemeHandler(DownloadsSchemeHandler(), forURLScheme: "perch")
+        InternalPage.install("downloads", handler: downloadsPage, in: configuration)
         if startsAtHome { configuration.setURLSchemeHandler(HomeHistoryPage(), forURLScheme: "perch-home") }
         configuration.websiteDataStore = dataStore ?? .default()
         configuration.userContentController.add(selectionTracker, contentWorld: .defaultClient, name: "perchSelection")
@@ -227,6 +229,8 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
                 injectionTime: .atDocumentStart, forMainFrameOnly: false, in: .defaultClient))
         }
         webView = PageWebView(frame: .zero, configuration: configuration)
+        downloadsPage.web = webView
+        downloadsPage.downloads = downloads
         super.init()
         webView.extendMenu = { [weak self] menu in self?.extendContextMenu(menu) }
         webView.navigationDelegate = self
@@ -489,6 +493,8 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         guard navigation === activeNavigation else { return }
         pendingHistoryItem = nil; provisionalFailure = false
         title = webView.title ?? ""
+        if DownloadsPage.matches(webView.url) { downloadsPage.start() }
+        else { downloadsPage.stop() }
         address = displayAddress(webView.url)
         if startsAtHome && firstHomeDestination == nil { onHomeChanged?(isHome) }
         syncNavigationState()
@@ -632,6 +638,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        downloadsPage.stop()
         error = "网页进程已退出，点击重新加载即可恢复。"
     }
 }

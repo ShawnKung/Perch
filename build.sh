@@ -25,7 +25,7 @@ fi
 cp "$VAULT_CACHE/PerchAIKeys" "$APP/Contents/MacOS/PerchAIKeys"
 swiftc -swift-version 5 -parse-as-library -Osize -whole-module-optimization -lto=llvm-full -target "$(uname -m)-apple-macosx13.0" \
   -Xlinker -mllvm -Xlinker -machine-outliner-reruns=1 \
-  "$ROOT/src/Browser/URLInput.swift" "$ROOT/src/Browser/Downloads.swift" "$ROOT/src/App/Settings.swift" "$ROOT/src/App/Backup.swift" "$ROOT/src/Browser/BrowserImport.swift" \
+  "$ROOT/src/Browser/URLInput.swift" "$ROOT/src/Browser/InternalPage.swift" "$ROOT/src/Browser/Downloads.swift" "$ROOT/src/App/Settings.swift" "$ROOT/src/App/Backup.swift" "$ROOT/src/Browser/BrowserImport.swift" \
   "$ROOT/src/AI/AIChat.swift" "$ROOT/src/AI/AISearch.swift" "$ROOT/src/AI/AIGeneratedFile.swift" \
   "$ROOT/src/AI/AIFilePreview.swift" "$ROOT/src/AI/AIInteraction.swift" "$ROOT/src/AI/AITable.swift" \
   "$ROOT/src/AI/AIAttachment.swift" "$ROOT/src/AI/AIMarkdown.swift" "$ROOT/src/AI/AIDiagram.swift" \
@@ -47,6 +47,8 @@ cp "$ROOT/assets/LICENSE-noto.txt" "$ROOT/assets/ATTRIBUTION.md" "$APP/Contents/
 # Rebuild this derived directory so removed or renamed assets cannot survive incremental builds.
 rm -rf "$APP/Contents/Resources/markdown"
 cp -R "$ROOT/assets/markdown" "$APP/Contents/Resources/"
+rm -rf "$APP/Contents/Resources/internal"
+cp -R "$ROOT/assets/internal" "$APP/Contents/Resources/"
 swift -e 'import Foundation; let root = URL(fileURLWithPath: CommandLine.arguments[1]); for name in ["mermaid.js", "marked.js", "purify.js", "diagram.js", "diagram.css", "tables.js", "chat.js"] { let source = root.appendingPathComponent(name); let data = try Data(contentsOf: source); let packed = try (data as NSData).compressed(using: .lzma); let restored = try packed.decompressed(using: .lzma) as Data; precondition(restored == data); let output = name == "mermaid.js" ? "mermaid.lzma" : name + ".lzma"; try (packed as Data).write(to: root.appendingPathComponent(output)); try FileManager.default.removeItem(at: source) }' \
   "$APP/Contents/Resources/markdown"
 bash "$ROOT/scripts/sign-app.sh" "$APP"

@@ -1,0 +1,10 @@
+:root{color-scheme:light;--perch-accent:#216452;--perch-mint:#e0f0e6;--perch-sidebar:#f0f5ed;--perch-line:#dbe3db;--paper:#fafaf5;--ink:#1f3330;--muted:#647570}
+*{box-sizing:border-box}
+html,body{margin:0;min-height:100%;background:var(--paper);color:var(--ink);font:13px -apple-system,BlinkMacSystemFont,sans-serif}
+button,input{font:inherit;color:inherit}
+button{cursor:pointer;background:none;border:0}
+button:disabled{cursor:default;color:var(--muted)}
+button:focus-visible,input:focus-visible{outline:2px solid var(--perch-accent);outline-offset:3px}
+button svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;flex:none}
+[hidden]{display:none!important}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}}

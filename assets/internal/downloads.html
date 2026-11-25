@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
+<title>下载记录</title>
+<style>
+/* internal.css */
+main{max-width:860px;margin:auto;padding:24px}
+header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}
+h1{font-size:22px;font-weight:600;margin:0}
+#clear{color:var(--muted);padding:8px}
+#error{color:var(--muted);margin:0 0 16px}
+#empty{text-align:center;color:var(--muted);padding:40px}
+.row{display:flex;align-items:center;gap:8px;padding:10px;border-radius:8px;margin-bottom:8px}
+.row:hover,.row:focus-within{background:var(--perch-line)}
+.file{display:flex;align-items:center;text-align:left;gap:12px;flex:1;min-width:0;padding:0}
+.icon{width:28px;height:32px;object-fit:contain;flex:none}
+.fallback{width:28px;height:32px;display:grid;place-items:center;color:var(--muted)}
+.fallback svg{width:24px;height:28px}
+.info{display:flex;flex-direction:column;gap:4px;min-width:0}
+.name,.detail{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.name{font-weight:500}.detail{font-size:11px;color:var(--muted)}
+.actions{display:flex;gap:2px;opacity:0;pointer-events:none;transition:opacity .16s}
+.row:hover .actions,.row:focus-within .actions{opacity:1;pointer-events:auto}
+.actions button{width:24px;height:28px;padding:4px;display:grid;place-items:center}
+.actions button svg{width:12px;height:12px}
+</style>
+</head>
+<body><main>
+<header><h1>下载记录</h1><button id="clear" title="仅清空记录，保留文件和正在进行的下载" disabled>全部清空</button></header>
+<p id="error" role="status" hidden></p>
+<div id="records" aria-label="下载记录"></div>
+<p id="empty">暂无下载记录</p>
+</main></body>
+</html>

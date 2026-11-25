@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import WebKit
+import Combine
 
 enum DownloadsPage {
     static let url = URL(string: "perch://downloads")!
@@ -17,12 +18,72 @@ final class DownloadsSchemeHandler: NSObject, WKURLSchemeHandler {
         guard DownloadsPage.matches(task.request.url) else {
             task.didFailWithError(URLError(.unsupportedURL)); return
         }
-        let data = Data("<!doctype html><title>下载记录</title>".utf8)
+        let data = InternalPage.document("downloads")
         task.didReceive(URLResponse(url: task.request.url!, mimeType: "text/html",
                                    expectedContentLength: data.count, textEncodingName: "utf-8"))
         task.didReceive(data); task.didFinish()
     }
     func webView(_ webView: WKWebView, stop task: WKURLSchemeTask) {}
+}
+
+@MainActor
+final class DownloadsPageBridge: NSObject, WKScriptMessageHandler {
+    weak var web: WKWebView?
+    weak var downloads: DownloadController?
+    private var changes: AnyCancellable?
+    private var theme: AnyCancellable?
+    private var timer: Timer?
+    private var icons: [String: String] = [:]
+
+    func stop() {
+        changes = nil; theme = nil; timer?.invalidate(); timer = nil; icons = [:]
+    }
+    deinit { timer?.invalidate() }
+    func start() {
+        guard changes == nil, let downloads else { update(); return }
+        changes = downloads.objectWillChange.sink { [weak self] in
+            DispatchQueue.main.async { self?.update() }
+        }
+        theme = PerchTheme.shared.objectWillChange.sink { [weak self] in
+            DispatchQueue.main.async { self?.update() }
+        }
+        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.update() }
+        }
+        update()
+    }
+    func update() {
+        guard let web, DownloadsPage.matches(web.url), let downloads else { return }
+        PerchTheme.shared.update(web)
+        let records = downloads.records.map { record -> [String: Any] in
+            var icon = ""
+            if record.available, let url = record.destination {
+                if icons[url.path] == nil { icons[url.path] = InternalPage.icon(NSWorkspace.shared.icon(forFile: url.path)) }
+                icon = icons[url.path] ?? ""
+            }
+            return ["id": record.id.uuidString, "name": record.filename, "detail": record.detail,
+                    "available": record.available, "icon": icon]
+        }
+        InternalPage.update(["records": records, "error": downloads.storageError ?? ""], web: web)
+    }
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard InternalPage.accepts(message, web: web, matches: DownloadsPage.matches),
+              let body = message.body as? [String: Any], let action = body["action"] as? String,
+              let downloads else { return }
+        if action == "ready" {
+            start()
+        } else if action == "clear" { downloads.clear() }
+        else if let raw = body["id"] as? String, let id = UUID(uuidString: raw),
+                let record = downloads.records.first(where: { $0.id == id }) {
+            switch action {
+            case "open": downloads.open(record)
+            case "reveal": downloads.reveal(record)
+            case "copy": downloads.copyLink(record)
+            case "remove": downloads.remove(id)
+            default: break
+            }
+        }
+    }
 }
 
 struct DownloadRecord: Identifiable, Codable {

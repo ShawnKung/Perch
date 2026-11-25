@@ -72,6 +72,8 @@ enum DownloadSelfCheck {
         func wait(_ condition: () -> Bool) async throws { try await AISelfCheck.wait(timeout: 15, condition) }
         try await wait { browser?.webView.title == "Downloads fixture" && browser?.loading == false }
         let view = browser!.webView
+        let bridgeVisible = try await view.evaluateJavaScript("!!window.webkit?.messageHandlers?.perchInternal") as? Bool
+        guard bridgeVisible == false else { throw PerchError("Website can access the internal-page bridge") }
         _ = try await view.evaluateJavaScript("document.getElementById('slow').click(); true")
         try await wait { downloads.progressRecord?.received ?? 0 > 0 }
         let slow = downloads.progressRecord!.id
@@ -151,7 +153,9 @@ enum DownloadSelfCheck {
         guard store.selected == id && store.history.count == historyCount else {
             throw PerchError("Typed route changed tab selection or wrote browser history")
         }
-        print("PASS: typed downloads URL reaches the native tab title")
+        let htmlTitle = try await store.browser!.webView.evaluateJavaScript("document.querySelector('h1')?.textContent") as? String
+        guard htmlTitle == "下载记录" else { throw PerchError("Downloads route did not load the bundled HTML document") }
+        print("PASS: typed downloads URL reaches the HTML page with an isolated bridge")
         store.navigate(baseURL + "/redirect-public")
         try await waitForStore { store.downloads.records.count == 3 && store.downloads.records[0].state == .completed && store.browser?.loading == false }
         guard DownloadsPage.matches(URL(string: store.tabs.first(where: { $0.id == id })?.address ?? "")),
@@ -166,6 +170,11 @@ enum DownloadSelfCheck {
         store.browser!.goBack()
         try await waitForStore { store.tabs.first(where: { $0.id == id })?.title == "下载记录" && store.browser?.webView.isLoading == false }
         guard DownloadsPage.matches(URL(string: store.browser!.address)) else { throw PerchError("Back navigation did not restore the internal address") }
+        let returnWeb = store.browser!.webView
+        store.downloads.clear()
+        try await Task.sleep(nanoseconds: 200_000_000)
+        let rowCount = try await returnWeb.evaluateJavaScript("document.querySelectorAll('.row').length") as? Int
+        guard rowCount == 0 else { throw PerchError("Restored downloads page stopped receiving record changes") }
         let restored = Store(defaults: defaults)
         guard restored.tabs.first.map({ DownloadsPage.matches(URL(string: $0.address)) }) == true else {
             throw PerchError("Internal downloads tab did not persist: \(restored.tabs.map(\.address))")
@@ -233,15 +242,67 @@ enum DownloadSelfCheck {
         try await AISelfCheck.wait { store.tabs.contains { DownloadsPage.matches(URL(string: $0.address)) } }
         guard !popover.isVisible && store.tabs.count == 1 else { throw PerchError("Full records click did not dismiss the popover and create one tab") }
         try await Task.sleep(nanoseconds: 300_000_000)
-        guard let root = window.contentView, let fileButton = element(record.filename, in: root),
-              let fileFrame = (fileButton.value(forKey: "accessibilityFrame") as? NSValue)?.rectValue else {
-            throw PerchError("Full records page did not expose its file row")
+        let web = store.browser!.webView
+        try await AISelfCheck.wait {
+            web.url == DownloadsPage.url && !web.isLoading
         }
-        let hoverPoint = window.convertPoint(fromScreen: NSPoint(x: fileFrame.midX, y: fileFrame.midY))
-        NSApp.postEvent(NSEvent.mouseEvent(with: .mouseMoved, location: hoverPoint, modifierFlags: [],
-            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
-            context: nil, eventNumber: 1, clickCount: 0, pressure: 0)!, atStart: false)
-        try await AISelfCheck.wait { window.contentView.flatMap { element("删除下载记录", in: $0) } != nil }
+        try await Task.sleep(nanoseconds: 200_000_000)
+        func point(_ selector: String) async throws -> NSPoint {
+            let value = try await web.callAsyncJavaScript("""
+                const element = document.querySelector(selector);
+                if (!element) throw new Error('Missing element: ' + selector);
+                const rect = element.getBoundingClientRect();
+                return {x:rect.x+rect.width/2,y:rect.y+rect.height/2};
+                """, arguments: ["selector": selector], in: nil, contentWorld: .defaultClient)
+            guard let coordinates = value as? [String: Double], let x = coordinates["x"], let y = coordinates["y"] else {
+                throw PerchError("HTML element has no event target: \(selector)")
+            }
+            return web.convert(NSPoint(x: x, y: web.isFlipped ? y : web.bounds.height - y), to: nil)
+        }
+        func clickHTML(_ selector: String) async throws {
+            let location = try await point(selector)
+            NSApp.postEvent(NSEvent.mouseEvent(with: .leftMouseUp, location: location, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                context: nil, eventNumber: 1, clickCount: 1, pressure: 0)!, atStart: true)
+            window.sendEvent(NSEvent.mouseEvent(with: .leftMouseDown, location: location, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!)
+            try await Task.sleep(nanoseconds: 200_000_000)
+        }
+        window.makeKeyAndOrderFront(nil)
+        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+        try await AISelfCheck.wait { NSApp.isActive && window.isKeyWindow }
+        let rowPoint = try await web.evaluateJavaScript("""
+            const rect=document.querySelector('.row').getBoundingClientRect();
+            ({x:rect.x+2,y:rect.y+2})
+            """) as! [String: Double]
+        let hoverPoint = web.convert(NSPoint(x: rowPoint["x"]!,
+            y: web.isFlipped ? rowPoint["y"]! : web.bounds.height-rowPoint["y"]!), to: nil)
+        let root = window.contentView!
+        let hit = root.hitTest(root.superview?.convert(hoverPoint, from: nil) ?? hoverPoint)
+        print("Download pointer: web=\(web.frame), attached=\(web.window === window), key=\(window.isKeyWindow), target=\(String(describing: hit))")
+        _ = try await web.evaluateJavaScript("""
+            window.pointerEvents=[];
+            for(const type of ['mousedown','mouseup','mousemove'])
+              document.addEventListener(type,e=>pointerEvents.push([type,e.clientX,e.clientY,e.target.className]));
+            """)
+        // Synthetic mouseMoved does not reach WebKit's DOM; clicking the row padding
+        // exercises AppKit hit testing and establishes the pointer without opening a file.
+        for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+            NSApp.sendEvent(NSEvent.mouseEvent(with: type,
+                location: hoverPoint, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                context: nil, eventNumber: 1, clickCount: 1, pressure: 0)!)
+            try await Task.sleep(nanoseconds: 40_000_000)
+        }
+        try await Task.sleep(nanoseconds: 200_000_000)
+        let visible = try await web.evaluateJavaScript("getComputedStyle(document.querySelector('.actions')).opacity") as? String
+        guard visible == "1" else {
+            let trace = try await web.evaluateJavaScript("JSON.stringify({pointerEvents,hover:[...document.querySelectorAll(':hover')].map(e=>e.className)})")
+            throw PerchError("Native row click did not reveal HTML row actions: \(String(describing: trace))")
+        }
+        let missingDisabled = try await web.evaluateJavaScript("document.querySelectorAll('.file')[1].disabled") as? Bool
+        guard missingDisabled == true else { throw PerchError("Missing file can still be opened from HTML") }
         if let root = window.contentView, let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds) {
             root.cacheDisplay(in: root.bounds, to: bitmap)
             let preview = FileManager.default.temporaryDirectory.appendingPathComponent("perch-downloads-preview.png")
@@ -249,12 +310,12 @@ enum DownloadSelfCheck {
                 preview)
             print("Download UI preview: \(preview.path)")
         }
-        try await click("删除下载记录", in: window)
+        try await clickHTML(".row button[data-action='remove']")
         guard store.downloads.records.count == 1 && store.downloads.records[0].id == missing.id && record.available else {
             throw PerchError("Hovered delete button did not remove only its record")
         }
-        try await click("全部清空", in: window)
+        try await clickHTML("#clear")
         precondition(store.downloads.records.isEmpty && record.available)
-        print("PASS: isolated native toolbar, recent popover, full records tab, hover/delete and clear-all mouse event paths; downloaded file preserved")
+        print("PASS: native toolbar/popover and HTML records page pointer/delete/clear event paths; missing file disabled and downloaded file preserved")
     }
 }
