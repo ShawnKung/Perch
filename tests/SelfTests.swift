@@ -130,6 +130,7 @@ enum SelfTests {
     }
     @MainActor
     static func run() throws {
+        try DownloadSelfCheck.data()
         try BackupSelfCheck.run()
         try savedTabGroups()
         tabGroupCreation()

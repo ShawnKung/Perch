@@ -135,8 +135,7 @@ struct TabContentView: View {
                     .padding(.vertical, 8).background(Style.paper).background(WindowDragArea()).zIndex(10)
                     ZStack {
                         if let browser {
-                            WebContent(browser: browser)
-                            BrowserScreen(browser: browser)
+                            BrowserTabContent(browser: browser, downloads: store.downloads)
                         } else { HomeScreen(store: store, tabID: tabID) }
                     }.modifier(ContentTopChrome(enabled: true))
                 }
@@ -153,5 +152,20 @@ struct TabContentView: View {
         .defaultAppStorage(store.defaults)
         .foregroundStyle(Style.ink).tint(Style.accent).preferredColorScheme(.light)
         .ignoresSafeArea(.container, edges: .top)
+    }
+}
+
+struct BrowserTabContent: View {
+    @ObservedObject var browser: Browser
+    let downloads: DownloadController
+    var body: some View {
+        if DownloadsPage.matches(URL(string: browser.address)) {
+            DownloadsList(downloads: downloads)
+                .frame(maxWidth: 860).frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Style.paper)
+        } else {
+            WebContent(browser: browser)
+            BrowserScreen(browser: browser)
+        }
     }
 }

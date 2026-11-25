@@ -132,6 +132,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     let passwordBridge: PasswordBridge
     let hoverLinks: HoverLinkTracker?
     let previewDefaults: UserDefaults
+    let downloads: DownloadController?
     @Published var address = ""
     @Published var title = ""
     @Published var loading = false
@@ -177,6 +178,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         webView.find(findQuery, configuration: configuration) { _ in }
     }
     var onVisit: ((String, String) -> Void)?
+    var onTitleChanged: ((String) -> Void)?
     var onHomeChanged: ((Bool) -> Void)?
     var onNewTab: ((URL, Bool) -> Void)?
     var onOpenInPerch: ((URL) -> Void)?
@@ -198,7 +200,9 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     }
 
     init(url: URL, userAgent: String? = nil, dataStore: WKWebsiteDataStore? = nil,
-         trackHoverLinks: Bool = false, previewDefaults: UserDefaults = .standard, startsAtHome: Bool = false) {
+         trackHoverLinks: Bool = false, previewDefaults: UserDefaults = .standard, startsAtHome: Bool = false,
+         downloads: DownloadController? = nil) {
+        self.downloads = downloads
         self.startsAtHome = startsAtHome
         self.previewDefaults = previewDefaults
         let tracker = trackHoverLinks ? HoverLinkTracker() : nil
@@ -206,6 +210,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         let bridge = PasswordBridge()
         passwordBridge = bridge
         let configuration = WKWebViewConfiguration()
+        configuration.setURLSchemeHandler(DownloadsSchemeHandler(), forURLScheme: "perch")
         if startsAtHome { configuration.setURLSchemeHandler(HomeHistoryPage(), forURLScheme: "perch-home") }
         configuration.websiteDataStore = dataStore ?? .default()
         configuration.userContentController.add(selectionTracker, contentWorld: .defaultClient, name: "perchSelection")
@@ -230,6 +235,15 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         webView.allowsMagnification = true
         webView.customUserAgent = userAgent
         observations = [
+            webView.observe(\.title, options: [.new]) { [weak self] view, _ in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.title = view.title ?? ""
+                    if !view.isLoading && view.url == view.backForwardList.currentItem?.url && !self.isHome {
+                        self.onTitleChanged?(self.title)
+                    }
+                }
+            },
             webView.observe(\.isLoading, options: [.new]) { [weak self] view, _ in
                 DispatchQueue.main.async { self?.syncNavigationState() }
             },
@@ -310,7 +324,8 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         case "back": syncNavigationState(); return canGoBack
         case "forward": syncNavigationState(); return canGoForward
         case "stop": return webView.isLoading
-        case "copy", "bookmark", "reload": return URLInput.parse(values[1], search: false) != nil
+        case "copy", "reload": return URLInput.parseNavigation(values[1], search: false) != nil
+        case "bookmark": return URLInput.parse(values[1], search: false) != nil
         case "save": return webView.url != nil && !isHome
         case "find": return true
         default: return false
@@ -523,6 +538,8 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         guard let url = navigationAction.request.url,
               ["http", "https", "about"].contains(url.scheme?.lowercased() ?? "") ||
+                (downloads != nil && ["blob", "data"].contains(url.scheme?.lowercased() ?? "")) ||
+                DownloadsPage.matches(url) ||
                 (startsAtHome && url == HomeHistoryPage.url && navigationAction.targetFrame?.isMainFrame == true) else {
             error = "此链接使用其他应用的专用协议，Perch 暂不支持打开。"
             decisionHandler(.cancel)
@@ -533,7 +550,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
             decisionHandler(.cancel)
             return
         }
-        decisionHandler(.allow)
+        decisionHandler(navigationAction.shouldPerformDownload && downloads != nil ? .download : .allow)
     }
 
     private func opensInBackground(_ action: WKNavigationAction) -> Bool {
@@ -543,12 +560,32 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse,
                  decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
-        guard navigationResponse.canShowMIMEType else {
-            error = "此内容需要下载，Perch 暂不支持下载。"
+        let disposition = (navigationResponse.response as? HTTPURLResponse)?
+            .value(forHTTPHeaderField: "Content-Disposition")?
+            .components(separatedBy: ";").first?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if navigationResponse.canShowMIMEType && disposition != "attachment" { decisionHandler(.allow) }
+        else if downloads != nil { decisionHandler(.download) }
+        else {
+            error = "此内容需要下载，请在 Perch 标签页中打开。"
             decisionHandler(.cancel)
-            return
         }
-        decisionHandler(.allow)
+    }
+
+    func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
+        downloads?.receive(download)
+        if navigationAction.targetFrame?.isMainFrame == true { restoreAfterDownload() }
+    }
+    func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
+        downloads?.receive(download)
+        if navigationResponse.isForMainFrame { restoreAfterDownload() }
+    }
+    private func restoreAfterDownload() {
+        // WebKit may report a policy interruption after handing this navigation to WKDownload.
+        activeNavigation = nil
+        pendingHistoryItem = nil; provisionalFailure = false
+        let document = webView.backForwardList.currentItem?.url
+        address = displayAddress(document); error = nil; syncNavigationState()
+        onHomeChanged?(document == nil || (startsAtHome && document == HomeHistoryPage.url))
     }
 
     // shortcut: links open in tabs; OAuth flows requiring window.opener need a dedicated popup implementation.
@@ -601,6 +638,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
 
 @MainActor
 final class Store: ObservableObject {
+    let downloads: DownloadController
     lazy var linkPreview = LinkPreviewController(store: self)
     lazy var bookmarkEditor = BookmarkEditorController()
     @Published var bookmarkEditRequest: BookmarkEditRequest?
@@ -751,8 +789,9 @@ final class Store: ObservableObject {
     var selectionChanged: ((UUID?, UUID?) -> Void)?
     var homeAddressDrafts: [UUID: [Bool: String]] = [:]
 
-    init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults = .standard, downloadDirectory: URL? = nil) {
         self.defaults = defaults
+        downloads = DownloadController(defaults: defaults, directory: downloadDirectory)
         ai = AIController(defaults: defaults)
         passwords = PasswordVault(memoryOnly: defaults !== UserDefaults.standard)
         settings = BrowserSettings()
@@ -843,15 +882,16 @@ final class Store: ObservableObject {
         if select, selected != id, let groupID = tab.groupID, let index = tabGroups.firstIndex(where: { $0.id == groupID }),
            tabGroups[index].collapsed { tabGroups[index].collapsed = false }
         if icons[id] == nil { icons[id] = FaviconCache.image(for: tab.address, defaults: defaults) }
-        if browsers[id] == nil, let url = URLInput.parse(tab.address, search: false) {
+        if browsers[id] == nil, let url = URLInput.parseNavigation(tab.address, search: false) {
             let view = Browser(url: url, userAgent: settings.userAgent,
                                dataStore: defaults === UserDefaults.standard ? .default() : .nonPersistent(),
-                               trackHoverLinks: true, previewDefaults: defaults, startsAtHome: startsAtHome)
+                               trackHoverLinks: true, previewDefaults: defaults, startsAtHome: startsAtHome, downloads: downloads)
             view.onHomeChanged = { [weak self, weak view] home in
                 guard let self, let view, let index = self.tabs.firstIndex(where: { $0.id == id }),
                       self.tabs[index].chatOwner == nil else { return }
                 self.tabs[index].address = home ? "" : view.address
-                self.tabs[index].title = home ? "新标签页" : URL(string: view.address)?.host ?? view.address
+                self.tabs[index].title = home ? "新标签页" :
+                    (view.title.isEmpty ? URL(string: view.address)?.host ?? view.address : view.title)
                 self.persistTabs()
             }
             linkPreview.start()
@@ -862,6 +902,16 @@ final class Store: ObservableObject {
                 self.tabs[index].title = title.isEmpty ? URL(string: address)?.host ?? address : title
                 self.persistTabs()
                 self.recordVisit(title: title, address: address)
+            }
+            view.onTitleChanged = { [weak self, weak view] title in
+                guard let self, let view, !title.isEmpty,
+                      let index = self.tabs.firstIndex(where: { $0.id == id && $0.address == view.address }) else { return }
+                self.tabs[index].title = title
+                self.persistTabs()
+                if self.settings.historyRecordingEnabled, let visit = self.history.firstIndex(where: { $0.address == view.address }) {
+                    self.history[visit].title = title
+                    self.persist(self.history, key: "history")
+                }
             }
             view.onNewTab = { [weak self] url, background in
                 self?.newTab(address: url.absoluteString, after: id, select: !background)
@@ -928,6 +978,11 @@ final class Store: ObservableObject {
         persistTabs()
     }
 
+    func openDownloads() {
+        if let tab = tabs.first(where: { DownloadsPage.matches(URL(string: $0.address)) }) { activate(tab.id) }
+        else { newTab(address: DownloadsPage.url.absoluteString, title: "下载记录") }
+    }
+
     @Published var chatHistoryVisible = true
     var chatOwner: UUID {
         let page = tabs.first(where: { $0.id == selected })
@@ -989,7 +1044,7 @@ final class Store: ObservableObject {
         }
         else if let index = tabs.firstIndex(where: { $0.id == selected && $0.address.isEmpty && $0.chatOwner == nil }) {
             if let browser = browsers.removeValue(forKey: tabs[index].id) {
-                browser.onHomeChanged = nil; browser.onVisit = nil
+                browser.onHomeChanged = nil; browser.onVisit = nil; browser.onTitleChanged = nil
                 browser.passwordBridge.dismiss(); browser.favicon.reset(); browser.webView.stopLoading()
                 browser.webView.removeFromSuperview()
             }
@@ -1415,7 +1470,7 @@ final class Store: ObservableObject {
     }
 
     func navigate(_ text: String) {
-        guard let url = URLInput.parse(text, searchTemplate: settings.searchURL) else {
+        guard let url = URLInput.parseNavigation(text, searchTemplate: settings.searchURL) else {
             notice = "请输入有效的 http / https 网址，或输入关键词搜索。"
             return
         }
@@ -2241,13 +2296,15 @@ struct WindowTools: View {
             GlyphButton(symbol: pinned ? "pin.fill" : "pin", label: "窗口置顶", active: pinned, size: 28) {
                 store.pinned.toggle(); store.changeWindow?()
             }
+            DownloadToolbarButton(downloads: store.downloads) { store.openDownloads() }
             Menu {
                 Button("书签管理") { store.openBookmarks() }
                 Button("历史记录") { store.openBookmarks(scope: .history) }
+                Button("下载记录") { store.openDownloads() }
                 Button("密码管理") { store.library = .passwords }
                 Divider()
                 Button("在新标签页打开") {
-                    if let url = URLInput.parse(store.browser?.address ?? "", search: false) { store.newTab(address: url.absoluteString) }
+                    if let url = URLInput.parseNavigation(store.browser?.address ?? "", search: false) { store.newTab(address: url.absoluteString) }
                 }.disabled(!hasBrowser)
                 Divider()
                 Button("回到首页") { store.selected = nil }
@@ -3124,6 +3181,14 @@ if CommandLine.arguments.contains("--update-self-test") {
     Task { @MainActor in
         setbuf(stdout, nil)
         do { try await WebTabSelfCheck.run(); exit(0) }
+        catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
+    }
+    app.run()
+} else if let index = CommandLine.arguments.firstIndex(of: "--download-self-test"), CommandLine.arguments.count > index + 1 {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    Task { @MainActor in
+        do { try await DownloadSelfCheck.run(baseURL: CommandLine.arguments[index + 1]); exit(0) }
         catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
     }
     app.run()

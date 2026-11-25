@@ -171,7 +171,7 @@ struct TabGroup: Identifiable, Codable, Equatable {
             guard !members.isEmpty, count <= 50000 else { throw PerchError("保存的标签组为空或标签过多。") }
             for tab in members {
                 guard tabIDs.insert(tab.id).inserted, !tab.pinned, tab.groupID == group.id,
-                      tab.address.isEmpty || tab.address == "about:blank" || URLInput.parse(tab.address, search: false) != nil else {
+                      tab.address.isEmpty || tab.address == "about:blank" || URLInput.parseNavigation(tab.address, search: false) != nil else {
                     throw PerchError("保存的标签 ID、网址或分组归属无效。")
                 }
             }
