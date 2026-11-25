@@ -3,6 +3,13 @@ import WebKit
 
 // Only bundled documents receive a bridge; arbitrary websites never own these actions.
 enum InternalPage {
+    private final class Handler: NSObject, WKScriptMessageHandler {
+        weak var target: WKScriptMessageHandler?
+        init(_ target: WKScriptMessageHandler) { self.target = target }
+        func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            target?.userContentController(userContentController, didReceive: message)
+        }
+    }
     static func asset(_ name: String) -> String {
         guard let url = Bundle.main.resourceURL?.appendingPathComponent("internal/\(name)"),
               let text = try? String(contentsOf: url, encoding: .utf8) else { return "" }
@@ -14,7 +21,7 @@ enum InternalPage {
         return Data(html.replacingOccurrences(of: "/* internal.css */", with: asset("internal.css")).utf8)
     }
     static func install(_ name: String, handler: WKScriptMessageHandler, in configuration: WKWebViewConfiguration) {
-        configuration.userContentController.add(handler, contentWorld: .defaultClient, name: "perchInternal")
+        configuration.userContentController.add(Handler(handler), contentWorld: .defaultClient, name: "perchInternal")
         configuration.userContentController.addUserScript(WKUserScript(source: asset("\(name).js"),
             injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: .defaultClient))
     }

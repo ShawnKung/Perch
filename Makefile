@@ -35,6 +35,7 @@ verify: build
 test: verify
 	@"$(BIN)" --self-test
 	@"$(BIN)" --update-self-test
+	@"$(BIN)" --home-page-state-self-test
 
 check: test
 	@"$(BIN)" --ai-typography-self-test

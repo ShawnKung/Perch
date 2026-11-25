@@ -6,6 +6,7 @@ import Combine
 final class TabContentState: ObservableObject {
     let store: Store
     let tabID: UUID
+    lazy var homeController = HomePageController(store: store, tabID: tabID)
     private var changes: AnyCancellable?
     private var selection: AnyCancellable?
     init(store: Store, tabID: UUID) {
@@ -74,6 +75,8 @@ final class TabContentsController: NSTabViewController {
                 pages[previous] = nil
                 item.identifier = selected
                 pages[selected] = item
+                content.page.homeController = host.rootView.page.homeController
+                content.page.homeController.tabID = selected
                 host.rootView = content
             } else {
                 let host = NSHostingController(rootView: content)
@@ -97,6 +100,11 @@ final class TabContentsController: NSTabViewController {
     }
 
     private func hasNoRetainedInputOrScroll(_ view: NSView) -> Bool {
+        if let home = view as? HomePageWebView {
+            // DOM updates are asynchronous; the native responder protects pending input too.
+            if home.controller?.pristine != true ||
+                (home.window?.firstResponder as? NSView)?.isDescendant(of: home) == true { return false }
+        }
         if let field = view as? AddressTextField.Field {
             let editor = field.currentEditor() as? NSTextView
             if !field.stringValue.isEmpty || editor?.string.isEmpty == false || editor?.hasMarkedText() == true {
@@ -136,7 +144,7 @@ struct TabContentView: View {
                     ZStack {
                         if let browser {
                             BrowserTabContent(browser: browser)
-                        } else { HomeScreen(store: store, tabID: tabID) }
+                        } else { HomeScreen(page: page) }
                     }.modifier(ContentTopChrome(enabled: true))
                 }
                 .overlayPreferenceValue(BookmarkButtonAnchor.self) { anchor in

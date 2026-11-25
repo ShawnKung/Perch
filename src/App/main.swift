@@ -2151,98 +2151,6 @@ struct BrowserFindBar: View {
     }
 }
 
-struct HomeScreen: View {
-    @ObservedObject private var theme = PerchTheme.shared
-    let store: Store
-    let tabID: UUID
-    private let shortcuts: [Site]
-    private let suggestionRevision: Int
-    private let icons: [UUID: NSImage]
-    init(store: Store, tabID: UUID) {
-        self.store = store; self.tabID = tabID
-        shortcuts = store.homeShortcuts
-        suggestionRevision = store.suggestionRevision
-        icons = store.icons
-    }
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                HStack {
-                    Image(systemName: "rectangle.topthird.inset.filled")
-                        .font(.system(size: 27)).foregroundStyle(Style.accent)
-                        .frame(width: 52, height: 52).background(Style.mint, in: RoundedRectangle(cornerRadius: 16))
-                    Spacer()
-                    Text(Date(), format: .dateTime.month(.wide).day().weekday(.wide))
-                        .font(.system(size: 12)).foregroundStyle(Style.muted)
-                }
-                VStack(alignment: .leading, spacing: 13) {
-                    Text("把常用网页，\n放在手边。")
-                        .font(.system(size: 32, weight: .semibold, design: .rounded))
-                        .tracking(-1).lineSpacing(3)
-                    Text("少一次切换，多一点专注。").font(.system(size: 14)).foregroundStyle(Style.muted)
-                }
-                HStack(spacing: 10) {
-                    Image(systemName: "magnifyingglass").foregroundStyle(Style.muted)
-                    AddressEntry(store: store, focusShortcut: false, homeTab: tabID)
-                        .id(tabID)
-                }.padding(14).background(.white, in: RoundedRectangle(cornerRadius: 13))
-                    .overlay(RoundedRectangle(cornerRadius: 13).stroke(Style.line, lineWidth: 1))
-                    .zIndex(20)
-                Button { store.openChat() } label: {
-                    HStack(spacing: 12) {
-                        Image(systemName: "sparkles").font(.system(size: 23)).foregroundStyle(Style.accent)
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("打开 Chat").font(.system(size: 15, weight: .semibold))
-                            Text("提问、引用标签页，继续之前的对话").font(.system(size: 12)).foregroundStyle(Style.muted)
-                        }
-                        Spacer()
-                        Image(systemName: "arrow.up.right").foregroundStyle(Style.muted)
-                    }.padding(18).background(.white, in: RoundedRectangle(cornerRadius: 14))
-                        .overlay(RoundedRectangle(cornerRadius: 14).stroke(Style.line))
-                }.buttonStyle(.plain)
-
-                Group {
-                    VStack(alignment: .leading, spacing: 14) {
-                        HStack {
-                            Text("快捷入口").font(.system(size: 13, weight: .semibold))
-                            Spacer()
-                            Button { store.openBookmarks(scope: .all) } label: {
-                                Label("全部书签", systemImage: "bookmark")
-                            }.buttonStyle(.plain).font(.system(size: 12)).foregroundStyle(Style.accent)
-                                .accessibilityLabel("全部书签")
-                            Button { store.adding = true } label: { Label("添加", systemImage: "plus") }
-                                .buttonStyle(.plain).font(.system(size: 12)).foregroundStyle(Style.accent)
-                        }
-                        HomeShortcutGrid(store: store, sites: shortcuts, tabID: tabID) { site in
-                            Button { store.open(site) } label: {
-                                HStack(spacing: 12) {
-                                    Group {
-                                        if let icon = store.cachedFavicon(site.address) {
-                                            Image(nsImage: icon).resizable().scaledToFit()
-                                                .frame(width: 20, height: 20)
-                                        } else {
-                                            Image(systemName: site.symbol).font(.system(size: 20))
-                                                .foregroundStyle(Style.accent)
-                                        }
-                                    }.frame(width: 32).accessibilityHidden(true)
-                                    VStack(alignment: .leading, spacing: 5) {
-                                        Text(site.title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
-                                        Text(URL(string: site.address)?.host ?? site.address)
-                                            .font(.system(size: 10)).foregroundStyle(Style.muted).lineLimit(1)
-                                    }
-                                    Spacer(minLength: 0)
-                                }.padding(17).frame(maxWidth: .infinity, alignment: .leading)
-                                    .background(.white, in: RoundedRectangle(cornerRadius: 12))
-                            }.buttonStyle(.plain)
-                                .background(BookmarkEditorAnchor(store: store, ownerID: site.id))
-                        }.id(tabID)
-                    }
-                }
-            }.padding(28).frame(maxWidth: 760, alignment: .leading).frame(maxWidth: .infinity)
-        }.background(Style.paper)
-    }
-}
-
 struct AddSite: View {
     @ObservedObject private var theme = PerchTheme.shared
     @ObservedObject var store: Store
@@ -2646,7 +2554,7 @@ final class Panel: NSPanel {
     var statusItemPressed: (() -> Bool)?
 
     @discardableResult override func makeFirstResponder(_ responder: NSResponder?) -> Bool {
-        if !restoringTabFocus, responder !== firstResponder, firstResponder is NSTextView {
+        if !restoringTabFocus, responder !== firstResponder, firstResponder is NSView {
             captureFocus(for: selectedTab)
         }
         return super.makeFirstResponder(responder)
@@ -2729,6 +2637,11 @@ final class Panel: NSPanel {
         restoringTabFocus = true
         defer { restoringTabFocus = false }
         guard makeFirstResponder(target) else { return }
+        var ancestor: NSView? = target
+        while let view = ancestor {
+            if let home = view as? HomePageWebView { home.controller?.restoreFocus(); break }
+            ancestor = view.superview
+        }
         guard let range = snapshot.selection,
               let editor = ((target as? NSTextField)?.currentEditor() as? NSTextView) ?? target as? NSTextView else { return }
         if let identifier = snapshot.fieldIdentifier, let text = snapshot.text, editor.string != text {
@@ -3179,6 +3092,15 @@ if CommandLine.arguments.contains("--update-self-test") {
     Task { @MainActor in
         setbuf(stdout, nil)
         do { try await ScrollSelfCheck.run(); exit(0) }
+        catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
+    }
+    app.run()
+} else if CommandLine.arguments.contains("--home-page-state-self-test") {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    Task { @MainActor in
+        setbuf(stdout, nil)
+        do { try await HomePageSelfCheck.state(); exit(0) }
         catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
     }
     app.run()
