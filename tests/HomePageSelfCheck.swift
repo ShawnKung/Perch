@@ -149,6 +149,14 @@ enum HomePageSelfCheck {
         for throughTable in [true,false] {
             let web = try await fixture.home()
             try await fixture.type("首页草稿 fixture", web: web)
+            if throughTable {
+                let image = try await web.takeSnapshot(configuration: nil)
+                let preview = FileManager.default.temporaryDirectory.appendingPathComponent("perch-home-focused.png")
+                if let data = image.tiffRepresentation, let bitmap = NSBitmapImageRep(data: data) {
+                    try bitmap.representation(using: .png, properties: [:])?.write(to: preview)
+                    print("Home focus preview: \(preview.path)")
+                }
+            }
             _ = try await web.evaluateJavaScript("document.getElementById('search').setSelectionRange(2,3)")
             if throughTable { panel.makeFirstResponder(table) }
             store.activate(other)
@@ -191,16 +199,29 @@ enum HomePageSelfCheck {
         let fixture = HomePageFixture(store: store,panel: panel), web = try await fixture.home()
         try await fixture.type("输入法 fixture",web: web)
         guard let client = panel.firstResponder as? NSTextInputClient else { throw PerchError("Search text input client missing") }
+        _ = try await web.evaluateJavaScript("""
+            window.homeInputFixture={composing:false};
+            document.getElementById('search').addEventListener('compositionstart',()=>homeInputFixture.composing=true);
+            document.getElementById('search').addEventListener('compositionend',()=>homeInputFixture.composing=false);
+            """)
         client.setMarkedText("ni", selectedRange: NSRange(location: 2,length: 0), replacementRange: NSRange(location: NSNotFound,length: 0))
+        // WKWebView can report hasMarkedText=false while native composition events are active.
+        guard try await web.evaluateJavaScript("homeInputFixture.composing") as? Bool == true else {
+            throw PerchError("Native WebKit composition did not start")
+        }
         let sites = store.sites; store.sites = sites
         try await Task.sleep(nanoseconds: 100_000_000)
-        guard client.hasMarkedText() else { throw PerchError("Store refresh discarded the native WebKit composition") }
+        guard try await web.evaluateJavaScript("homeInputFixture.composing") as? Bool == true else {
+            throw PerchError("Store refresh discarded the native WebKit composition")
+        }
         let before = store.homeAddressDrafts[store.selected!]?[false]
         try await fixture.key(36,"\r")
         guard store.browser == nil, store.homeAddressDrafts[store.selected!]?[false] == before else {
             throw PerchError("Composition Return submitted or published uncommitted input")
         }
-        if client.hasMarkedText() { client.insertText("你",replacementRange:NSRange(location:NSNotFound,length:0)) }
+        if try await web.evaluateJavaScript("homeInputFixture.composing") as? Bool == true {
+            client.insertText("你",replacementRange:NSRange(location:NSNotFound,length:0))
+        }
         try await fixture.type("Home fixture",web: web)
         try await Task.sleep(nanoseconds: 200_000_000)
         let count = try await web.evaluateJavaScript("document.querySelectorAll('#suggestions button').length") as? Int ?? 0
@@ -232,12 +253,22 @@ enum HomePageSelfCheck {
         let ids = store.homeShortcuts.map(\.id)
         let start = try await fixture.point(".shortcut", web: web)
         let target = try await fixture.point(".shortcut:nth-child(4)", web: web)
+        let expected = [ids[1],ids[2],ids[3],ids[0],ids[4],ids[5]]
         fixture.mouse(.leftMouseDown, at: start)
         try await Task.sleep(nanoseconds: 50_000_000)
         fixture.mouse(.leftMouseDragged, at: target)
+        // Sample while the 180ms animations are running, rather than only after they settle.
+        for sample in 0..<12 {
+            try await Task.sleep(nanoseconds: 12_000_000)
+            let liveOrder = try await web.evaluateJavaScript("Array.from(document.querySelectorAll('#shortcuts .shortcut')).map(e=>e.dataset.id)") as? [String]
+            guard liveOrder == expected.map(\.uuidString), store.homeShortcutOrder.isEmpty else {
+                throw PerchError("Small pointer moves oscillated the homepage order during animation at sample \(sample): \(String(describing: liveOrder))")
+            }
+            fixture.mouse(.leftMouseDragged, at: NSPoint(x: target.x + CGFloat(sample % 2), y: target.y))
+        }
+        print("PASS: native continuous one-point pointer moves retain the target slot throughout homepage reorder animations")
         try await Task.sleep(nanoseconds: 250_000_000)
         let preview = try await web.evaluateJavaScript("Array.from(document.querySelectorAll('#shortcuts .shortcut')).map(e=>e.dataset.id)") as? [String]
-        let expected = [ids[1],ids[2],ids[3],ids[0],ids[4],ids[5]]
         guard preview == expected.map(\.uuidString), store.homeShortcutOrder.isEmpty else {
             throw PerchError("HTML drag did not preview across rows without saving: \(String(describing: preview))")
         }

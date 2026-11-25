@@ -73,13 +73,15 @@
     if (rememberedFocus) {const start=input.selectionStart,end=input.selectionEnd;input.focus({preventScroll:true});input.setSelectionRange(start,end);}
   };
   function arrange(ids) {
+    if(ids.length===grid.children.length && ids.every((id,index)=>grid.children[index].dataset.id===id))return;
     const positions=new Map(Array.from(grid.children).map(card=>[card,card.getBoundingClientRect()]));
+    for(const card of grid.children)cards.get(card.dataset.id)?.animation?.cancel();
     ids.forEach((id,index)=>{const card=cards.get(id)?.card;if(card && grid.children[index]!==card)grid.insertBefore(card,grid.children[index]||null);});
     if(!matchMedia('(prefers-reduced-motion: reduce)').matches) {
       for(const card of grid.children) {
         const before=positions.get(card);if(!before)continue;
         const after=card.getBoundingClientRect(),x=before.x-after.x,y=before.y-after.y;
-        if(x || y){cards.get(card.dataset.id)?.animation?.cancel();const animation=card.animate([{transform:`translate(${x}px,${y}px)`},{transform:'none'}],{duration:180,easing:'ease-out'});cards.get(card.dataset.id).animation=animation;}
+        if(x || y){const animation=card.animate([{transform:`translate(${x}px,${y}px)`},{transform:'none'}],{duration:180,easing:'ease-out'});cards.get(card.dataset.id).animation=animation;}
       }
     }
     if(drag)drag.card.setPointerCapture(drag.pointer);
@@ -114,9 +116,10 @@
     drag.ghost.style.left=(event.clientX-drag.offsetX)+'px';drag.ghost.style.top=(event.clientY-drag.offsetY)+'px';
     const rect=grid.getBoundingClientRect();
     if (event.clientX<rect.left || event.clientX>rect.right || event.clientY<rect.top || event.clientY>rect.bottom) {drag.preview=drag.original.slice();arrange(drag.preview);return;}
-    const slots=Array.from(grid.children).map(card=>card.getBoundingClientRect());
+    // Layout offsets stay fixed while animation transforms move the visible cards.
+    const slots=Array.from(grid.children).map(card=>({x:rect.left+card.offsetLeft+card.offsetWidth/2,y:rect.top+card.offsetTop+card.offsetHeight/2}));
     let target=0,distance=Infinity;
-    slots.forEach((slot,i)=>{const value=Math.hypot(slot.x+slot.width/2-event.clientX,slot.y+slot.height/2-event.clientY);if(value<distance){distance=value;target=i;}});
+    slots.forEach((slot,i)=>{const value=Math.hypot(slot.x-event.clientX,slot.y-event.clientY);if(value<distance){distance=value;target=i;}});
     const next=drag.preview.slice();next.splice(next.indexOf(drag.id),1);next.splice(target,0,drag.id);drag.preview=next;arrange(next);
   });
   grid.addEventListener('pointerup',event=>{

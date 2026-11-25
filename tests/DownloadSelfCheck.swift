@@ -193,11 +193,14 @@ enum DownloadSelfCheck {
         missing.destination = record.destination!.deletingLastPathComponent().appendingPathComponent("missing.bin")
         defaults.set(try JSONEncoder().encode([record, missing]), forKey: "downloads")
         let store = Store(defaults: defaults)
-        let window = NSWindow(contentRect: NSRect(x: 120, y: 120, width: 1100, height: 750),
+        store.newTab()
+        let homeID = store.selected!
+        let window = Panel(contentRect: NSRect(x: 120, y: 120, width: 1100, height: 750),
                               styleMask: [.titled, .resizable], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         window.acceptsMouseMovedEvents = true
-        window.contentView = NSHostingView(rootView: RootView(store: store).defaultAppStorage(defaults))
+        window.contentView = RootHostingView(rootView: RootView(store: store).defaultAppStorage(defaults))
+        window.bindTabFocus(to: store)
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         defer { window.close() }
@@ -238,15 +241,79 @@ enum DownloadSelfCheck {
         guard let popover = NSApp.windows.first(where: {
             $0 !== window && $0.isVisible && $0.contentView.flatMap { element("完整的下载记录", in: $0) } != nil
         }) else { throw PerchError("Download toolbar did not present recent records") }
+        func hoverRegion(_ view: NSView) -> TabGroupMenuHoverView? {
+            if let region = view as? TabGroupMenuHoverView, !region.isHiddenOrHasHiddenAncestor,
+               region.bounds.width > 100, region.bounds.height > 40 { return region }
+            return view.subviews.lazy.compactMap(hoverRegion).first
+        }
+        guard let region = popover.contentView.flatMap(hoverRegion) else { throw PerchError("Recent downloads have no native hover region") }
+        func nativeMove(_ point: NSPoint, in target: NSWindow) {
+            NSApp.sendEvent(NSEvent.mouseEvent(with: .mouseMoved, location: point, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: target.windowNumber,
+                context: nil, eventNumber: 1, clickCount: 0, pressure: 0)!)
+        }
+        let regionPoint = region.convert(NSPoint(x: region.bounds.midX, y: region.bounds.midY), to: nil)
+        nativeMove(regionPoint, in: popover)
+        try await AISelfCheck.wait { region.hovered }
+        nativeMove(NSPoint(x: -10, y: -10), in: popover)
+        try await AISelfCheck.wait { !region.hovered }
+        print("PASS: recent download row hover enters and leaves through native window events")
         try await click("完整的下载记录", in: popover)
         try await AISelfCheck.wait { store.tabs.contains { DownloadsPage.matches(URL(string: $0.address)) } }
-        guard !popover.isVisible && store.tabs.count == 1 else { throw PerchError("Full records click did not dismiss the popover and create one tab") }
+        guard !popover.isVisible && store.tabs.count == 2 else { throw PerchError("Full records click did not dismiss the popover and create one tab") }
         try await Task.sleep(nanoseconds: 300_000_000)
         let web = store.browser!.webView
         try await AISelfCheck.wait {
             web.url == DownloadsPage.url && !web.isLoading
         }
         try await Task.sleep(nanoseconds: 200_000_000)
+        let downloadsID = store.selected!
+        func addressField(_ view: NSView) -> NSTextField? {
+            if let field = view as? AddressTextField.Field, field.ownerTab == downloadsID,
+               !field.isHiddenOrHasHiddenAncestor { return field }
+            return view.subviews.lazy.compactMap(addressField).first
+        }
+        func verifyPageFocus() throws {
+            guard window.contentView.flatMap(addressField)?.currentEditor() == nil,
+                  store.pendingAddressFocus == nil else {
+                throw PerchError("Opening downloads focused or selected the toolbar address: \(String(describing: window.firstResponder))")
+            }
+        }
+        try verifyPageFocus()
+        store.activate(homeID)
+        try await Task.sleep(nanoseconds: 300_000_000)
+        window.makeKeyAndOrderFront(nil)
+        try await click("近期下载任务", in: window)
+        guard let reusedPopover = NSApp.windows.first(where: {
+            $0 !== window && $0.isVisible && $0.contentView.flatMap { element("完整的下载记录", in: $0) } != nil
+        }) else { throw PerchError("Downloads reuse did not present recent records") }
+        try await click("完整的下载记录", in: reusedPopover)
+        try await Task.sleep(nanoseconds: 300_000_000)
+        guard store.selected == downloadsID && store.tabs.count == 2 else { throw PerchError("Downloads reuse created another tab") }
+        try verifyPageFocus()
+        window.makeKeyAndOrderFront(nil)
+        let delegate = AppDelegate(store: store)
+        delegate.panel = window
+        delegate.installMenu()
+        let commandL = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .command,
+            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+            context: nil, characters: "l", charactersIgnoringModifiers: "l", isARepeat: false, keyCode: 37)!
+        guard NSApp.mainMenu?.performKeyEquivalent(with: commandL) == true else { throw PerchError("Command-L was not handled") }
+        try await Task.sleep(nanoseconds: 200_000_000)
+        guard let field = window.contentView.flatMap(addressField), let editor = field.currentEditor() as? NSTextView,
+              window.firstResponder === editor,
+              editor.selectedRange() == NSRange(location: 0, length: editor.string.utf16.count),
+              !editor.string.isEmpty else { throw PerchError("Explicit Command-L no longer selects the downloads address") }
+        editor.setSelectedRange(NSRange(location: 2, length: 3))
+        store.activate(homeID)
+        try await Task.sleep(nanoseconds: 300_000_000)
+        store.activate(downloadsID)
+        try await Task.sleep(nanoseconds: 300_000_000)
+        guard let returned = window.contentView.flatMap(addressField)?.currentEditor() as? NSTextView,
+              returned === window.firstResponder, returned.selectedRange() == NSRange(location: 2, length: 3) else {
+            throw PerchError("Downloads address selection was not restored after an explicit edit")
+        }
+        print("PASS: native downloads popover clicks create/reuse a tab without address focus; Command-L selects the address and tab switching retains an explicit selection")
         func point(_ selector: String) async throws -> NSPoint {
             let value = try await web.callAsyncJavaScript("""
                 const element = document.querySelector(selector);
@@ -286,21 +353,36 @@ enum DownloadSelfCheck {
             for(const type of ['mousedown','mouseup','mousemove'])
               document.addEventListener(type,e=>pointerEvents.push([type,e.clientX,e.clientY,e.target.className]));
             """)
-        // Synthetic mouseMoved does not reach WebKit's DOM; clicking the row padding
-        // exercises AppKit hit testing and establishes the pointer without opening a file.
-        for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
-            NSApp.sendEvent(NSEvent.mouseEvent(with: type,
-                location: hoverPoint, modifierFlags: [],
+        func trackedMove(_ location: NSPoint) async throws {
+            guard let hit = root.hitTest(root.superview?.convert(location, from: nil) ?? location),
+                  hit === web || hit.isDescendant(of: web) else { throw PerchError("HTML hover missed WebKit") }
+            let event = NSEvent.mouseEvent(with: .mouseMoved, location: location, modifierFlags: [],
                 timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
-                context: nil, eventNumber: 1, clickCount: 1, pressure: 0)!)
-            try await Task.sleep(nanoseconds: 40_000_000)
+                context: nil, eventNumber: 1, clickCount: 0, pressure: 0)!
+            // AppKit derives tracking delivery from the system cursor; dispatch its owners in this isolated fixture.
+            var seen = Set<ObjectIdentifier>()
+            for area in web.trackingAreas {
+                guard let owner = area.owner as? NSObject, seen.insert(ObjectIdentifier(owner)).inserted else { continue }
+                let selector = #selector(NSResponder.mouseMoved(with:))
+                if owner.responds(to: selector) { owner.perform(selector, with: event) }
+            }
+            try await Task.sleep(nanoseconds: 200_000_000)
         }
-        try await Task.sleep(nanoseconds: 200_000_000)
+        let headingPoint = try await point("h1")
+        try await trackedMove(headingPoint)
+        let hidden = try await web.evaluateJavaScript("getComputedStyle(document.querySelector('.actions')).opacity") as? String
+        guard hidden == "0" else { throw PerchError("HTML actions did not hide outside the row") }
+        try await trackedMove(hoverPoint)
         let visible = try await web.evaluateJavaScript("getComputedStyle(document.querySelector('.actions')).opacity") as? String
         guard visible == "1" else {
             let trace = try await web.evaluateJavaScript("JSON.stringify({pointerEvents,hover:[...document.querySelectorAll(':hover')].map(e=>e.className)})")
-            throw PerchError("Native row click did not reveal HTML row actions: \(String(describing: trace))")
+            throw PerchError("Native tracked mouse entry did not reveal HTML row actions: \(String(describing: trace))")
         }
+        try await trackedMove(headingPoint)
+        let exited = try await web.evaluateJavaScript("getComputedStyle(document.querySelector('.actions')).opacity") as? String
+        guard exited == "0" else { throw PerchError("HTML actions did not hide after tracked mouse exit") }
+        try await trackedMove(hoverPoint)
+        print("PASS: native WebKit tracking events reveal and hide HTML row actions without clicking or moving the system pointer")
         let missingDisabled = try await web.evaluateJavaScript("document.querySelectorAll('.file')[1].disabled") as? Bool
         guard missingDisabled == true else { throw PerchError("Missing file can still be opened from HTML") }
         if let root = window.contentView, let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds) {

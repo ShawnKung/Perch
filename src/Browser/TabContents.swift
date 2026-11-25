@@ -48,6 +48,16 @@ final class TabContentsController: NSTabViewController {
         tabView.drawsBackground = false
     }
 
+    override func tabView(_ tabView: NSTabView, willSelect tabViewItem: NSTabViewItem?) {
+        if let host = tabViewItem?.viewController as? NSHostingController<TabContentView> {
+            let page = host.rootView.page
+            let tab = page.store.tabs.first { $0.id == page.tabID }
+            // AppKit otherwise chooses the first text field and selects its entire address.
+            tabViewItem?.initialFirstResponder = tab?.address.isEmpty == false ? host.view : nil
+        }
+        super.tabView(tabView, willSelect: tabViewItem)
+    }
+
     func update(store: Store, controlsInset: CGFloat) {
         _ = view
         let ids = Set(store.tabs.map(\.id) + (store.selected == nil ? [AIController.homeID] : []))

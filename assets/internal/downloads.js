@@ -3,7 +3,7 @@
   const send = (action, id) => window.webkit.messageHandlers.perchInternal.postMessage({action, id});
   const icons = {
     file: '<path d="M5 2h8l6 6v14H5z"/><path d="M13 2v6h6"/>',
-    copy: '<path d="m10 13 4-4"/><path d="m8 16-2 2a4 4 0 0 1-6-6l4-4a4 4 0 0 1 6 0m4 0 2-2a4 4 0 0 1 6 6l-4 4a4 4 0 0 1-6 0"/>',
+    copy: '<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>',
     reveal: '<path d="M2 6h8l2 2h10v12H2z"/>',
     remove: '<path d="m6 6 12 12M18 6 6 18"/>'
   };

@@ -16,7 +16,9 @@ h1{font-size:32px;font-weight:600;letter-spacing:-1px;line-height:1.3;margin:0 0
 .subtitle{font-size:14px;color:var(--muted);margin:0 0 20px}
 .search-box{position:relative;display:flex;align-items:center;gap:10px;padding:14px;background:white;border:1px solid var(--perch-line);border-radius:13px;margin-bottom:20px;z-index:2}
 .search-box>svg{width:17px;height:17px;fill:none;stroke:var(--muted);stroke-width:1.5}
-#search{min-width:0;flex:1;padding:4px 8px;border:0;background:transparent;font-size:12px;height:26px;outline-offset:0}
+.search-box:focus-within{border-color:var(--perch-accent);box-shadow:0 0 0 3px var(--perch-mint)}
+#search{min-width:0;flex:1;padding:2px 8px;border:0;background:transparent;font-size:16px;line-height:22px;height:26px}
+#search:focus,#search:focus-visible{outline:none}
 #suggestions{position:absolute;top:calc(100% + 4px);left:14px;right:14px;border:1px solid var(--perch-line);border-radius:8px;background:var(--paper);box-shadow:0 4px 8px #0002;overflow:hidden}
 #suggestions button{display:flex;align-items:center;gap:8px;padding:9px;width:100%;text-align:left}
 #suggestions button:hover,#suggestions button[aria-selected=true]{background:var(--perch-mint)}
@@ -32,7 +34,7 @@ h1{font-size:32px;font-weight:600;letter-spacing:-1px;line-height:1.3;margin:0 0
 h2{flex:1;font-size:13px;font-weight:600;margin:0}
 .section-header button{display:flex;align-items:center;gap:4px;padding:4px 0;color:var(--perch-accent);font-size:12px}
 .section-header svg{width:12px;height:12px}
-#shortcuts{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(190px,100%),1fr));gap:12px}
+#shortcuts{position:relative;display:grid;grid-template-columns:repeat(auto-fill,minmax(min(190px,100%),1fr));gap:12px}
 .shortcut{display:flex;align-items:center;gap:12px;height:68px;padding:17px;width:100%;min-width:0;text-align:left;border-radius:12px;background:white;touch-action:none;user-select:none}
 .shortcut img{width:20px;height:20px;object-fit:contain;margin:0 6px;flex:none}
 .site-symbol{width:32px;display:grid;place-items:center;color:var(--perch-accent);flex:none}

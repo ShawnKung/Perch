@@ -2577,6 +2577,8 @@ final class Panel: NSPanel {
 
     private func captureFocus(for tab: UUID?) {
         guard let tab, let view = firstResponder as? NSView, view.window === self else { return }
+        // NSTextField is a transient responder while AppKit attaches its actual field editor.
+        if view is NSTextField { return }
         if let editor = view as? NSTextView, editor.isFieldEditor, !(editor.delegate is NSTextField) { return }
         if let editor = view as? NSTextView, let nativeField = editor.delegate as? NSTextField,
            let field = nativeField as? AddressTextField.Field,
@@ -2586,6 +2588,7 @@ final class Panel: NSPanel {
         var ancestor: NSView? = view
         while let current = ancestor {
             if current is TabTable { return }
+            if let home = current as? HomePageWebView, home.controller?.tabID != tab { return }
             ancestor = current.superview
         }
         tabFocus[tab] = FocusSnapshot(view)
@@ -2636,7 +2639,10 @@ final class Panel: NSPanel {
         guard let target, !target.isHiddenOrHasHiddenAncestor else { return }
         restoringTabFocus = true
         defer { restoringTabFocus = false }
-        guard makeFirstResponder(target) else { return }
+        let fieldEditor = (target as? NSTextField)?.currentEditor()
+        if target !== firstResponder && (fieldEditor == nil || fieldEditor !== firstResponder) {
+            guard makeFirstResponder(target) else { return }
+        }
         var ancestor: NSView? = target
         while let view = ancestor {
             if let home = view as? HomePageWebView { home.controller?.restoreFocus(); break }
