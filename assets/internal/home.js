@@ -152,6 +152,7 @@
   window.addEventListener('scroll',()=>{status();positionAnchor();},{passive:true});
   new ResizeObserver(positionAnchor).observe(grid);
   window.perchUpdate = state => {
+    document.querySelector('.chat-icon').style.webkitMaskImage = `url("${state.chatIcon}")`;
     if (owner!==state.owner) {
       cancelDrag();dismiss();owner=state.owner;input.value=state.draft;rememberedFocus=false;anchored=null;window.scrollTo(0,0);
       document.documentElement.dataset.owner=owner;

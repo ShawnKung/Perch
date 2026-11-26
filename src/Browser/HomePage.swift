@@ -57,6 +57,12 @@ final class HomePageController: NSObject, WKScriptMessageHandler, WKNavigationDe
     private var ready = false
     private var search: Task<Void, Never>?
     private var iconCache: [UUID: (NSImage, String)] = [:]
+    private static let chatIcon: String = {
+        // Rasterize at 2× for the homepage's 27px Retina icon.
+        guard let image = NSImage(systemSymbolName: "sparkles", accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 54, weight: .regular)) else { return "" }
+        return InternalPage.icon(image)
+    }()
     private let anchor = BookmarkEditorAnchor.Anchor()
     private var anchoredID: UUID?
     init(store: Store, tabID: UUID) {
@@ -98,7 +104,7 @@ final class HomePageController: NSObject, WKScriptMessageHandler, WKNavigationDe
             anchor.removeFromSuperview(); self.anchoredID = nil
         }
         InternalPage.update(["owner": tabID.uuidString, "draft": store.homeAddressDrafts[tabID]?[false] ?? "",
-                             "sites": sites, "revision": store.suggestionRevision,
+                             "sites": sites, "revision": store.suggestionRevision, "chatIcon": Self.chatIcon,
                              "date": Date().formatted(.dateTime.month(.wide).day().weekday(.wide))], web: web)
         if let request = store.bookmarkEditRequest, sites.contains(where: { $0["id"] as? String == request.ownerID.uuidString }),
            anchor.window != nil, store.library == nil, !store.adding {
