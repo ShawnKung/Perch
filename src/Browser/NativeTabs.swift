@@ -285,9 +285,10 @@ final class TabWipeAnimation: NSAnimation {
     private let from: CGFloat
     private let to: CGFloat
     private let changed: @MainActor (CGFloat, Bool) -> Void
-    @MainActor init(from: CGFloat, to: CGFloat, changed: @escaping @MainActor (CGFloat, Bool) -> Void) {
+    @MainActor init(from: CGFloat, to: CGFloat, duration: TimeInterval? = nil,
+                    changed: @escaping @MainActor (CGFloat, Bool) -> Void) {
         self.from = from; self.to = to; self.changed = changed
-        super.init(duration: TabListContainer.groupAnimationDuration, animationCurve: .easeInOut)
+        super.init(duration: duration ?? TabListContainer.groupAnimationDuration, animationCurve: .easeInOut)
         animationBlockingMode = .nonblocking
         frameRate = Float(NSScreen.main?.maximumFramesPerSecond ?? 60)
     }
@@ -612,9 +613,18 @@ final class TabCell: NSTableCellView {
             }
         }
         label.stringValue = tab.title
+        let downloadsPage = DownloadsPage.matches(URL(string: tab.address))
+        icon.imageScaling = downloadsPage ? .scaleProportionallyDown : .scaleProportionallyUpOrDown
         icon.image = tab.chatOwner != nil
             ? NSImage(systemSymbolName: "bubble.left.and.bubble.right.fill", accessibilityDescription: "Chat")
-            : image ?? NSImage(systemSymbolName: "globe", accessibilityDescription: "网站")
+            : downloadsPage
+                ? NSImage(systemSymbolName: "arrow.down.to.line", accessibilityDescription: "下载记录")?
+                    .withSymbolConfiguration(.init(pointSize: 12, weight: .regular))
+                : tab.address.isEmpty
+                    ? NSImage(systemSymbolName: "house", accessibilityDescription: "新标签页")?
+                        .withSymbolConfiguration(.init(pointSize: 16, weight: .medium)
+                            .applying(.init(paletteColors: [.labelColor])))
+                    : image ?? NSImage(systemSymbolName: "globe", accessibilityDescription: "网站")
         icon.setAccessibilityLabel(tab.title)
         pin.image = tab.pinned ? NSImage(systemSymbolName: "pin.fill", accessibilityDescription: "已固定") : nil
         pinWidth.constant = tab.pinned ? 9 : 0
@@ -669,10 +679,13 @@ final class TabGroupCell: NSTableCellView {
         }
         if expansion > 0 {
             let paragraph = NSMutableParagraphStyle(); paragraph.lineBreakMode = .byTruncatingTail
-            (group.name.isEmpty ? "未命名分组" : group.name as NSString).draw(
-                in: NSRect(x: 11, y: bounds.midY - 8, width: max(0, bounds.width - 39), height: 17),
-                withAttributes: [.font: NSFont.systemFont(ofSize: 12, weight: .semibold),
-                                 .foregroundColor: group.color.foreground.withAlphaComponent(expansion), .paragraphStyle: paragraph])
+            let font = NSFont.systemFont(ofSize: 12, weight: .semibold)
+            let title = NSAttributedString(string: group.name.isEmpty ? "未命名分组" : group.name,
+                attributes: [.font: font,
+                             .foregroundColor: group.color.foreground.withAlphaComponent(expansion), .paragraphStyle: paragraph])
+            let height = ceil(font.ascender - font.descender + font.leading)
+            title.draw(in: NSRect(x: 11, y: bounds.midY - height / 2,
+                                 width: max(0, bounds.width - 39), height: height))
         }
         let center = NSPoint(x: 18 + expansion * (bounds.maxX - 33), y: bounds.midY)
         let arrow = NSBezierPath()
@@ -739,14 +752,14 @@ private struct TabGroupMenuButtonStyle: ButtonStyle {
                     RoundedRectangle(cornerRadius: 6)
                         .fill(Color.primary.opacity(configuration.isPressed ? 0.14 : hovered ? 0.09 : 0))
                 }
-                .background(TabGroupMenuHoverRegion(changed: { hovered = $0 }))
+                .background(NativeHoverRegion(changed: { hovered = $0 }))
                 .animation(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil : .easeOut(duration: 0.1),
                            value: hovered)
         }
     }
 }
 
-private struct TabGroupMenuHoverRegion: NSViewRepresentable {
+struct NativeHoverRegion: NSViewRepresentable {
     let changed: (Bool) -> Void
     func makeNSView(context: Context) -> TabGroupMenuHoverView {
         let view = TabGroupMenuHoverView()

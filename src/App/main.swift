@@ -132,6 +132,8 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     let passwordBridge: PasswordBridge
     let hoverLinks: HoverLinkTracker?
     let previewDefaults: UserDefaults
+    let downloads: DownloadController?
+    let downloadsPage = DownloadsPageBridge()
     @Published var address = ""
     @Published var title = ""
     @Published var loading = false
@@ -177,6 +179,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         webView.find(findQuery, configuration: configuration) { _ in }
     }
     var onVisit: ((String, String) -> Void)?
+    var onTitleChanged: ((String) -> Void)?
     var onHomeChanged: ((Bool) -> Void)?
     var onNewTab: ((URL, Bool) -> Void)?
     var onOpenInPerch: ((URL) -> Void)?
@@ -198,7 +201,9 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     }
 
     init(url: URL, userAgent: String? = nil, dataStore: WKWebsiteDataStore? = nil,
-         trackHoverLinks: Bool = false, previewDefaults: UserDefaults = .standard, startsAtHome: Bool = false) {
+         trackHoverLinks: Bool = false, previewDefaults: UserDefaults = .standard, startsAtHome: Bool = false,
+         downloads: DownloadController? = nil) {
+        self.downloads = downloads
         self.startsAtHome = startsAtHome
         self.previewDefaults = previewDefaults
         let tracker = trackHoverLinks ? HoverLinkTracker() : nil
@@ -206,6 +211,8 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         let bridge = PasswordBridge()
         passwordBridge = bridge
         let configuration = WKWebViewConfiguration()
+        configuration.setURLSchemeHandler(DownloadsSchemeHandler(), forURLScheme: "perch")
+        InternalPage.install("downloads", handler: downloadsPage, in: configuration)
         if startsAtHome { configuration.setURLSchemeHandler(HomeHistoryPage(), forURLScheme: "perch-home") }
         configuration.websiteDataStore = dataStore ?? .default()
         configuration.userContentController.add(selectionTracker, contentWorld: .defaultClient, name: "perchSelection")
@@ -222,6 +229,8 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
                 injectionTime: .atDocumentStart, forMainFrameOnly: false, in: .defaultClient))
         }
         webView = PageWebView(frame: .zero, configuration: configuration)
+        downloadsPage.web = webView
+        downloadsPage.downloads = downloads
         super.init()
         webView.extendMenu = { [weak self] menu in self?.extendContextMenu(menu) }
         webView.navigationDelegate = self
@@ -230,6 +239,15 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         webView.allowsMagnification = true
         webView.customUserAgent = userAgent
         observations = [
+            webView.observe(\.title, options: [.new]) { [weak self] view, _ in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.title = view.title ?? ""
+                    if !view.isLoading && view.url == view.backForwardList.currentItem?.url && !self.isHome {
+                        self.onTitleChanged?(self.title)
+                    }
+                }
+            },
             webView.observe(\.isLoading, options: [.new]) { [weak self] view, _ in
                 DispatchQueue.main.async { self?.syncNavigationState() }
             },
@@ -310,7 +328,8 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         case "back": syncNavigationState(); return canGoBack
         case "forward": syncNavigationState(); return canGoForward
         case "stop": return webView.isLoading
-        case "copy", "bookmark", "reload": return URLInput.parse(values[1], search: false) != nil
+        case "copy", "reload": return URLInput.parseNavigation(values[1], search: false) != nil
+        case "bookmark": return URLInput.parse(values[1], search: false) != nil
         case "save": return webView.url != nil && !isHome
         case "find": return true
         default: return false
@@ -474,6 +493,8 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         guard navigation === activeNavigation else { return }
         pendingHistoryItem = nil; provisionalFailure = false
         title = webView.title ?? ""
+        if DownloadsPage.matches(webView.url) { downloadsPage.start() }
+        else { downloadsPage.stop() }
         address = displayAddress(webView.url)
         if startsAtHome && firstHomeDestination == nil { onHomeChanged?(isHome) }
         syncNavigationState()
@@ -523,6 +544,8 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         guard let url = navigationAction.request.url,
               ["http", "https", "about"].contains(url.scheme?.lowercased() ?? "") ||
+                (downloads != nil && ["blob", "data"].contains(url.scheme?.lowercased() ?? "")) ||
+                DownloadsPage.matches(url) ||
                 (startsAtHome && url == HomeHistoryPage.url && navigationAction.targetFrame?.isMainFrame == true) else {
             error = "此链接使用其他应用的专用协议，Perch 暂不支持打开。"
             decisionHandler(.cancel)
@@ -533,7 +556,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
             decisionHandler(.cancel)
             return
         }
-        decisionHandler(.allow)
+        decisionHandler(navigationAction.shouldPerformDownload && downloads != nil ? .download : .allow)
     }
 
     private func opensInBackground(_ action: WKNavigationAction) -> Bool {
@@ -543,12 +566,32 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse,
                  decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
-        guard navigationResponse.canShowMIMEType else {
-            error = "此内容需要下载，Perch 暂不支持下载。"
+        let disposition = (navigationResponse.response as? HTTPURLResponse)?
+            .value(forHTTPHeaderField: "Content-Disposition")?
+            .components(separatedBy: ";").first?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if navigationResponse.canShowMIMEType && disposition != "attachment" { decisionHandler(.allow) }
+        else if downloads != nil { decisionHandler(.download) }
+        else {
+            error = "此内容需要下载，请在 Perch 标签页中打开。"
             decisionHandler(.cancel)
-            return
         }
-        decisionHandler(.allow)
+    }
+
+    func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
+        downloads?.receive(download)
+        if navigationAction.targetFrame?.isMainFrame == true { restoreAfterDownload() }
+    }
+    func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
+        downloads?.receive(download)
+        if navigationResponse.isForMainFrame { restoreAfterDownload() }
+    }
+    private func restoreAfterDownload() {
+        // WebKit may report a policy interruption after handing this navigation to WKDownload.
+        activeNavigation = nil
+        pendingHistoryItem = nil; provisionalFailure = false
+        let document = webView.backForwardList.currentItem?.url
+        address = displayAddress(document); error = nil; syncNavigationState()
+        onHomeChanged?(document == nil || (startsAtHome && document == HomeHistoryPage.url))
     }
 
     // shortcut: links open in tabs; OAuth flows requiring window.opener need a dedicated popup implementation.
@@ -595,12 +638,14 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        downloadsPage.stop()
         error = "网页进程已退出，点击重新加载即可恢复。"
     }
 }
 
 @MainActor
 final class Store: ObservableObject {
+    let downloads: DownloadController
     lazy var linkPreview = LinkPreviewController(store: self)
     lazy var bookmarkEditor = BookmarkEditorController()
     @Published var bookmarkEditRequest: BookmarkEditRequest?
@@ -751,8 +796,9 @@ final class Store: ObservableObject {
     var selectionChanged: ((UUID?, UUID?) -> Void)?
     var homeAddressDrafts: [UUID: [Bool: String]] = [:]
 
-    init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults = .standard, downloadDirectory: URL? = nil) {
         self.defaults = defaults
+        downloads = DownloadController(defaults: defaults, directory: downloadDirectory)
         ai = AIController(defaults: defaults)
         passwords = PasswordVault(memoryOnly: defaults !== UserDefaults.standard)
         settings = BrowserSettings()
@@ -843,15 +889,16 @@ final class Store: ObservableObject {
         if select, selected != id, let groupID = tab.groupID, let index = tabGroups.firstIndex(where: { $0.id == groupID }),
            tabGroups[index].collapsed { tabGroups[index].collapsed = false }
         if icons[id] == nil { icons[id] = FaviconCache.image(for: tab.address, defaults: defaults) }
-        if browsers[id] == nil, let url = URLInput.parse(tab.address, search: false) {
+        if browsers[id] == nil, let url = URLInput.parseNavigation(tab.address, search: false) {
             let view = Browser(url: url, userAgent: settings.userAgent,
                                dataStore: defaults === UserDefaults.standard ? .default() : .nonPersistent(),
-                               trackHoverLinks: true, previewDefaults: defaults, startsAtHome: startsAtHome)
+                               trackHoverLinks: true, previewDefaults: defaults, startsAtHome: startsAtHome, downloads: downloads)
             view.onHomeChanged = { [weak self, weak view] home in
                 guard let self, let view, let index = self.tabs.firstIndex(where: { $0.id == id }),
                       self.tabs[index].chatOwner == nil else { return }
                 self.tabs[index].address = home ? "" : view.address
-                self.tabs[index].title = home ? "新标签页" : URL(string: view.address)?.host ?? view.address
+                self.tabs[index].title = home ? "新标签页" :
+                    (view.title.isEmpty ? URL(string: view.address)?.host ?? view.address : view.title)
                 self.persistTabs()
             }
             linkPreview.start()
@@ -862,6 +909,16 @@ final class Store: ObservableObject {
                 self.tabs[index].title = title.isEmpty ? URL(string: address)?.host ?? address : title
                 self.persistTabs()
                 self.recordVisit(title: title, address: address)
+            }
+            view.onTitleChanged = { [weak self, weak view] title in
+                guard let self, let view, !title.isEmpty,
+                      let index = self.tabs.firstIndex(where: { $0.id == id && $0.address == view.address }) else { return }
+                self.tabs[index].title = title
+                self.persistTabs()
+                if self.settings.historyRecordingEnabled, let visit = self.history.firstIndex(where: { $0.address == view.address }) {
+                    self.history[visit].title = title
+                    self.persist(self.history, key: "history")
+                }
             }
             view.onNewTab = { [weak self] url, background in
                 self?.newTab(address: url.absoluteString, after: id, select: !background)
@@ -928,6 +985,11 @@ final class Store: ObservableObject {
         persistTabs()
     }
 
+    func openDownloads() {
+        if let tab = tabs.first(where: { DownloadsPage.matches(URL(string: $0.address)) }) { activate(tab.id) }
+        else { newTab(address: DownloadsPage.url.absoluteString, title: "下载记录") }
+    }
+
     @Published var chatHistoryVisible = true
     var chatOwner: UUID {
         let page = tabs.first(where: { $0.id == selected })
@@ -989,7 +1051,7 @@ final class Store: ObservableObject {
         }
         else if let index = tabs.firstIndex(where: { $0.id == selected && $0.address.isEmpty && $0.chatOwner == nil }) {
             if let browser = browsers.removeValue(forKey: tabs[index].id) {
-                browser.onHomeChanged = nil; browser.onVisit = nil
+                browser.onHomeChanged = nil; browser.onVisit = nil; browser.onTitleChanged = nil
                 browser.passwordBridge.dismiss(); browser.favicon.reset(); browser.webView.stopLoading()
                 browser.webView.removeFromSuperview()
             }
@@ -1415,7 +1477,7 @@ final class Store: ObservableObject {
     }
 
     func navigate(_ text: String) {
-        guard let url = URLInput.parse(text, searchTemplate: settings.searchURL) else {
+        guard let url = URLInput.parseNavigation(text, searchTemplate: settings.searchURL) else {
             notice = "请输入有效的 http / https 网址，或输入关键词搜索。"
             return
         }
@@ -2089,98 +2151,6 @@ struct BrowserFindBar: View {
     }
 }
 
-struct HomeScreen: View {
-    @ObservedObject private var theme = PerchTheme.shared
-    let store: Store
-    let tabID: UUID
-    private let shortcuts: [Site]
-    private let suggestionRevision: Int
-    private let icons: [UUID: NSImage]
-    init(store: Store, tabID: UUID) {
-        self.store = store; self.tabID = tabID
-        shortcuts = store.homeShortcuts
-        suggestionRevision = store.suggestionRevision
-        icons = store.icons
-    }
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                HStack {
-                    Image(systemName: "rectangle.topthird.inset.filled")
-                        .font(.system(size: 27)).foregroundStyle(Style.accent)
-                        .frame(width: 52, height: 52).background(Style.mint, in: RoundedRectangle(cornerRadius: 16))
-                    Spacer()
-                    Text(Date(), format: .dateTime.month(.wide).day().weekday(.wide))
-                        .font(.system(size: 12)).foregroundStyle(Style.muted)
-                }
-                VStack(alignment: .leading, spacing: 13) {
-                    Text("把常用网页，\n放在手边。")
-                        .font(.system(size: 32, weight: .semibold, design: .rounded))
-                        .tracking(-1).lineSpacing(3)
-                    Text("少一次切换，多一点专注。").font(.system(size: 14)).foregroundStyle(Style.muted)
-                }
-                HStack(spacing: 10) {
-                    Image(systemName: "magnifyingglass").foregroundStyle(Style.muted)
-                    AddressEntry(store: store, focusShortcut: false, homeTab: tabID)
-                        .id(tabID)
-                }.padding(14).background(.white, in: RoundedRectangle(cornerRadius: 13))
-                    .overlay(RoundedRectangle(cornerRadius: 13).stroke(Style.line, lineWidth: 1))
-                    .zIndex(20)
-                Button { store.openChat() } label: {
-                    HStack(spacing: 12) {
-                        Image(systemName: "sparkles").font(.system(size: 23)).foregroundStyle(Style.accent)
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("打开 Chat").font(.system(size: 15, weight: .semibold))
-                            Text("提问、引用标签页，继续之前的对话").font(.system(size: 12)).foregroundStyle(Style.muted)
-                        }
-                        Spacer()
-                        Image(systemName: "arrow.up.right").foregroundStyle(Style.muted)
-                    }.padding(18).background(.white, in: RoundedRectangle(cornerRadius: 14))
-                        .overlay(RoundedRectangle(cornerRadius: 14).stroke(Style.line))
-                }.buttonStyle(.plain)
-
-                Group {
-                    VStack(alignment: .leading, spacing: 14) {
-                        HStack {
-                            Text("快捷入口").font(.system(size: 13, weight: .semibold))
-                            Spacer()
-                            Button { store.openBookmarks(scope: .all) } label: {
-                                Label("全部书签", systemImage: "bookmark")
-                            }.buttonStyle(.plain).font(.system(size: 12)).foregroundStyle(Style.accent)
-                                .accessibilityLabel("全部书签")
-                            Button { store.adding = true } label: { Label("添加", systemImage: "plus") }
-                                .buttonStyle(.plain).font(.system(size: 12)).foregroundStyle(Style.accent)
-                        }
-                        HomeShortcutGrid(store: store, sites: shortcuts, tabID: tabID) { site in
-                            Button { store.open(site) } label: {
-                                HStack(spacing: 12) {
-                                    Group {
-                                        if let icon = store.cachedFavicon(site.address) {
-                                            Image(nsImage: icon).resizable().scaledToFit()
-                                                .frame(width: 20, height: 20)
-                                        } else {
-                                            Image(systemName: site.symbol).font(.system(size: 20))
-                                                .foregroundStyle(Style.accent)
-                                        }
-                                    }.frame(width: 32).accessibilityHidden(true)
-                                    VStack(alignment: .leading, spacing: 5) {
-                                        Text(site.title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
-                                        Text(URL(string: site.address)?.host ?? site.address)
-                                            .font(.system(size: 10)).foregroundStyle(Style.muted).lineLimit(1)
-                                    }
-                                    Spacer(minLength: 0)
-                                }.padding(17).frame(maxWidth: .infinity, alignment: .leading)
-                                    .background(.white, in: RoundedRectangle(cornerRadius: 12))
-                            }.buttonStyle(.plain)
-                                .background(BookmarkEditorAnchor(store: store, ownerID: site.id))
-                        }.id(tabID)
-                    }
-                }
-            }.padding(28).frame(maxWidth: 760, alignment: .leading).frame(maxWidth: .infinity)
-        }.background(Style.paper)
-    }
-}
-
 struct AddSite: View {
     @ObservedObject private var theme = PerchTheme.shared
     @ObservedObject var store: Store
@@ -2241,13 +2211,15 @@ struct WindowTools: View {
             GlyphButton(symbol: pinned ? "pin.fill" : "pin", label: "窗口置顶", active: pinned, size: 28) {
                 store.pinned.toggle(); store.changeWindow?()
             }
+            DownloadToolbarButton(downloads: store.downloads) { store.openDownloads() }
             Menu {
                 Button("书签管理") { store.openBookmarks() }
                 Button("历史记录") { store.openBookmarks(scope: .history) }
+                Button("下载记录") { store.openDownloads() }
                 Button("密码管理") { store.library = .passwords }
                 Divider()
                 Button("在新标签页打开") {
-                    if let url = URLInput.parse(store.browser?.address ?? "", search: false) { store.newTab(address: url.absoluteString) }
+                    if let url = URLInput.parseNavigation(store.browser?.address ?? "", search: false) { store.newTab(address: url.absoluteString) }
                 }.disabled(!hasBrowser)
                 Divider()
                 Button("回到首页") { store.selected = nil }
@@ -2582,7 +2554,7 @@ final class Panel: NSPanel {
     var statusItemPressed: (() -> Bool)?
 
     @discardableResult override func makeFirstResponder(_ responder: NSResponder?) -> Bool {
-        if !restoringTabFocus, responder !== firstResponder, firstResponder is NSTextView {
+        if !restoringTabFocus, responder !== firstResponder, firstResponder is NSView {
             captureFocus(for: selectedTab)
         }
         return super.makeFirstResponder(responder)
@@ -2605,6 +2577,8 @@ final class Panel: NSPanel {
 
     private func captureFocus(for tab: UUID?) {
         guard let tab, let view = firstResponder as? NSView, view.window === self else { return }
+        // NSTextField is a transient responder while AppKit attaches its actual field editor.
+        if view is NSTextField { return }
         if let editor = view as? NSTextView, editor.isFieldEditor, !(editor.delegate is NSTextField) { return }
         if let editor = view as? NSTextView, let nativeField = editor.delegate as? NSTextField,
            let field = nativeField as? AddressTextField.Field,
@@ -2614,6 +2588,7 @@ final class Panel: NSPanel {
         var ancestor: NSView? = view
         while let current = ancestor {
             if current is TabTable { return }
+            if let home = current as? HomePageWebView, home.controller?.tabID != tab { return }
             ancestor = current.superview
         }
         tabFocus[tab] = FocusSnapshot(view)
@@ -2664,7 +2639,15 @@ final class Panel: NSPanel {
         guard let target, !target.isHiddenOrHasHiddenAncestor else { return }
         restoringTabFocus = true
         defer { restoringTabFocus = false }
-        guard makeFirstResponder(target) else { return }
+        let fieldEditor = (target as? NSTextField)?.currentEditor()
+        if target !== firstResponder && (fieldEditor == nil || fieldEditor !== firstResponder) {
+            guard makeFirstResponder(target) else { return }
+        }
+        var ancestor: NSView? = target
+        while let view = ancestor {
+            if let home = view as? HomePageWebView { home.controller?.restoreFocus(); break }
+            ancestor = view.superview
+        }
         guard let range = snapshot.selection,
               let editor = ((target as? NSTextField)?.currentEditor() as? NSTextView) ?? target as? NSTextView else { return }
         if let identifier = snapshot.fieldIdentifier, let text = snapshot.text, editor.string != text {
@@ -3118,12 +3101,29 @@ if CommandLine.arguments.contains("--update-self-test") {
         catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
     }
     app.run()
+} else if CommandLine.arguments.contains("--home-page-state-self-test") {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    Task { @MainActor in
+        setbuf(stdout, nil)
+        do { try await HomePageSelfCheck.state(); exit(0) }
+        catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
+    }
+    app.run()
 } else if CommandLine.arguments.contains("--web-tabs-self-test") {
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)
     Task { @MainActor in
         setbuf(stdout, nil)
         do { try await WebTabSelfCheck.run(); exit(0) }
+        catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
+    }
+    app.run()
+} else if let index = CommandLine.arguments.firstIndex(of: "--download-self-test"), CommandLine.arguments.count > index + 1 {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    Task { @MainActor in
+        do { try await DownloadSelfCheck.run(baseURL: CommandLine.arguments[index + 1]); exit(0) }
         catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
     }
     app.run()
@@ -3135,6 +3135,30 @@ if CommandLine.arguments.contains("--update-self-test") {
         catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
     }
     app.run()
+} else if CommandLine.arguments.contains("--ai-history-self-test") {
+    NSApplication.shared.setActivationPolicy(.regular)
+    Task { @MainActor in
+        setbuf(stdout, nil)
+        do {
+            try await AISelfCheck.historyDisclosureUI()
+            exit(0)
+        } catch { print("FAIL: \(error)"); exit(1) }
+    }
+    NSApplication.shared.run()
+} else if CommandLine.arguments.contains("--ai-chat-html-self-test") || CommandLine.arguments.contains("--ai-chat-style-self-test") || CommandLine.arguments.contains("--ai-quote-self-test") {
+    NSApplication.shared.setActivationPolicy(.regular)
+    Task { @MainActor in
+        setbuf(stdout, nil)
+        NSApp.activate(ignoringOtherApps: true)
+        do {
+            let index = CommandLine.arguments.firstIndex { $0 == "--ai-chat-html-self-test" || $0 == "--ai-chat-style-self-test" || $0 == "--ai-quote-self-test" }!
+            let baseURL = CommandLine.arguments.count > index + 1 ? CommandLine.arguments[index + 1] : nil
+            try await AIChatPageSelfCheck.run(baseURL: baseURL, styleOnly: CommandLine.arguments.contains("--ai-chat-style-self-test"),
+                                            quoteOnly: CommandLine.arguments.contains("--ai-quote-self-test"))
+            print("PASS: HTML Chat self-check"); exit(0)
+        } catch { print("FAIL: \(error)"); exit(1) }
+    }
+    NSApplication.shared.run()
 } else if CommandLine.arguments.contains("--ai-typography-self-test") {
     let app = NSApplication.shared
     app.setActivationPolicy(.regular)

@@ -15,7 +15,7 @@
 - 加入分组菜单将「新建组」置顶，有已打开组时在其后添加分隔线，只列 `openTabGroups`；折叠组仍属于已打开组。新建颜色在 `Store.createTabGroup` 按 `TabGroupColor.allCases` 轮询，`nextTabGroupColor` 以原始颜色名保存在应用 UserDefaults 中；状态缺失、类型错误或未知颜色从默认蓝色恢复，创建失败不推进轮询，手动改色与隐藏/恢复不改变轮询状态。已保存组的颜色保持原值。
 - 分组编辑弹窗的 SwiftUI `onHover` 未可靠更新菜单反馈，单纯移动状态归属也未解决。操作行与颜色按钮共用不参与命中的原生跟踪视图，以 `activeAlways` 跟踪区和弹窗内鼠标坐标更新悬停；本地事件监听只观察事件，视图离窗时清理。跟踪区显式初始化并随布局更新，范围取按钮 `bounds` 与 `visibleRect` 的交集：未裁切的 SwiftUI 托管祖先可能使 `visibleRect` 超出按钮，不能直接使用 `inVisibleRect`。跟踪区生命周期参考 [AppKit 官方说明](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/EventOverview/TrackingAreaObjects/TrackingAreaObjects.html)。`--ui-preview --preview-saved-groups --verify-preview` 验证 NSApp 鼠标事件、实际背景像素、高亮转移、重绘与移出清除及整行点击，不移动系统鼠标。
 - 原生拖放只在 Coordinator 中预览顺序和成员关系，接受落点后交给 Store 提交；取消、离开列表和外部结构变化会丢弃预览。标题与组内行接纳标签，左侧留白、组末尾边缘与列表外侧落点移出分组；整组移动保持成员顺序并临时收起。布局使用 200ms ease-in-out，并遵循「减少动态效果」。参考 Chromium 的 `tab_collection_animating_layout_manager.cc`、`tab_drag_handler.cc` 与 `tab_group_view_vertical_layout.cc`（`chrome/browser/ui/views/tabs/common/`）。
-- 首页入口、标签与分组标题共用 `DragPreview.swift` 绘制圆角浮层，背景与内容合成后统一应用 88% 不透明度，原位置留空并实时补位。`--ui-preview --verify-tab-drag --verify-home-shortcut-drag --verify-preview` 覆盖真实窗口内的鼠标按下路径、宽窄侧栏、预览行位置、元数据刷新、固定边界、取消与接受落点；系统拖动捕获与落点使用合成夹具，不替代真实鼠标拖动验收。
+- 标签与分组标题共用 `DragPreview.swift` 绘制圆角浮层，背景与内容合成后统一应用 88% 不透明度，原位置留空并实时补位。`--ui-preview --verify-tab-drag --verify-preview` 覆盖真实窗口内的鼠标按下路径、宽窄侧栏、预览行位置、元数据刷新、固定边界、取消与接受落点；系统拖动捕获与落点使用合成夹具，不替代真实鼠标拖动验收。首页 HTML 拖拽使用同样的浮层透明度和留空语义，单独通过 `--verify-home-shortcut-drag` 验证窗口内的实际指针事件。
 - 原生鼠标按下时记录行的 UUID，标签选择与组标题动作使用同一点击身份，避免擦除期间动态行高更新使 `clickedRow` 或选中行号指向其他对象；沿用 NSTableView 的原生跟踪与拖放流程，鼠标跟踪结束后清理点击身份。
 - 标签与分组擦除共用 `TabWipeAnimation`，通过 [NSAnimation](https://developer.apple.com/documentation/appkit/nsanimation) 的非阻塞主线程进度驱动行高和色线，使用 common run-loop modes，按当前屏幕刷新率采样。反向操作停止旧驱动，从当前实际进度开始；不通过自定义 NSView 属性的隐式 animator 推断显示进度。
 - 每个分组的色线由独立原生视图绘制一条连续路径，只在整组首尾圆角，避免逐行圆角的抗锯齿露出底色；展开栏与窄栏均通过实际窗口截图的接缝像素检查。`--ui-preview --preview-groups --verify-preview` 可单独运行分组原生事件与布局回归。
@@ -24,8 +24,10 @@
 - 分组收起时不立即清除显示标签的组归属：图标及选中背景的横向缩进使用「侧栏展开进度 × 分组擦除进度」，由同一进度逐帧更新原生约束，不额外启动横移动画。色线下沿取表格当前可见成员高度，扣除保留选中项中尚未展开的部分，末端保持固定 4pt 留白；更新行高后同步完成原生布局，避免色线先走、图标后走。中间帧回归同时检查真实行高、色线边界和图标/高亮缩进。
 
 - `src/App/main.swift` 管理 Store、窗口与应用生命周期；`src/Browser/TabContents.swift` 管理网页、首页及完整 Chat 的平级原生内容控制器。
-- 所有页面使用同一个 NSTabViewController，标签首次选中才创建内容控制器。网页、Chat、有输入或阅读位置的首页保留稳定控制器；连续切换到空白首页时，可复用当前无草稿、原生输入、输入法组合文本、滚动位置及弹窗的首页 hosting tree，避免在擦除期间重建整页。具有 Browser 历史的首页不参与复用。平台负责选择当前页面，后台页面离开窗口和事件响应链，不以透明度、零宽度或隐藏叠层模拟切换。
+- 所有页面使用同一个 NSTabViewController，标签首次选中才创建内容控制器。网页、Chat、有输入或阅读位置的首页保留稳定控制器；连续切换到空白首页时，可复用当前无草稿、输入法组合文本、HTML 搜索焦点、滚动位置及弹窗的首页 hosting tree 与 WebView，避免在擦除期间重建整页。具有 Browser 历史的首页不参与复用。平台负责选择当前页面，后台页面离开窗口和事件响应链，不以透明度、零宽度或隐藏叠层模拟切换。
 - `TabContentState` 只向当前页转发 Store 更新，并在即将选中时通知对应后台页读取最新数据；独立 Browser、AI 请求与数据状态继续正常运行。首页和工具栏按显式输入值刷新，地址输入身份绑定所属标签，不绑定全局选择，避免连续新建时重建后台输入框。窗口控件留白变化仍更新所有保留控制器。`--ui-preview --verify-tab-burst --verify-preview` 连续创建 60 个首页，覆盖擦除重叠、输入框身份与草稿、首页滚动保留及最终列表一致性。
+- 焦点快照记录实际输入响应者：AppKit 将 `NSTextField` 转交窗口 field editor 的中间状态不覆盖已保存的选区，首页响应者按所属标签校验；恢复到当前 field editor 时不重复切换焦点。首页输入将焦点提示绘制在外层圆角搜索框，避免内部矩形描边。
+- 网页标签通过 `NSTabViewItem.initialFirstResponder` 指定内容根视图，避免 AppKit 默认选中第一个地址输入框；根视图在选择时已经属于标签，异步挂载的 WebView 此时可能尚未加入视图树，不能作为初始响应者。首次空白标签仍由 Store 请求地址栏焦点，切回已有标签再恢复用户保留的焦点和选区。下载页新建及复用、显式 ⌘L 全选和选区恢复由下载 UI 专项验证。
 - 切换标签不重建 WKWebView、不回写 DOM 滚动位置。后台网页保留视口，真实窗口尺寸变化只布局当前网页；NSHostingController 不用内容尺寸反推容器大小。
 - 完整 Chat 为全局唯一标签，打开、恢复、历史、Fork 和网页对话转完整页均复用它。重复旧标签只合并入口，其对应对话仍保存在历史中。
 - 网页 AI 侧栏仅打开时挂载；其会话、草稿、请求和阅读位置保留在 AIController。侧栏开关按网页标签记忆，完整 Chat 与侧栏共用会话状态。
@@ -33,13 +35,21 @@
 - 新建对话共用 `AIController.newChatOwner`：当前输入包含文字、附件或引用时，带入新对话；当前已经是空白会话时保留其 owner。文字、网页/已关闭网页引用及选区引用一起复制，旧会话的历史、草稿和请求保留；不同的既存未发送草稿继续可恢复，不覆盖。没有当前草稿时沿用既有空白草稿复用规则，发送仍需用户确认。数据自检覆盖重启与既存草稿，`--verify-web-selection-ai` 覆盖侧栏新对话按钮的实际点击及原生输入框内容。
 - 侧栏历史按网页 URL（忽略查询参数和片段）筛选，路径变化后旧网页对话仍保存在全局历史。菜单的「全部历史对话」打开完整 Chat 和历史列表，沿用当前会话 owner 保留输入；空白草稿不进入历史。数据自检覆盖新建会话与重启后的旧记录及网页筛选边界。
 - 导航入口复用 Browser.goBack/goForward，未提交导航及连续历史操作由 pendingHistoryItem 管理；旧导航失败不得覆盖新状态。
+- WebKit 的 `didFinish` 可能先于 `title` 更新，下载后继续导航也会出现此行为。Browser 观察原生 `title` 属性，在已完成的当前文档上同步标签与既有历史项标题，不新增历史、不用延时或页面脚本补偿。
+- 主框架交接给 `WKDownload` 后即结束该导航的生命周期，保留已提交页面；GitHub 发布资源等跨域下载会在交接后返回 `WebKitErrorDomain` 102，旧导航的迟到失败不能覆盖原页面。不全局屏蔽错误码；子框架下载不结束主页面导航。下载回归覆盖跨域跳转后主页、网页和内部记录页的地址、历史及无错误状态。
+- 近期下载弹层的行与分组菜单复用 `NativeHoverRegion`，以原生跟踪区和窗口内鼠标事件更新悬停，避免弹层内 SwiftUI `onHover` 漏事件；装饰跟踪视图不参与命中，监听按窗口生命周期清理。完整 HTML 下载页使用 DOM 悬停和键盘焦点显示操作。
+- 下载使用 `WKNavigationAction.shouldPerformDownload`、不可显示的 MIME 响应及 HTTP `Content-Disposition: attachment` 转交 `WKDownload`，保留 WebKit 会话、Cookie 与原始下载请求。仅检查 MIME 无法覆盖 HTML 等可显示的附件；附件 disposition 按分号前的 token 大小写无关匹配。下载转交后恢复当前主页或网页的地址、标题与导航状态，不追加浏览历史。Store 持有 `DownloadController`，任务不由标签视图管理；记录存于独立 `downloads` 本机配置，不归入浏览历史或导出备份。损坏记录保留原数据，重启后的未完成记录标为中断，不自动重新请求。文件在「下载」目录内的独立隐藏临时路径写入，成功时添加系统 quarantine 元数据并避让同名文件后移动到最终位置，失败清理临时文件。
+- 下载按钮紧邻更多菜单，圆环显示最新未完成任务；总大小未知时转圈，遵循减少动态效果。近期原生弹层与完整 HTML 列表共用 DownloadController 及文件操作，删除或清空仅影响记录，后台传输继续。文件不存在时禁用打开与 Finder 操作，列表显示期间刷新文件状态。`perch://downloads` 的 scheme handler 返回本地 HTML，直接显示在原 Browser 的 WKWebView 中；地址栏、后退与持久化恢复共用此路径。前端脚本和消息桥使用隔离 content world，Swift 校验对应 WebView、主框架与内部地址，只接受记录 ID；普通网页没有宿主桥权限，文件名与错误使用 textContent。内部地址校验不扩展外部 URL、书签和 AI 引用的信任范围。`make test-downloads` 使用隔离配置、临时文件与本机 HTTP 服务验证下载、导航及 HTML 按钮实际鼠标事件。
 - 网页右键在 `Browser.extendContextMenu` 精确移除 WebKit 的导航项，再统一追加中文导航；其他原生链接、图片和编辑项保留。后退、前进、重新加载使用 `NSMenuItem.identifier`；停止加载没有标识，仅匹配 WebKit 转发动作和 macOS 的 Stop tag 11。依据为 WebKit 的 [菜单构造](https://github.com/WebKit/WebKit/blob/main/Source/WebKit/UIProcess/mac/WebContextMenuProxyMac.mm)、[标识定义](https://github.com/WebKit/WebKit/blob/main/Source/WebKit/UIProcess/API/Cocoa/WKMenuItemIdentifiers.mm) 和 [动作枚举](https://github.com/WebKit/WebKit/blob/main/Source/WebCore/platform/ContextMenuItem.h)，系统 WebKit 升级时以实际右键回归复核。`存储为…` 在隔离 JavaScript world 中克隆当前 HTML，保留 doctype、统一 UTF-8 并固定原页面 baseURI，不修改现场 DOM；原生保存面板选择 `.html` 文件，使用原子写入。保存面板期间页面切换不改变已捕获快照；外部图片、样式等资源仍通过原网址加载，不打包为离线资源。`--ui-preview --verify-web-context-menu --verify-preview` 验证实际右键事件、去重、原生项保留与本地 HTML 编码及相对链接回读。
 - 文字选区右键保留原生中文「复制」，移除查询、翻译、系统搜索、带高亮链接、分享、朗读与系统写作入口；通过 NSMenu 的公开配置关闭自动追加的上下文插件。`WebSelectionTracker` 在隔离 world 的各 frame 中仅监听 `contextmenu`，冻结最多 12,000 字的非表单选中文字；导航开始时清理，网页脚本不能调用桥接入口。主网页的「问 AI」通过 Store 激活来源标签、打开侧栏、去重添加网页引用并设置文字引用，保留已有问题及运行请求，等待用户发送；引用使用去除凭据、查询和片段的网页 URL。`AIQuote.page` 为可选网页来源，旧回答引用的 `messageID` 数据保持兼容；文字经 XML 转义后作为独立引用发送，焦点请求只在运行时按会话传递。`--ui-preview --verify-web-selection-ai --verify-preview` 覆盖真实选区右键、菜单结束跟踪、选区变化后的快照、侧栏引用和原生输入焦点。
 - AppKit 的 Services 菜单不属于 `NSMenu.items`，关闭上下文插件也不能移除；`PageWebView.validRequestor` 返回 nil，网页不参与系统 Services，防止系统追加此入口。原生复制、粘贴及其他视图的 Services 保持原行为。隔离 WKWebView 实验通过实际菜单截图验证，自动回归检查网页 Services 请求者边界。「问 AI」使用侧栏同款 `sparkles`；macOS 27 的 AppKit 默认可能隐藏菜单图片，需通过公开 `preferredImageVisibility` 指定 `NSMenuItemImageVisibilityVisible`（整数值 1）。`NSMenuItem.showImageIfSupported` 先检查 setter，再经 KVC 设置此公开属性，以支持旧 SDK 编译；缺少 setter 的系统沿用默认图片显示。仅运行时 `#available` 不能让旧 SDK 识别新属性。
-- 新标签页首次提交网址或搜索时，Browser 先通过 WKURLSchemeHandler 建立内部 `perch-home://new-tab/` 历史项，再打开目标网页；后退至该项显示原生首页，保留同一 Browser 与前进栈。首页中央和工具栏输入草稿按标签独立保留，重新提交沿用 WebKit 的历史分支行为。内部首页不写入浏览历史、不作为 AI 网页引用，历史栈与草稿仅在本次运行中保留。
+- 首页由 `HomePageController` 持有独立的非持久化 WKWebView，加载本地 HTML；中央输入、选区与滚动由同一 DOM 保留，草稿同时按标签同步到 Store，工具栏仍使用原生输入。HTML 建议复用 Store 的异步检索与取消机制，输入法组合态不发布草稿、不接管候选键或提交。内部消息桥使用隔离 content world、弱代理和主框架/文档/标签校验，仅接受动作与书签 ID；原生菜单、编辑器、添加及管理入口复用既有控制器。前端不会执行书签或建议内容中的 HTML。`--home-page-state-self-test` 在隔离配置和窗口中验证空白首页复用后的标签及书签更新、草稿/选区/滚动/DOM 保留与桥接隔离；使用合成 DOM 状态，不替代原生输入及指针回归。
+- 新标签页首次提交网址或搜索时，Browser 先通过 WKURLSchemeHandler 建立内部 `perch-home://new-tab/` 历史项，再打开目标网页；后退至该项重新挂载保留的首页 WebView，保留同一 Browser 与前进栈。首页中央和工具栏输入草稿按标签独立保留，重新提交沿用 WebKit 的历史分支行为。内部首页不写入浏览历史、不作为 AI 网页引用，历史栈与草稿仅在本次运行中保留。`tests/HomePageSelfCheck.swift` 覆盖原生 WebKit 文本插入、组合态 Return、建议键盘/鼠标事件、切页焦点和选区、前进后退及 DOM 身份。
 - 首页书签直接在当前标签导航，复用首页返回和草稿保留逻辑；网页中打开书签仍新建标签。新标签优先继承显式来源，否则继承当前标签的分组并插入其后；批量打开书签同样保持组内连续顺序。
+- 首页输入法合成检查通过 `NSTextInputClient` 设置组合文本，使用实际 DOM `compositionstart` / `compositionend` 判断组合态；独立 WKWebView 实验中 `hasMarkedText()` 在 DOM 组合态仍会返回 false，不能据此认定输入被清空。下载悬停检查向原生窗口及 WebKit 的 `NSTrackingArea.owner` 发送窗口内鼠标移动事件，验证进入显示、离开隐藏，不点击建立悬停、不移动系统鼠标；WebKit owner 检查仅覆盖其跟踪处理，应用命中与原生窗口事件另外校验，不代表已验证 AppKit 根据真实系统鼠标自动投递跟踪事件的整条链路。这些合成检查不替代真实输入法候选面板及硬件鼠标验收。
 - 首页「全部书签」入口复用管理页，以 `BookmarkScope.all` 初始展示个人与导入目录；书签管理和历史入口分别指定 `.root` 与 `.history`。显示范围由 Store 的临时 `libraryBookmarkScope` 与管理页同步，关闭时重置，不写入书签或首页排序。`--ui-preview --verify-home-bookmarks --verify-preview` 验证首页按钮的实际点击、完整书签树及未固定书签在当前首页标签打开。
-- 首页入口顺序单独保存在 `homeShortcutOrder`，不改变收藏列表与目录顺序。隐藏入口保留其位置，新入口追加；原生拖放使用半透明卡片和实时换位，接受本地落点后才保存，取消或离开区域恢复预览。顺序归入 v3 书签备份，旧备份缺省时恢复收藏顺序，损坏数据保留并阻止覆盖。
+- 首页入口顺序单独保存在 `homeShortcutOrder`，不改变收藏列表与目录顺序。隐藏入口保留其位置，新入口追加；HTML 指针捕获拖拽使用半透明卡片和实时换位，接受网格内落点后才提交 Store 保存，取消、离开区域或外部结构变化时恢复预览，保存失败回读原顺序。遵循减少动态效果；页面离开窗口清理拖拽和未完成建议。顺序归入 v3 书签备份，旧备份缺省时恢复收藏顺序，损坏数据保留并阻止覆盖。
+- 首页拖拽落点按相对于网格的布局偏移计算，不读取受动画 transform 影响的卡片位置；顺序不变时不重新排列或重启动画。连续换位先保留当前显示位置、取消旧动画，再测量新布局并衔接动画。原生指针专项在动画尚未完成时连续移动 1pt 并逐次核对顺序，防止只检查动画结束后的落点而遗漏反复换位。
 - 书签管理页的个人书签行支持单选与多选拖动排序，使用同一半透明浮层与原生 `NSOutlineView.moveItem` 实时补位；拖到个人目录仍移动归属。只有接受本地落点才保存 `sites` 顺序，未显示的书签保留其位置和元数据，并先固定首页当前顺序，保持两处排序独立。拖动期间保留列表项对象身份、原地更新名称与网址，取消、离开列表或外部结构变化时恢复显示顺序。`--ui-preview --verify-bookmark-drag --verify-preview` 覆盖原生点击路径、预览位置、选区与元数据保留、多选、保存/重启、拒绝/取消、目录移动和导入只读边界；拖动捕获和目标回调使用隔离合成夹具。
 - 全部书签和个人书签使用同一个个人目录树投影，搜索保留匹配项的祖先目录；左侧只保留个人书签总入口。目录箭头由 `frameOfOutlineCell` 返回空布局隐藏，保留原生展开/收起能力；不能通过 `shouldShowOutlineCell=false` 隐藏，该选项会连同 `collapseItem` 一起禁用。双击目录切换展开/收起，行末打开按钮进入个人目录，顶部返回按钮按实际父目录逐层返回。展开的子目录内排序限定于同级书签，不改变归属。`--ui-preview --verify-bookmark-folders --verify-preview` 通过隔离窗口双击和按钮事件验证导入/个人目录开合、两种视图的层级、子目录排序及元数据保留、侧栏去重与多级返回。
 - 星标、⌘D 和网页收藏菜单通过同一书签编辑请求打开无箭头的原生浮窗，按按钮的屏幕坐标紧贴下方并右对齐，屏幕边缘自动约束；首页右键编辑复用编辑器并显示网址。名称、网址、目录及首页显示标记一起校验、保存；点击完成或在外部关闭时保存，错误保留编辑草稿。新星标书签显式设置 `showOnHome = false`，旧数据缺省值仍视为显示。导入目录保持只读。
@@ -57,7 +67,7 @@
 
 ## 输入、会话与交互
 
-- 原生输入框保留编辑快捷键、图片粘贴和输入法 marked text。组合输入期间不回写 stringValue、不发布未提交文字、不抢候选词方向键、回车或 Escape。
+- 完整 Chat 与网页侧栏共用 `AIChatPageController` 和本地 `internal/chat.html`，保留原生窗口栏、历史列表及系统打开/保存面板。HTML 输入框使用 WebKit 原生文本输入能力；组合输入期间不回写 value、不发布未提交文字、不抢候选词方向键、回车或 Escape。提交后的输入以递增序号同步，过期状态不能覆盖新输入；输入选区按 owner 保存在 AIController，侧栏与完整页共用。
 - 默认回车发送、Shift+回车换行，可设置 Command+回车发送；输入法和网页引用候选确认优先。
 - 发送受理后清空草稿，未受理保留。生成中可加入会话绑定的 FIFO 队列，冻结问题、附件、引用、模型与联网选择；完成后由 AIController 继续，不依赖视图挂载。
 - 停止或失败暂停并保留队列；新对话、历史切换及关闭展示标签后，旧会话的队列继续在后台执行。归档、删除及受理历史编辑清理对应队列，不能发送到其他会话。队列只在内存保存，并保留数量和附件预算限制。
@@ -67,12 +77,16 @@
 - 历史右键支持重命名与置顶，手动名称优先于未完成的自动标题。置顶独立分组显示在 Chat 上方，保留原始会话来源和时间排序，取消后回原组；归档和 Fork 清除置顶状态。名称及置顶持久化，旧存档默认未置顶。
 - macOS 27 默认隐藏 NSMenuItem 图像，会话菜单显式设置 preferredImageVisibility 为 visible，重命名使用 pencil 图标；通过检测公开 Objective-C setter 并使用 KVC 设置枚举原值 1，兼容尚未声明该属性的旧 SDK。旧版系统不存在此 setter，继续使用原生默认行为；macOS 27 UI 回归检查实际属性值。
 - 阅读位置持久化为消息 ID 与消息内偏移，网页侧栏和完整 Chat 共用。延迟布局按消息锚点校正，不能用固定绝对坐标或强制滚到底部覆盖用户阅读。
-- 消息布局保留已测量高度，Markdown 视图在视口附近加载、离屏释放。普通鼠标滚轮没有 phase，也必须通知阅读记录组件；事件监听随视图移除清理。
+- Chat 使用一个保留的 WKWebView，按消息 ID 更新 DOM；未变化的消息、表格排序、图表视口和展开状态不随草稿或流式状态重建。桥接字典字段顺序不稳定，内容签名先对对象键排序，数组保留原顺序，不能直接以原始 JSON 字段顺序判断变化。阅读位置仍使用消息 ID 与偏移，布局变化按锚点校正；正文、思考和代码的滚动由 WebKit 管理。桥接视图直接订阅 Store 与 AIController，保证设置、历史切换及后台流式内容更新能到达 HTML。
 - 思考、搜索、工具和正文状态分别管理。运行中的 phase 不写入历史，不能仅凭累计正文是否为空推断当前状态。
 - 历史行从实时会话读取运行状态：生成中右侧常显原生转圈，悬停不替换成归档；空闲时文字占满，悬停才渐显归档并为图标让位。图标位于行高亮内；减少动态效果时静态显示运行标记，动画随视图离窗暂停。
 - 澄清工具在完整工具流验证后保存 awaiting_user 结果并结束本轮，答案作为新一轮续聊。后续建议的直接发送和填入草稿使用独立点击区域，不能冒泡触发彼此。
 
 验证入口：`python3 tests/ai-self-check.py build/Perch.app/Contents/MacOS/Perch --composer-only`；同一服务也提供 `--background-only`、`--streaming-only`、`--experience-only` 及完整 AI 回归。后台专项使用独立 owner 与可控 SSE 阶段，覆盖历史行鼠标选择、跨会话/网页/侧栏切换、关闭重开、FIFO、显式停止、删除和工具后续轮次。
+
+HTML Chat 入口为 `--ai-chat-html-self-test`；使用合成接口时运行 `python3 tests/ai-self-check.py build/Perch.app/Contents/MacOS/Perch --chat-html-only`。桥仅接受 `perch-chat://conversation/` 的主框架与当前 owner/会话 ID，位于隔离的 `.defaultClient` world；普通页面世界和生成文件的沙箱子框架没有宿主能力。模型内容经 DOMPurify 净化，操作控件只由受信任脚本创建。WebContent 进程终止后从 Swift 状态恢复页面，不重新发送请求。
+
+嵌入式 WebKit 存在原生命中正确但 DOM 悬停不稳定的既有兼容边界；Chat 与独立 Markdown 共用 `AIWebHoverTracker`，在实际窗口命中后同步来源和消息悬浮操作，离窗清理监听。Chat 底部工具栏使用箭头光标；原生悬停根据 DOM 命中恢复箭头，并用事件修订号丢弃过期回复，避免覆盖随后进入文本区的光标。来源目标按 DOM 节点弱引用登记，支持多条消息和多个来源列表；纯悬浮事件不触发会话状态重绘。
 
 ## 模型供应商、协议与联网
 

@@ -2,7 +2,7 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 # GUI checks share focus, and builds/installations share the same app bundle.
 .NOTPARALLEL:
-.PHONY: help build verify test check test-ai test-navigation test-web test-ui test-window test-keychain install reinstall run preview clean
+.PHONY: help build verify test check test-ai test-navigation test-downloads test-web test-ui test-window test-keychain install reinstall run preview clean
 
 APP := build/Perch.app
 BIN := $(APP)/Contents/MacOS/Perch
@@ -18,6 +18,7 @@ help:
 	  'make test-web      WebKit 合成页面回归' \
 	  'make test-ai       AI 合成接口、页面提取与流式聊天回归' \
 	  'make test-navigation 网页加载中、连续前进后退与 History API 回归' \
+	  'make test-downloads WebKit 下载、进度与内部记录页合成回归' \
 	  'make test-ui       原生 UI 回归' \
 	  'make test-window   窗口与动画回归' \
 	  'make test-keychain 合成钥匙串回归（单独运行）' \
@@ -34,12 +35,15 @@ verify: build
 test: verify
 	@"$(BIN)" --self-test
 	@"$(BIN)" --update-self-test
+	@"$(BIN)" --home-page-state-self-test
 
 check: test
+	@"$(BIN)" --ai-history-self-test
 	@"$(BIN)" --ai-typography-self-test
 	@python3 tests/ai-self-check.py "$(BIN)" --background-only
 	@python3 tests/ai-self-check.py "$(BIN)"
 	@python3 tests/ai-self-check.py "$(BIN)" --navigation
+	@python3 tests/download-self-check.py "$(BIN)"
 	@"$(BIN)" --web-self-test
 	@"$(BIN)" --web-tabs-self-test
 	@"$(BIN)" --scroll-self-test
@@ -53,12 +57,16 @@ test-web: verify
 	@"$(BIN)" --scroll-self-test
 
 test-ai: verify
+	@"$(BIN)" --ai-history-self-test
 	@"$(BIN)" --ai-typography-self-test
 	@python3 tests/ai-self-check.py "$(BIN)" --background-only
 	@python3 tests/ai-self-check.py "$(BIN)"
 
 test-navigation: verify
 	@python3 tests/ai-self-check.py "$(BIN)" --navigation
+
+test-downloads: verify
+	@python3 tests/download-self-check.py "$(BIN)"
 
 test-ui: verify
 	@"$(BIN)" --ui-self-test --compact

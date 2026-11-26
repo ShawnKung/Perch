@@ -108,6 +108,14 @@ final class AIHistoryRow: TabSelectionRow {
     private(set) var hovered = false
     var conversation = false
     private var tracking: NSTrackingArea?
+    override func layout() {
+        super.layout()
+        guard conversation else { return }
+        layer?.masksToBounds = true
+        for cell in subviews.compactMap({ $0 as? AIHistoryCell }) {
+            cell.frame = NSRect(x: 0, y: 1, width: bounds.width, height: 40 * PerchTheme.shared.chatScale)
+        }
+    }
     override func didAddSubview(_ subview: NSView) {
         super.didAddSubview(subview)
         (subview as? AIHistoryCell)?.setHovered(hovered, animated: false)
@@ -208,7 +216,7 @@ struct AIHistoryList: NSViewRepresentable {
         let table = AIHistoryTable()
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("history"))
         table.addTableColumn(column)
-        table.headerView = nil; table.rowHeight = 40; table.intercellSpacing = NSSize(width: 0, height: 2)
+        table.headerView = nil; table.rowHeight = 40; table.intercellSpacing = .zero
         table.backgroundColor = NSColor(Style.sidebar); table.focusRingType = .none
         table.style = .plain
         table.floatsGroupRows = true
@@ -238,7 +246,7 @@ struct AIHistoryList: NSViewRepresentable {
             }
         }
     }
-    final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
+    @MainActor final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         var parent: AIHistoryList
         var theme: ThemeColor = .green
         weak var table: AIHistoryTable?
@@ -250,7 +258,12 @@ struct AIHistoryList: NSViewRepresentable {
         private var renderedRows: [String] = []
         private var renderedActive: UUID?
         private var renderedFontSize = BrowserSettings.defaultChatFontSize
+        private var disclosureAnimations: [AIHistoryGroup: TabWipeAnimation] = [:]
+        private var disclosureProgress: [AIHistoryGroup: CGFloat] = [:]
+        private var groupRanges: [AIHistoryGroup: Range<Int>] = [:]
+        private var renderedConversations: [AISession] = []
         init(_ parent: AIHistoryList) { self.parent = parent }
+        deinit { disclosureAnimations.values.forEach { $0.stop() } }
         func sourceTitle(_ session: AISession) -> String? {
             let references = (session.pageReferences ?? []) + session.messages.flatMap(\.references)
             var seen = Set<String>()
@@ -273,6 +286,10 @@ struct AIHistoryList: NSViewRepresentable {
             let fontSize = PerchTheme.shared.chatFontSize
             let fontChanged = renderedFontSize != fontSize
             guard signature != renderedRows || renderedActive != parent.active || fontChanged else { return }
+            // Keep live rows until the height transition finishes; apply content updates afterwards.
+            if animatedOrigin == nil && !disclosureAnimations.isEmpty { return }
+            // Reversals use the same row identities until pending inserts/deletes can be applied.
+            if disclosureAnimations.isEmpty { renderedConversations = parent.conversations }
             let topRow = table.rows(in: table.visibleRect).location
             let offset = topRow != NSNotFound && topRow < rows.count ? table.visibleRect.minY - table.rect(ofRow: topRow).minY : 0
             let activeChanged = renderedActive != parent.active
@@ -280,31 +297,27 @@ struct AIHistoryList: NSViewRepresentable {
             let selected = Set(table.selectedRowIndexes.compactMap { table.conversationIDs.indices.contains($0) ? table.conversationIDs[$0] : nil })
             let oldRows = rows
             rows = AIHistoryGroup.allCases.flatMap { origin -> [(origin: AIHistoryGroup, session: AISession?)] in
-                let sessions = parent.conversations.filter { AIHistoryGroup.group(for: $0, archived: parent.archived) == origin }
+                let sessions = renderedConversations.filter { AIHistoryGroup.group(for: $0, archived: parent.archived) == origin }
                 if origin == .pinned && sessions.isEmpty { return [] }
-                return [(origin: origin, session: nil)] + (collapsed.contains(origin) ? [] :
+                return [(origin: origin, session: nil)] + (collapsed.contains(origin) && disclosureProgress[origin] == nil ? [] :
                     sessions.map { (origin: origin, session: Optional($0)) })
+            }
+            groupRanges.removeAll()
+            for (index, entry) in rows.enumerated() where entry.session == nil {
+                let end = rows[(index + 1)...].firstIndex { $0.session == nil } ?? rows.count
+                groupRanges[entry.origin] = (index + 1)..<end
             }
             table.conversationIDs = rows.map { $0.session?.id }
             if let origin = animatedOrigin {
-                let closing = collapsed.contains(origin)
-                let affectedRows = closing ? oldRows : rows
-                let affected = IndexSet(affectedRows.indices.filter {
-                    affectedRows[$0].origin == origin && affectedRows[$0].session != nil
-                })
                 let header = oldRows.firstIndex { $0.origin == origin && $0.session == nil }!
                 let cell = table.view(atColumn: 0, row: header, makeIfNecessary: false) as? AIHistoryCell
-                let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+                cell?.rotateDisclosure(expanded: !collapsed.contains(origin), animated: true)
                 NSAnimationContext.runAnimationGroup { context in
-                    context.duration = reduceMotion ? 0 : 0.22
-                    cell?.rotateDisclosure(expanded: !closing, animated: !reduceMotion)
-                    table.beginUpdates()
-                    if closing {
-                        table.removeRows(at: affected, withAnimation: reduceMotion ? [] : [.slideUp, .effectFade])
-                    } else {
-                        table.insertRows(at: affected, withAnimation: reduceMotion ? [] : [.slideDown, .effectFade])
+                    context.duration = 0
+                    if rows.count > oldRows.count {
+                        let affected = IndexSet(rows.indices.filter { rows[$0].origin == origin && rows[$0].session != nil })
+                        table.insertRows(at: affected, withAnimation: [])
                     }
-                    table.endUpdates()
                 }
             } else {
                 table.reloadData()
@@ -327,7 +340,13 @@ struct AIHistoryList: NSViewRepresentable {
         func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool { rows[row].session != nil }
         func tableView(_ tableView: NSTableView, isGroupRow row: Int) -> Bool { rows[row].session == nil }
         func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
-            CGFloat((rows[row].session == nil ? 32 : 40) * PerchTheme.shared.chatScale)
+            let entry = rows[row]
+            // Include the old intercell spacing in the wipe so collapsed rows leave no gaps.
+            let height = CGFloat((entry.session == nil ? 32 : 40) * PerchTheme.shared.chatScale) + 2
+            guard entry.session != nil, let range = groupRanges[entry.origin] else { return height }
+            let progress = disclosureProgress[entry.origin] ?? (collapsed.contains(entry.origin) ? 0 : 1)
+            return max(0.001, min(height,
+                (CGFloat(range.count) * progress - CGFloat(row - range.lowerBound)) * height))
         }
         func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
             let view = AIHistoryRow()
@@ -453,8 +472,38 @@ struct AIHistoryList: NSViewRepresentable {
             if let session = rows[row].session { parent.open(session.id) }
             else {
                 let origin = rows[row].origin
+                let from = disclosureProgress[origin] ?? (collapsed.contains(origin) ? 0 : 1)
+                disclosureAnimations[origin]?.stop()
                 if collapsed.contains(origin) { collapsed.remove(origin) } else { collapsed.insert(origin) }
+                if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                    disclosureAnimations.values.forEach { $0.stop() }
+                    disclosureAnimations.removeAll(); disclosureProgress.removeAll()
+                    renderedRows = []
+                    refresh()
+                    return
+                }
+                disclosureProgress[origin] = from
+                let animation = TabWipeAnimation(from: from, to: collapsed.contains(origin) ? 0 : 1, duration: 0.22) { [weak self] value, finished in
+                    guard let self, let table = self.table else { return }
+                    self.disclosureProgress[origin] = value
+                    let affected = IndexSet(integersIn: self.groupRanges[origin] ?? (0..<0))
+                    NSAnimationContext.runAnimationGroup { context in
+                        context.duration = 0
+                        table.noteHeightOfRows(withIndexesChanged: affected)
+                        table.layoutSubtreeIfNeeded()
+                    }
+                    if finished {
+                        self.disclosureAnimations.removeValue(forKey: origin)
+                        if self.disclosureAnimations.isEmpty {
+                            self.disclosureProgress.removeAll()
+                            self.renderedRows = []
+                            self.refresh()
+                        }
+                    }
+                }
+                disclosureAnimations[origin] = animation
                 refresh(animatedOrigin: origin)
+                animation.start()
             }
         }
         func menu(_ row: Int) -> NSMenu? {

@@ -130,6 +130,7 @@ enum SelfTests {
     }
     @MainActor
     static func run() throws {
+        try DownloadSelfCheck.data()
         try BackupSelfCheck.run()
         try savedTabGroups()
         tabGroupCreation()
@@ -1952,119 +1953,11 @@ final class LayoutSelfCheck {
         fflush(stdout)
     }
     func verifyHomeShortcutDrag() async {
-        func check(_ value: @autoclosure () -> Bool, _ message: String, line: UInt = #line) {
-            guard value() else { fputs("FAIL: home shortcut drag \(line): \(message)\n", stderr); exit(1) }
-        }
-        store.library = nil
-        store.newTab()
-        store.sites = (0..<6).map { Site(title: "Home fixture \($0)", address: "http://127.0.0.1:9/home-\($0)") }
-        let bookmarkData = try! JSONEncoder().encode(store.sites)
-        defaults.set(bookmarkData, forKey: "sites")
-        await settle()
-        func find(_ view: NSView) -> HomeShortcutGridView? {
-            if let grid = view as? HomeShortcutGridView { return grid }
-            for child in view.subviews { if let grid = find(child) { return grid } }
-            return nil
-        }
-        guard let grid = find(panel.contentView!), let first = grid.subviews.first as? HomeShortcutCell else {
-            check(false, "Real homepage must contain native shortcut grid"); return
-        }
-        let ids = grid.ids
-        check(ids == store.sites.map(\.id), "Initial grid follows bookmark order")
-        let start = first.convert(NSPoint(x: first.bounds.midX, y: first.bounds.midY), to: nil)
-        NSApp.activate(ignoringOtherApps: true); panel.focusWindow()
-        await settle()
-        let image = first.dragImage()!
-        let bitmap = NSBitmapImageRep(data: image.tiffRepresentation!)!
-        let alpha = bitmap.colorAt(x: bitmap.pixelsWide / 2, y: bitmap.pixelsHigh / 2)!.alphaComponent
-        check((0.8...0.95).contains(alpha), "Floating card must contain visible semitransparent content")
-        try? bitmap.representation(using: .png, properties: [:])?.write(to:
-            FileManager.default.temporaryDirectory.appendingPathComponent("perch-home-drag-card.png"))
-        func event(_ type: NSEvent.EventType, _ point: NSPoint) -> NSEvent {
-            NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
-                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber,
-                context: nil, eventNumber: 1, clickCount: 1, pressure: type == .leftMouseUp ? 0 : 1)!
-        }
-        // Keep the real root hit-test and drag threshold, substituting only system drag capture.
-        // AppKit's capture reads the actual system mouse and cannot be driven by window events.
-        var substituted = false
-        first.dragRequested = { [weak grid] _ in substituted = true; grid?.beginPreview(ids[0]) }
-        NSApp.postEvent(event(.leftMouseDragged, NSPoint(x: start.x + 12, y: start.y)), atStart: true)
-        NSApp.sendEvent(event(.leftMouseDown, start))
-        check(substituted, "Native drag threshold must invoke the substituted capture")
-        check(grid.dragID == ids[0], "Native press/drag events must begin a session")
-        check(first.alphaValue == 0, "Source slot must be transparent while dragging")
-        check(store.homeShortcutOrder.isEmpty, "Beginning a drag must not persist")
-        // Destination callbacks use synthetic local drag info, as in the native bookmark tests.
-        let board = NSPasteboard.withUniqueName()
-        defer { board.releaseGlobally() }
-        board.setString(ids[0].uuidString, forType: HomeShortcutGridView.pasteboardType)
-        let drag = BookmarkTestDrag(board: board, table: grid)
-        let foreign = BookmarkTestDrag(board: board, table: first)
-        foreign.draggingLocation = start
-        check(grid.draggingUpdated(foreign).isEmpty, "Only this grid's local drag can reorder")
-        let target = HomeShortcutLayout.frames(count: ids.count, width: grid.bounds.width)[3]
-        drag.draggingLocation = grid.convert(NSPoint(x: target.midX, y: target.midY), to: nil)
-        check(grid.draggingUpdated(drag) == .move, "Local destination accepts drag")
-        check(grid.ids == [ids[1], ids[2], ids[3], ids[0], ids[4], ids[5]], "Preview must move across rows")
-        await settle()
-        check(first.frame == target, "Live preview must move actual card frames across rows")
-        check(first.alphaValue == 0, "Preview must keep the source hidden")
-        check(defaults.data(forKey: "homeShortcutOrder") == nil, "Preview must not persist")
-        grid.draggingExited(drag)
-        await settle()
-        check(grid.ids == ids, "Leaving grid must restore original order")
-        drag.draggingLocation = grid.convert(NSPoint(x: -10, y: -10), to: nil)
-        check(!grid.performDragOperation(drag), "Outside drop must be rejected")
-        drag.draggingLocation = grid.convert(NSPoint(x: target.midX, y: target.midY), to: nil)
-        _ = grid.draggingUpdated(drag)
-        check(grid.performDragOperation(drag), "Valid drop must commit")
-        NSApp.sendEvent(event(.leftMouseUp, drag.draggingLocation))
-        let expected = [ids[1], ids[2], ids[3], ids[0], ids[4], ids[5]]
-        check(store.homeShortcuts.map(\.id) == expected, "Accepted order reaches Store")
-        check(store.browser == nil, "A drag release must not open a webpage")
-        check(store.sites.map(\.id) == ids && defaults.data(forKey: "sites") == bookmarkData,
-              "Home reorder must preserve bookmark order and bytes")
-        grid.cancelPreview()
-        await settle()
-        check(grid.ids == expected && first.frame == target && first.alphaValue == 1,
-              "Session end keeps accepted order, moves frames and restores source")
-        let savedOrder = defaults.data(forKey: "homeShortcutOrder")
-        check(grid.beginPreview(ids[0]), "Another drag can begin after drop")
-        let before = HomeShortcutLayout.frames(count: ids.count, width: grid.bounds.width)[0]
-        drag.draggingLocation = grid.convert(NSPoint(x: before.midX, y: before.midY), to: nil)
-        _ = grid.draggingUpdated(drag)
-        grid.cancelPreview()
-        await settle()
-        check(grid.ids == expected && first.frame == target && defaults.data(forKey: "homeShortcutOrder") == savedOrder,
-              "Cancellation restores preview without persisting")
-        let commit = grid.commit
-        grid.commit = { _ in false }
-        check(grid.beginPreview(ids[0]) && !grid.performDragOperation(drag),
-              "A rejected save must reject the drop")
-        grid.commit = commit
-        check(grid.ids == expected && first.alphaValue == 1 && defaults.data(forKey: "homeShortcutOrder") == savedOrder,
-              "Rejected drop restores the original visible order")
-        if let view = panel.contentView, let snapshot = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
-            view.cacheDisplay(in: view.bounds, to: snapshot)
-            try? snapshot.representation(using: .png, properties: [:])?.write(to:
-                FileManager.default.temporaryDirectory.appendingPathComponent("perch-home-shortcuts.png"))
-        }
-        let click = first.convert(NSPoint(x: first.bounds.maxX - 3, y: first.bounds.midY), to: nil)
-        let homeID = store.selected!
-        check(panel.isVisible, "Pointer routing requires a visible isolated window")
-        NSApp.postEvent(event(.leftMouseUp, click), atStart: true)
-        NSApp.sendEvent(event(.leftMouseDown, click))
-        check(store.selected == homeID && store.tabs.first(where: { $0.id == homeID })?.address == store.sites[0].address &&
-              store.cachedBrowser(for: homeID) != nil, "Card edge click must request navigation in the current home tab")
-        await settle()
-        store.newTab()
-        await settle()
-        print("PASS: homepage native drag hit path, translucent image, cross-row preview frames, source placeholder, outside rejection, commit, cancellation and ordinary click; system capture substituted and destination uses synthetic local drag info")
-        fflush(stdout)
+        do { try await HomePageSelfCheck.drag(store: store, panel: panel) }
+        catch { fputs("FAIL: HTML home drag: \(error)\n", stderr); exit(1) }
     }
     private func clickInPanel(_ point: NSPoint) async {
-        NSApp.activate(ignoringOtherApps: true)
+        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
         panel.focusWindow()
         for _ in 0..<60 where !NSApp.isActive || !panel.isKeyWindow {
             try? await Task.sleep(nanoseconds: 16_000_000)
@@ -2752,13 +2645,6 @@ final class LayoutSelfCheck {
         }
         return find(panel.contentView!)!
     }
-    func homeAddressField() -> NSTextField {
-        func find(_ view: NSView) -> NSTextField? {
-            if let field = view as? NSTextField, field.identifier?.rawValue == "homeAddress" { return field }
-            return view.subviews.lazy.compactMap { find($0) }.first
-        }
-        return find(panel.contentView!)!
-    }
     func verifyBookmarkEditor() async {
         SelfTests.prepareAccessibility()
         func check(_ condition: Bool, _ message: String) {
@@ -2962,92 +2848,8 @@ final class LayoutSelfCheck {
         fflush(stdout)
     }
     func verifyHomeNavigation(baseURL: String) async {
-        SelfTests.prepareAccessibility()
-        func clickAccessible(_ label: String) async throws {
-            var visited = Set<ObjectIdentifier>()
-            func find(_ node: NSObject) -> NSRect? {
-                guard visited.insert(ObjectIdentifier(node)).inserted else { return nil }
-                if node.responds(to: NSSelectorFromString("accessibilityLabel")),
-                   node.value(forKey: "accessibilityLabel") as? String == label,
-                   node.responds(to: NSSelectorFromString("accessibilityPerformPress")),
-                   node.responds(to: NSSelectorFromString("accessibilityFrame")),
-                   let frame = node.value(forKey: "accessibilityFrame") as? NSValue { return frame.rectValue }
-                var children: [NSObject] = (node as? NSView)?.subviews ?? []
-                if node.responds(to: NSSelectorFromString("accessibilityChildren")),
-                   let accessible = node.value(forKey: "accessibilityChildren") as? [NSObject] { children += accessible }
-                for child in children { if let frame = find(child) { return frame } }
-                return nil
-            }
-            guard let rect = find(panel.contentView!), !rect.isEmpty else { throw PerchError("Missing native button: \(label)") }
-            await clickInPanel(panel.convertPoint(fromScreen: NSPoint(x: rect.midX, y: rect.midY)))
-        }
-        do {
-            guard URL(string: baseURL)?.host == "127.0.0.1" else { throw PerchError("Home UI fixture must use loopback") }
-            let id = store.selected!
-            store.settings.searchEngine = "custom"
-            store.settings.customSearchURL = baseURL + "/nav/a?q={query}"
-            for home in [true, false] {
-                let field = home ? homeAddressField() : addressField()
-                panel.focusWindow()
-                panel.makeFirstResponder(field)
-                let editor = field.currentEditor() as! NSTextView
-                let draft = home ? "  " + baseURL + "/nav/a  " : "  合成 搜索词  "
-                editor.selectAll(nil)
-                editor.insertText(draft, replacementRange: NSRange(location: NSNotFound, length: 0))
-                await Task.yield()
-                for type in [NSEvent.EventType.keyDown, .keyUp] {
-                    NSApp.sendEvent(NSEvent.keyEvent(with: type, location: .zero, modifierFlags: [],
-                        timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber,
-                        context: nil, characters: "\r", charactersIgnoringModifiers: "\r",
-                        isARepeat: false, keyCode: 36)!)
-                }
-                try await AISelfCheck.wait(timeout: 10) { self.store.browser?.webView.title == "a" && self.store.browser?.canGoBack == true }
-                await settle()
-                guard addressField().currentEditor() == nil else {
-                    throw PerchError("Submitted address stole focus after navigation, central=\(home), responder=\(String(describing: panel.firstResponder)), input=\(addressField().stringValue)")
-                }
-                try await clickAccessible("后退")
-                try await AISelfCheck.wait(timeout: 10) { self.store.browser == nil }
-                await settle()
-                let restored = home ? homeAddressField() : addressField()
-                guard store.selected == id, restored.stringValue == draft else { throw PerchError("Native home input did not survive back") }
-                try await clickAccessible("前进")
-                try await AISelfCheck.wait(timeout: 10) { self.store.browser?.webView.title == "a" }
-                store.cachedBrowser(for: id)?.goBack()
-                try await AISelfCheck.wait(timeout: 10) { self.store.browser == nil }
-                await settle()
-            }
-            let site = Site(title: "首页合成书签", address: baseURL + "/nav/b")
-            store.sites = [site]
-            await settle()
-            var visited = Set<ObjectIdentifier>()
-            func bookmark(_ node: NSObject) -> NSObject? {
-                guard visited.insert(ObjectIdentifier(node)).inserted else { return nil }
-                if node.responds(to: NSSelectorFromString("accessibilityLabel")),
-                   (node.value(forKey: "accessibilityLabel") as? String)?.contains(site.title) == true,
-                   node.responds(to: NSSelectorFromString("accessibilityPerformPress")),
-                   node.responds(to: NSSelectorFromString("accessibilityFrame")) { return node }
-                var children: [NSObject] = (node as? NSView)?.subviews ?? []
-                if node.responds(to: NSSelectorFromString("accessibilityChildren")),
-                   let accessible = node.value(forKey: "accessibilityChildren") as? [NSObject] { children += accessible }
-                for child in children { if let result = bookmark(child) { return result } }
-                return nil
-            }
-            guard let button = bookmark(panel.contentView!),
-                  let frame = button.value(forKey: "accessibilityFrame") as? NSValue else { throw PerchError("Home bookmark has no native hit target") }
-            let count = store.tabs.count
-            let rect = frame.rectValue
-            await clickInPanel(panel.convertPoint(fromScreen: NSPoint(x: rect.midX, y: rect.midY)))
-            try await AISelfCheck.wait(timeout: 10) { self.store.browser?.webView.title == "b" }
-            guard store.selected == id, store.tabs.count == count else { throw PerchError("Home bookmark click opened another tab") }
-            store.browser?.goBack()
-            try await AISelfCheck.wait(timeout: 10) { self.store.browser == nil }
-            await settle()
-            guard homeAddressField().stringValue.contains("/nav/a"),
-                  addressField().stringValue == "  合成 搜索词  " else { throw PerchError("Bookmark back lost home inputs") }
-            print("PASS: native Return submission, actual back/forward clicks and restored central/toolbar input")
-            print("PASS: actual home bookmark click reuses its tab and back preserves both inputs")
-        } catch { fputs("FAIL: home navigation UI: \(error)\n", stderr); exit(1) }
+        do { try await HomePageSelfCheck.navigation(store: store, panel: panel, baseURL: baseURL) }
+        catch { fputs("FAIL: HTML home navigation: \(error)\n", stderr); exit(1) }
     }
     func editAddress(_ text: String) {
         let field = addressField()
@@ -3068,46 +2870,11 @@ final class LayoutSelfCheck {
             }
             try? await Task.sleep(nanoseconds: 20_000_000)
         }
-        guard let selected = store.selected, let other = store.tabs.first(where: { $0.id != selected }) else {
+        guard let selected = store.selected, store.tabs.contains(where: { $0.id != selected }) else {
             preconditionFailure("Homepage focus fixture requires two tabs")
         }
-        for (home, throughTable) in [(true, true), (false, true), (true, false), (false, false)] {
-            let field = home ? homeAddressField() : addressField()
-            panel.makeFirstResponder(field)
-            guard field.currentEditor() === panel.firstResponder else {
-                fputs("FAIL: could not focus \(home ? "home search" : "toolbar address") before switching\n", stderr); exit(1)
-            }
-            let editor = field.currentEditor() as! NSTextView
-            let draft = home ? "首页草稿 fixture" : "地址草稿 fixture"
-            editor.selectAll(nil)
-            editor.insertText(draft, replacementRange: NSRange(location: NSNotFound, length: 0))
-            editor.setSelectedRange(NSRange(location: 2, length: 1))
-            // AppKit transfers first responder before the table receives mouseDown.
-            if throughTable { panel.makeFirstResponder(table()) }
-            store.activate(other.id)
-            await settle()
-            let otherField = home ? homeAddressField() : addressField()
-            guard otherField.stringValue != draft else {
-                fputs("FAIL: homepage drafts leaked between tabs\n", stderr); exit(1)
-            }
-            if throughTable { panel.makeFirstResponder(table()) }
-            store.activate(selected)
-            await settle()
-            let restored = home ? homeAddressField() : addressField()
-            let restoreDeadline = Date().addingTimeInterval(3)
-            while restored.currentEditor() !== panel.firstResponder || restored.currentEditor() == nil {
-                guard Date() < restoreDeadline else { break }
-                try? await Task.sleep(nanoseconds: 20_000_000)
-            }
-            guard restored.currentEditor() === panel.firstResponder else {
-                fputs("FAIL: did not restore \(home ? "home search" : "toolbar address") after switching: key=\(panel.isKeyWindow), active=\(NSApp.isActive), responder=\(String(describing: panel.firstResponder)), editor=\(String(describing: restored.currentEditor()))\n", stderr); exit(1)
-            }
-            guard restored.currentEditor()?.string == draft,
-                  (restored.currentEditor() as? NSTextView)?.selectedRange() == NSRange(location: 2, length: 1) else {
-                fputs("FAIL: did not restore \(home ? "home search" : "toolbar address") text and selection: text=\(restored.currentEditor()?.string ?? "nil"), selection=\(String(describing: (restored.currentEditor() as? NSTextView)?.selectedRange()))\n", stderr); exit(1)
-            }
-        }
-        print("PASS: homepage search and address drafts, focus and selection survive table and direct tab switches without leaking")
+        do { try await HomePageSelfCheck.focus(store: store, panel: panel, table: table()) }
+        catch { fputs("FAIL: HTML home focus: \(error)\n", stderr); exit(1) }
         let url = URL(string: "https://perch-reference.invalid/page?fixture=1")!
         let count = store.tabs.count
         store.openReferencedPage(url)
@@ -3122,64 +2889,8 @@ final class LayoutSelfCheck {
         print("PASS: page reference opens within Perch and reuses an existing tab")
     }
     func verifyAddressComposition() async {
-        let host = NSHostingView(rootView: HomeScreen(store: store, tabID: store.selected ?? AIController.homeID).defaultAppStorage(defaults))
-        let window = NSWindow(contentRect: NSRect(x: 150, y: 180, width: 780, height: 580),
-                              styleMask: [.titled], backing: .buffered, defer: false)
-        window.contentView = host; window.makeKeyAndOrderFront(nil)
-        defer { window.orderOut(nil); window.contentView = nil; panel.makeKeyAndOrderFront(nil) }
-        await settle()
-        func find(_ view: NSView) -> NSTextField? {
-            if let field = view as? NSTextField, field.delegate is AddressTextField.Coordinator { return field }
-            return view.subviews.lazy.compactMap { find($0) }.first
-        }
-        let field = find(host)!
-        window.makeFirstResponder(field)
-        let editor = field.currentEditor() as! NSTextView
-        editor.setSelectedRange(NSRange(location: 0, length: editor.string.utf16.count))
-        editor.setMarkedText("n", selectedRange: NSRange(location: 1, length: 0),
-                             replacementRange: NSRange(location: NSNotFound, length: 0))
-        let sites = store.sites
-        store.sites = sites
-        await settle()
-        fflush(stdout)
-        precondition(editor.string == "n" && editor.hasMarkedText(), "Redrawing the homepage must not swallow the first IME letter")
-        editor.setMarkedText("ni", selectedRange: NSRange(location: 2, length: 0),
-                             replacementRange: NSRange(location: NSNotFound, length: 0))
-        store.sites = sites
-        await settle()
-        fflush(stdout)
-        precondition(editor.string == "ni" && editor.hasMarkedText())
-        let coordinator = field.delegate as! AddressTextField.Coordinator
-        for command in ["moveDown:", "moveUp:", "insertNewline:", "cancelOperation:"] {
-            precondition(!coordinator.control(field, textView: editor, doCommandBy: NSSelectorFromString(command)),
-                         "IME candidate keys must remain with the native input method")
-        }
-        editor.insertText("你", replacementRange: NSRange(location: NSNotFound, length: 0))
-        await settle()
-        fflush(stdout)
-        precondition(!editor.hasMarkedText() && editor.string == "你" && coordinator.parent.text == "你")
-        editor.insertText("好", replacementRange: NSRange(location: NSNotFound, length: 0))
-        await settle()
-        precondition(editor.string == "你好" && coordinator.parent.text == "你好")
-        precondition(field.focusRingType == .none, "The homepage must not show an inner blue focus ring")
-        print("PASS: homepage native IME first letter, composition across redraws, candidate keys, Chinese commit and plain focus appearance")
-        store.sites = (0..<8).map { Site(title: "Suggestion fixture \($0)", address: "https://suggestion-\($0).invalid/") }
-        editor.setSelectedRange(NSRange(location: 0, length: editor.string.utf16.count))
-        editor.insertText("Suggestion fixture", replacementRange: NSRange(location: NSNotFound, length: 0))
-        await settle()
-        let fieldRect = field.convert(field.bounds, to: nil)
-        let point = NSPoint(x: fieldRect.midX, y: fieldRect.minY - 30 - 3 * 49 - 20)
-        for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
-            let event = NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
-                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
-                context: nil, eventNumber: 0, clickCount: 1, pressure: 0)!
-            window.sendEvent(event)
-        }
-        await settle()
-        precondition(store.tabs.first(where: { $0.id == store.selected })?.address.hasPrefix("https://suggestion-") == true,
-                     "Suggestion rows overlapping homepage cards must receive mouse clicks")
-        store.sites = sites
-        print("PASS: homepage suggestion dropdown receives clicks above the Chat and shortcut cards")
+        do { try await HomePageSelfCheck.input(store: store, panel: panel) }
+        catch { fputs("FAIL: HTML home input: \(error)\n", stderr); exit(1) }
     }
     func verify(width: CGFloat) {
         func check(_ condition: @autoclosure () -> Bool, _ message: String = "", line: UInt = #line) {
@@ -3300,8 +3011,15 @@ final class LayoutSelfCheck {
               "The draft must reference both the page and the frozen text")
         check(store.ai.drafts[owner] == "保留已有草稿" && store.ai.sessions[owner]?.requestID == nil,
               "Ask AI must preserve the question and wait for explicit sending")
-        for _ in 0..<20 where !(panel.firstResponder is AIComposerTextView) { await settle() }
-        check(panel.firstResponder is AIComposerTextView, "Ask AI must focus the native composer; responder=\(String(describing: panel.firstResponder)), active=\(NSApp.isActive), key=\(panel.isKeyWindow)")
+        var chatFocused = false
+        for _ in 0..<20 {
+            if let web = AIChatPageSelfCheck.find(panel.contentView!) {
+                chatFocused = (try? await web.evaluateJavaScript("document.activeElement.id==='composer'")) as? Bool == true
+            }
+            if chatFocused { break }
+            await settle()
+        }
+        check(chatFocused && panel.firstResponder is NSTextInputClient, "Ask AI must focus the native WebKit input client; responder=\(String(describing: panel.firstResponder)), active=\(NSApp.isActive), key=\(panel.isKeyWindow)")
         check(store.ai.composerFocusRequests[owner] == nil, "Focus requests must be consumed instead of replaying on later tab switches")
         let snapshot = store.ai.draftQuotes[owner]!
         let restored = try? JSONDecoder().decode(AIQuote.self, from: JSONEncoder().encode(snapshot))
@@ -3309,6 +3027,9 @@ final class LayoutSelfCheck {
               "Page quotes must persist and escape quoted markup")
         store.askAI(selected, tabID: id)
         check(store.ai.draftReferences[owner] == [id], "Repeated Ask AI must not duplicate the page reference")
+        let repeatedSnapshot = store.ai.draftQuotes[owner]!
+        check(repeatedSnapshot.text == snapshot.text && repeatedSnapshot.page?.url == snapshot.page?.url,
+              "Repeated Ask AI must preserve the selected text and source")
         let bridge = (try? await browser.webView.evaluateJavaScript("typeof window.webkit?.messageHandlers?.perchSelection")) as? String
         check(bridge == "undefined", "The selection bridge must remain isolated from page scripts")
         check(store.ai.send("已发送的合成消息", tab: owner, browser: nil, usePage: false),
@@ -3330,7 +3051,9 @@ final class LayoutSelfCheck {
             if node.responds(to: NSSelectorFromString("accessibilityChildren")) {
                 children += node.value(forKey: "accessibilityChildren") as? [NSObject] ?? []
             }
-            return children.lazy.compactMap(newChatButton).first
+            // A lazy compactMap can evaluate the transform twice; this search mutates visited.
+            for child in children { if let found = newChatButton(child) { return found } }
+            return nil
         }
         guard let button = newChatButton(panel.contentView!),
               let frame = (button.value(forKey: "accessibilityFrame") as? NSValue)?.rectValue else {
@@ -3344,16 +3067,17 @@ final class LayoutSelfCheck {
         check(store.ai.drafts[newOwner] == "保留文字和引用，开始新会话 🙂" &&
               store.ai.draftFiles[newOwner]?.map(\.id) == [attachment.id] &&
               store.ai.draftFiles[newOwner]?.first?.data == attachment.data && store.ai.draftReferences[newOwner] == [id] &&
-              store.ai.draftQuotes[newOwner] == snapshot,
+              store.ai.draftQuotes[newOwner] == repeatedSnapshot,
               "The new conversation must retain the visible text, attachment, webpage and selection references")
-        check((panel.firstResponder as? AIComposerTextView)?.string == store.ai.drafts[newOwner],
+        let chatInput = try? await AIChatPageSelfCheck.find(panel.contentView!)?.evaluateJavaScript("document.getElementById('composer').value")
+        check(chatInput as? String == store.ai.drafts[newOwner],
               "The new native composer must display the preserved input")
         check(store.ai.sessions[owner]?.messages.map(\.id) == oldMessages &&
               store.ai.sessions[newOwner]?.requestID == nil,
               "Starting a conversation must preserve old history and wait for explicit sending")
         store.newChat()
         check(store.chatOwner == newOwner && store.ai.draftReferences[newOwner] == [id] &&
-              store.ai.draftQuotes[newOwner] == snapshot, "Repeated new-chat clicks must retain the same draft and deduplicate references")
+              store.ai.draftQuotes[newOwner] == repeatedSnapshot, "Repeated new-chat clicks must retain the same draft and deduplicate references")
         print("PASS: actual sidebar new-chat click preserves native composer text, attachments, webpage/selection references and old history without sending")
         print("PASS: actual selected-text context menu, Chinese cleanup, frozen webpage/text references, preserved drafts, composer focus and isolated selection bridge")
     }
@@ -4178,10 +3902,11 @@ final class LayoutSelfCheck {
         precondition(addressField().stringValue.isEmpty && addressField().currentEditor() != nil,
                      "A second empty tab must not retain the previous address draft")
         let secondTab = store.selected!
-        let homeField = homeAddressField()
-        panel.makeFirstResponder(homeField)
-        precondition(homeField.currentEditor() === panel.firstResponder,
-                     "The homepage search field must accept native focus")
+        let homeFixture = HomePageFixture(store: store, panel: panel)
+        let homeWeb = try! await homeFixture.home()
+        try! await homeFixture.click("#search", web: homeWeb)
+        precondition((panel.firstResponder as? NSView)?.isDescendant(of: homeWeb) == true,
+                     "The homepage search must accept native WebKit focus")
         store.activate(oldTab)
         await settle()
         precondition(addressField().currentEditor() === panel.firstResponder &&
@@ -4189,8 +3914,8 @@ final class LayoutSelfCheck {
                      "Returning to a tab must restore its last focused control and text selection")
         store.activate(secondTab)
         await settle()
-        precondition(homeAddressField().currentEditor() === panel.firstResponder,
-                     "Returning to an empty tab must restore the rebuilt homepage search field")
+        precondition((panel.firstResponder as? NSView)?.isDescendant(of: homeWeb) == true,
+                     "Returning to an empty tab must restore its retained WebKit search focus")
         store.close(store.selected!)
         store.close(store.selected!)
         store.newTab()
@@ -4419,7 +4144,9 @@ final class LayoutSelfCheck {
             (view as? AddressTextField.Field).map { [$0] } ?? view.subviews.flatMap(fields)
         }
         let originalFields = fields(panel.contentView!)
-        precondition(originalFields.count == 2 && originalFields.allSatisfy { $0.ownerTab == first })
+        precondition(originalFields.count == 1 && originalFields.allSatisfy { $0.ownerTab == first })
+        let fixture = HomePageFixture(store: store, panel: panel)
+        let originalHome = try! await fixture.home()
         for grouped in [false, true] {
             if grouped { _ = store.createTabGroup(store.selected!) }
             await settle()
@@ -4457,21 +4184,19 @@ final class LayoutSelfCheck {
         let savedSites = store.sites
         store.sites = (0..<40).map { Site(title: "滚动保留 \($0)", address: "https://scroll-\($0).invalid") }
         await settle()
-        var ancestor: NSView? = fields(panel.contentView!).first { $0.identifier?.rawValue == "homeAddress" }
-        while ancestor != nil && !(ancestor is NSScrollView) { ancestor = ancestor?.superview }
-        guard let scroll = ancestor as? NSScrollView else {
-            fputs("FAIL: burst homepage scroll view unavailable\n", stderr); exit(1)
-        }
-        scroll.contentView.scroll(to: NSPoint(x: 0, y: 160))
-        scroll.reflectScrolledClipView(scroll.contentView)
-        let position = scroll.contentView.bounds.origin
-        precondition(position.y > 0)
+        let scrolledWeb = try! await fixture.home()
+        _ = try! await scrolledWeb.evaluateJavaScript("window.scrollTo(0,160)")
+        await settle()
+        let position = try! await scrolledWeb.evaluateJavaScript("window.scrollY") as! Double
+        precondition(position > 0)
         store.newTab()
         await settle()
         store.activate(scrolledHome)
         await settle()
-        precondition(scroll.window === panel && scroll.contentView.bounds.origin == position,
-                     "Scrolled homepages must retain their own controller and reading position")
+        let returnedWeb = try! await fixture.home()
+        let returnedPosition = try! await returnedWeb.evaluateJavaScript("window.scrollY") as! Double
+        precondition(returnedWeb === scrolledWeb && returnedPosition == position,
+                     "Scrolled HTML homes must retain their WebView and reading position")
         store.sites = savedSites
         store.activate(first)
         await settle()
@@ -4480,7 +4205,9 @@ final class LayoutSelfCheck {
                      "New tabs must not recreate the retained homepage's input fields")
         precondition(returnedFields.allSatisfy { $0.ownerTab == first })
         precondition(returnedFields.first { $0.identifier?.rawValue == "toolbarAddress" }?.stringValue == "toolbar draft")
-        precondition(returnedFields.first { $0.identifier?.rawValue == "homeAddress" }?.stringValue == "central draft")
+        let returnedHome = try! await fixture.home()
+        let centralDraft = try! await returnedHome.evaluateJavaScript("document.getElementById('search').value") as? String
+        precondition(returnedHome === originalHome && centralDraft == "central draft")
         store.tabs = savedTabs; store.tabGroups = savedGroups; store.selected = savedSelection
         await settle()
         print("PASS: overlapping selected-homepage insertions, retained input identity, ownership, drafts and homepage scroll")

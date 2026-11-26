@@ -44,10 +44,8 @@ window.renderTable = rows => {
   document.getElementById('content').replaceChildren(table); enhanceTable(table);
   document.documentElement.style.overflow='auto'; document.body.style.overflow='auto'; document.body.style.padding='12px';
 };
-window.enhanceCitations = (root, sources) => {
-  const canonical = value => {try {return new URL(value).href} catch (_) {return value}};
-  const known = new Map(sources.map(source => [canonical(source.url), source]));
-  const targets = new Map();
+{
+  const targets = new WeakMap();
   let activeLink = null;
   const activate = (link, event = {}) => {
     if (activeLink === link) return;
@@ -60,6 +58,9 @@ window.enhanceCitations = (root, sources) => {
       ? document.elementFromPoint(x, y)?.closest('a.source-citation') : null;
     activate(link && targets.has(link) ? link : null, {clientX:x, clientY:y});
   };
+window.enhanceCitations = (root, sources, post = body => window.webkit.messageHandlers.markdown.postMessage(body)) => {
+  const canonical = value => {try {return new URL(value).href} catch (_) {return value}};
+  const known = new Map(sources.map(source => [canonical(source.url), source]));
   root.querySelectorAll('a').forEach(link => {
     if (!/^https?:/i.test(link.href)) return;
     const source = known.get(link.href) || {url:link.href, title:link.textContent.trim() || link.hostname};
@@ -69,11 +70,11 @@ window.enhanceCitations = (root, sources) => {
       const rects=Array.from(link.getClientRects());
       const r=rects.find(r=>event.clientX>=r.left && event.clientX<=r.right && event.clientY>=r.top && event.clientY<=r.bottom) || rects[0];
       if (!r) return;
-      window.webkit.messageHandlers.markdown.postMessage({citation:{
+      post({citation:{
         action:'enter',url:source.url,title:source.title,x:r.x,y:r.y,width:r.width,height:r.height
       }});
     };
-    const hide=()=>window.webkit.messageHandlers.markdown.postMessage({citation:{action:'leave',url:source.url}});
+    const hide=()=>post({citation:{action:'leave',url:source.url}});
     targets.set(link, {show, hide});
     if (!window.nativeCitationHover) {
       link.addEventListener('mouseenter',event=>activate(link,event));
@@ -83,3 +84,4 @@ window.enhanceCitations = (root, sources) => {
     link.addEventListener('blur',()=>{if (activeLink===link) activate(null)});
   });
 };
+}

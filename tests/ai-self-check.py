@@ -712,17 +712,19 @@ navigation_ui = "--navigation-ui" in sys.argv
 navigation = "--navigation" in sys.argv or navigation_ui
 search_only = "--search-only" in sys.argv
 composer_only = "--composer-only" in sys.argv
+chat_style_only = "--chat-style-only" in sys.argv
+chat_html_only = "--chat-html-only" in sys.argv or chat_style_only
 files_only = "--files-only" in sys.argv
 experience_only = "--experience-only" in sys.argv
 streaming_only = "--streaming-only" in sys.argv
 background_only = "--background-only" in sys.argv
-arguments = ["--navigation-self-test" if navigation else "--ai-background-self-test" if background_only else "--ai-streaming-self-test" if streaming_only else "--ai-experience-self-test" if experience_only else "--ai-files-self-test" if files_only else "--ai-search-self-test" if search_only else "--ai-composer-self-test" if composer_only else "--ai-self-test", f"http://127.0.0.1:{server.server_port}"]
+arguments = ["--ai-chat-style-self-test" if chat_style_only else "--ai-chat-html-self-test" if chat_html_only else "--navigation-self-test" if navigation else "--ai-background-self-test" if background_only else "--ai-streaming-self-test" if streaming_only else "--ai-experience-self-test" if experience_only else "--ai-files-self-test" if files_only else "--ai-search-self-test" if search_only else "--ai-composer-self-test" if composer_only else "--ai-self-test", f"http://127.0.0.1:{server.server_port}"]
 result = subprocess.run([sys.argv[1]] + arguments, timeout=120)
 if result.returncode == 0 and navigation_ui:
     result = subprocess.run([sys.argv[1], "--ui-preview", "--verify-preview", "--verify-home-navigation",
                              f"http://127.0.0.1:{server.server_port}"], timeout=60)
 server.shutdown()
-if not navigation and not search_only and not composer_only and not files_only and not experience_only and not streaming_only and not background_only and (title_counts.get("hello fixture") != 1 or "Remember attachment fixture" in titles or "Replacement attachment fixture" in titles):
+if not navigation and not search_only and not composer_only and not chat_html_only and not files_only and not experience_only and not streaming_only and not background_only and (title_counts.get("hello fixture") != 1 or "Remember attachment fixture" in titles or "Replacement attachment fixture" in titles):
     failures.append("Conversation title was not generated exactly once")
 if failures:
     print("FAIL: synthetic provider:", failures, file=sys.stderr)

@@ -99,7 +99,7 @@ final class AIDiagram: NSObject, WKScriptMessageHandler, WKNavigationDelegate, N
             Task { @MainActor in
                 do {
                     let png = try await web.callAsyncJavaScript("return await diagramPNG(svg);",
-                        arguments: ["svg": svg], in: nil, contentWorld: .page) as? String
+                        arguments: ["svg": svg], in: nil, contentWorld: web is AIChatWebView ? .defaultClient : .page) as? String
                     guard let png else { throw PerchError("图表图片生成失败，请重试。") }
                     AIDiagram.save(png, window: web.window)
                 } catch { AIDiagram.report(error, window: web.window) }

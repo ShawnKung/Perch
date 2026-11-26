@@ -6,6 +6,7 @@ import Combine
 final class TabContentState: ObservableObject {
     let store: Store
     let tabID: UUID
+    lazy var homeController = HomePageController(store: store, tabID: tabID)
     private var changes: AnyCancellable?
     private var selection: AnyCancellable?
     init(store: Store, tabID: UUID) {
@@ -47,6 +48,16 @@ final class TabContentsController: NSTabViewController {
         tabView.drawsBackground = false
     }
 
+    override func tabView(_ tabView: NSTabView, willSelect tabViewItem: NSTabViewItem?) {
+        if let host = tabViewItem?.viewController as? NSHostingController<TabContentView> {
+            let page = host.rootView.page
+            let tab = page.store.tabs.first { $0.id == page.tabID }
+            // AppKit otherwise chooses the first text field and selects its entire address.
+            tabViewItem?.initialFirstResponder = tab?.address.isEmpty == false ? host.view : nil
+        }
+        super.tabView(tabView, willSelect: tabViewItem)
+    }
+
     func update(store: Store, controlsInset: CGFloat) {
         _ = view
         let ids = Set(store.tabs.map(\.id) + (store.selected == nil ? [AIController.homeID] : []))
@@ -74,6 +85,8 @@ final class TabContentsController: NSTabViewController {
                 pages[previous] = nil
                 item.identifier = selected
                 pages[selected] = item
+                content.page.homeController = host.rootView.page.homeController
+                content.page.homeController.tabID = selected
                 host.rootView = content
             } else {
                 let host = NSHostingController(rootView: content)
@@ -97,6 +110,11 @@ final class TabContentsController: NSTabViewController {
     }
 
     private func hasNoRetainedInputOrScroll(_ view: NSView) -> Bool {
+        if let home = view as? HomePageWebView {
+            // DOM updates are asynchronous; the native responder protects pending input too.
+            if home.controller?.pristine != true ||
+                (home.window?.firstResponder as? NSView)?.isDescendant(of: home) == true { return false }
+        }
         if let field = view as? AddressTextField.Field {
             let editor = field.currentEditor() as? NSTextView
             if !field.stringValue.isEmpty || editor?.string.isEmpty == false || editor?.hasMarkedText() == true {
@@ -135,9 +153,8 @@ struct TabContentView: View {
                     .padding(.vertical, 8).background(Style.paper).background(WindowDragArea()).zIndex(10)
                     ZStack {
                         if let browser {
-                            WebContent(browser: browser)
-                            BrowserScreen(browser: browser)
-                        } else { HomeScreen(store: store, tabID: tabID) }
+                            BrowserTabContent(browser: browser)
+                        } else { HomeScreen(page: page) }
                     }.modifier(ContentTopChrome(enabled: true))
                 }
                 .overlayPreferenceValue(BookmarkButtonAnchor.self) { anchor in
@@ -153,5 +170,13 @@ struct TabContentView: View {
         .defaultAppStorage(store.defaults)
         .foregroundStyle(Style.ink).tint(Style.accent).preferredColorScheme(.light)
         .ignoresSafeArea(.container, edges: .top)
+    }
+}
+
+struct BrowserTabContent: View {
+    @ObservedObject var browser: Browser
+    var body: some View {
+        WebContent(browser: browser)
+        BrowserScreen(browser: browser)
     }
 }

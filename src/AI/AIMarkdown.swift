@@ -91,6 +91,48 @@ final class AICitationPreview: NSObject, NSPopoverDelegate {
     deinit { showTask?.cancel(); closeTask?.cancel(); popover.close() }
 }
 
+// Embedded WebKit can miss DOM hover updates despite a correct native hit.
+final class AIWebHoverTracker {
+    private weak var web: WKWebView?
+    private let world: WKContentWorld
+    private let restoreArrow: () -> Void
+    private var inside = false
+    private var revision = 0
+    private var monitor: Any?
+    init(web: WKWebView, world: WKContentWorld, restoreArrow: @escaping () -> Void = { NSCursor.arrow.set() }) {
+        self.web = web; self.world = world; self.restoreArrow = restoreArrow
+        monitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .mouseExited,
+            .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]) { [weak self] event in
+            self?.update(event); return event
+        }
+    }
+    private func update(_ event: NSEvent) {
+        revision += 1
+        let revision = revision
+        guard let web, let window = web.window, let content = window.contentView else { return }
+        let point = web.convert(event.locationInWindow, from: nil)
+        let hovering = event.type == .mouseMoved || event.type == .mouseExited
+        let parentPoint = content.superview?.convert(event.locationInWindow, from: nil) ?? event.locationInWindow
+        let hit = content.hitTest(parentPoint)
+        let next = hovering && event.window === window && !web.isHiddenOrHasHiddenAncestor &&
+            web.bounds.intersection(web.visibleRect).contains(point) &&
+            (hit === web || hit?.isDescendant(of: web) == true)
+        guard next || inside else { return }
+        inside = next
+        web.callAsyncJavaScript("window.updateCitationHover?.(x,y); return window.updateChatHover?.(x,y) ?? false;",
+            arguments: ["x": next ? point.x as Any : NSNull(),
+                        "y": next ? (web.isFlipped ? point.y : web.bounds.height-point.y) as Any : NSNull()],
+            in: nil, in: world) { [weak self, weak web] result in
+                // WebKit can retain the previous text/link cursor over embedded controls.
+                guard let self, self.revision == revision, self.inside,
+                      let web, web.window?.isKeyWindow == true, !web.isHiddenOrHasHiddenAncestor,
+                      case .success(let value) = result, value as? Bool == true else { return }
+                self.restoreArrow()
+            }
+    }
+    deinit { if let monitor { NSEvent.removeMonitor(monitor) } }
+}
+
 struct AICitationHoverAnchor: NSViewRepresentable {
     let source: AISearchSource
     let openURL: (URL) -> Void
@@ -129,20 +171,16 @@ final class AIMarkdownWebView: WKWebView {
     var mermaidLoaded = false
     var diagramRects: [NSRect] = []
     private var eventMonitor: Any?
-    private var citationMouseInside = false
+    private var hoverTracker: AIWebHoverTracker?
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         window?.acceptsMouseMovedEvents = true
         if let eventMonitor { NSEvent.removeMonitor(eventMonitor); self.eventMonitor = nil }
-        citationMouseInside = false
+        hoverTracker = nil
         guard window != nil else { return }
-        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel, .mouseMoved, .mouseExited,
-            .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]) { [weak self] event in
+        hoverTracker = AIWebHoverTracker(web: self, world: .page)
+        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel]) { [weak self] event in
             guard let self, let window = self.window else { return event }
-            if event.type != .scrollWheel {
-                self.updateCitationHover(with: event)
-                return event
-            }
             let screenPoint = NSEvent.mouseLocation
             guard NSWindow.windowNumber(at: screenPoint, belowWindowWithWindowNumber: 0) == window.windowNumber else { return event }
             let point = window.convertPoint(fromScreen: screenPoint)
@@ -159,18 +197,6 @@ final class AIMarkdownWebView: WKWebView {
         }
     }
     deinit { if let eventMonitor { NSEvent.removeMonitor(eventMonitor) } }
-    private func updateCitationHover(with event: NSEvent) {
-        let point = convert(event.locationInWindow, from: nil)
-        let hovering = event.type == .mouseMoved || event.type == .mouseExited
-        let inside = hovering && event.window === window && isContentHit(at: point)
-        guard inside || citationMouseInside else { return }
-        citationMouseInside = inside
-        // Embedded WebKit can miss DOM hover updates despite a correct native hit.
-        let y = isFlipped ? point.y : bounds.height - point.y
-        callAsyncJavaScript("window.updateCitationHover?.(x,y);",
-            arguments: ["x": inside ? point.x as Any : NSNull(), "y": inside ? y as Any : NSNull()],
-            in: nil, in: .page, completionHandler: nil)
-    }
     private func isContentHit(at point: NSPoint) -> Bool {
         guard !isHiddenOrHasHiddenAncestor, bounds.intersection(visibleRect).contains(point),
               let window, let content = window.contentView else { return false }
@@ -438,19 +464,22 @@ struct AIMarkdownView: View {
             observers.forEach(NotificationCenter.default.removeObserver)
         }
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-            guard let body = message.body as? [String: Any] else { return }
-            if message.frameInfo.isMainFrame, let selected = body["quote"] as? String,
+            guard message.frameInfo.isMainFrame, let body = message.body as? [String: Any] else { return }
+            handle(body, web: message.webView)
+        }
+        func handle(_ body: [String: Any], web: WKWebView?) {
+            if let selected = body["quote"] as? String,
                !selected.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, selected.count <= 12000 {
                 quote?(selected)
             }
-            if let citation = body["citation"] as? [String: Any], message.frameInfo.isMainFrame {
+            if let citation = body["citation"] as? [String: Any] {
                 if citation["action"] as? String == "clear" { citationPreview.close() }
                 else if let address = citation["url"] as? String,
                         let url = URLInput.parse(address, search: false) {
                     let source = sources.first(where: { $0.url.absoluteString == address })
                         ?? AISearchSource(title: String((citation["title"] as? String ?? url.host ?? address).prefix(512)), url: url)
                     if citation["action"] as? String == "leave" { citationPreview.leave(url: source.url) }
-                    else if citation["action"] as? String == "enter", let web = message.webView,
+                    else if citation["action"] as? String == "enter", let web,
                             let x = citation["x"] as? Double, let y = citation["y"] as? Double,
                             let width = citation["width"] as? Double, let height = citation["height"] as? Double,
                             [x, y, width, height].allSatisfy({ $0.isFinite }), width > 0, height > 0 {
@@ -460,7 +489,7 @@ struct AIMarkdownView: View {
                     }
                 }
             }
-            if let rects = body["diagramRects"] as? [[String: Double]], let web = message.webView as? AIMarkdownWebView {
+            if let rects = body["diagramRects"] as? [[String: Double]], let web = web as? AIMarkdownWebView {
                 web.diagramRects = rects.compactMap { rect in
                     guard let x = rect["x"], let y = rect["y"], let width = rect["width"], let height = rect["height"],
                           [x, y, width, height].allSatisfy({ $0.isFinite }), width > 0, height > 0 else { return nil }
@@ -474,9 +503,9 @@ struct AIMarkdownView: View {
             if let copy = body["copy"] as? String {
                 NSPasteboard.general.clearContents(); NSPasteboard.general.setString(copy, forType: .string)
             }
-            if let rows = body["table"] as? [[String]] { _ = AITable.open(rows: rows, from: message.webView?.window) }
+            if let rows = body["table"] as? [[String]] { _ = AITable.open(rows: rows, from: web?.window) }
             if let csv = body["csv"] as? String, csv.utf8.count <= 1024 * 1024 {
-                AIGeneratedFile(name: "table.csv", content: "\u{FEFF}" + csv).saveAs(window: message.webView?.window) { result in
+                AIGeneratedFile(name: "table.csv", content: "\u{FEFF}" + csv).saveAs(window: web?.window) { result in
                     if case .failure(let error) = result {
                         let alert = NSAlert(); alert.messageText = "导出失败"; alert.informativeText = error.localizedDescription; alert.runModal()
                     }
@@ -488,7 +517,7 @@ struct AIMarkdownView: View {
                                   "json": "json", "yaml": "yaml", "yml": "yml", "markdown": "md", "md": "md",
                                   "csv": "csv", "sql": "sql", "swift": "swift", "go": "go", "rust": "rs"]
                 let file = AIGeneratedFile(name: "code." + (extensions[body["language"] as? String ?? ""] ?? "txt"), content: code)
-                file.saveAs(window: message.webView?.window) { result in
+                file.saveAs(window: web?.window) { result in
                     if case .failure(let error) = result {
                         let alert = NSAlert(); alert.messageText = "保存失败"; alert.informativeText = error.localizedDescription
                         alert.runModal()
@@ -496,9 +525,9 @@ struct AIMarkdownView: View {
                 }
             }
             if let svg = body["diagram"] as? String, let source = body["source"] as? String {
-                _ = AIDiagram.open(svg: svg, source: source, from: message.webView?.window)
+                _ = AIDiagram.open(svg: svg, source: source, from: web?.window)
             }
-            if let web = message.webView { AIDiagram.showContextMenu(body, web: web) }
+            if let web { AIDiagram.showContextMenu(body, web: web) }
         }
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             PerchTheme.shared.update(webView)

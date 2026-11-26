@@ -21,6 +21,223 @@ private struct AIHistoryManagementProbe: View {
 }
 
 extension AISelfCheck {
+    static func historyDisclosureUI() async throws {
+        for webCount in [1, 3, 20] {
+            let sessions = (0..<(8 + webCount)).map { index -> AISession in
+                var session = AISession(id: UUID())
+                session.summaryTitle = "合成网页会话 \(index)"
+                session.origin = index < 8 ? .chat : .web
+                return session
+            }
+            let host = NSHostingView(rootView: AIHistoryList(conversations: sessions, active: sessions[8].id,
+                open: { _ in }, delete: { _ in }, fork: { _ in }))
+            let window = NSWindow(contentRect: NSRect(x: 120, y: 160, width: 280, height: 500),
+                                  styleMask: [.titled], backing: .buffered, defer: false)
+            window.contentView = host; window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            defer { window.orderOut(nil); window.contentView = nil }
+            func find(_ view: NSView) -> AIHistoryTable? {
+                (view as? AIHistoryTable) ?? view.subviews.lazy.compactMap(find).first
+            }
+            try await wait { NSApp.isActive && window.isKeyWindow && find(host)?.conversationIDs.contains(sessions[8].id) == true }
+            let table = find(host)!
+            func pressHeader(_ title: String = "网页对话", fraction: CGFloat = 0.5) throws {
+                let header = (0..<table.numberOfRows).first {
+                    (table.view(atColumn: 0, row: $0, makeIfNecessary: true) as? AIHistoryCell)?.textField?.stringValue == title
+                }!
+                if !table.visibleRect.contains(table.rect(ofRow: header)) { table.scrollRowToVisible(header) }
+                table.layoutSubtreeIfNeeded()
+                let headerView = table.rowView(atRow: header, makeIfNecessary: true)!
+                // Floating headers can be displayed below their logical row position.
+                var rect = headerView.convert(headerView.bounds, to: table)
+                if !table.visibleRect.contains(NSPoint(x: rect.midX, y: rect.midY)), let scroll = table.enclosingScrollView {
+                    var bounds = scroll.contentView.bounds
+                    bounds.origin.y = table.rect(ofRow: header).minY
+                    scroll.contentView.scroll(to: scroll.contentView.constrainBoundsRect(bounds).origin)
+                    scroll.reflectScrolledClipView(scroll.contentView)
+                    table.layoutSubtreeIfNeeded()
+                    rect = headerView.convert(headerView.bounds, to: table)
+                }
+                let point = NSPoint(x: rect.minX + rect.width * fraction, y: rect.midY)
+                guard table.visibleRect.contains(point),
+                      table.hitTest(point)?.isDescendant(of: table) == true, table.row(at: point) == header else {
+                    throw PerchError("History disclosure missed the native table")
+                }
+                let location = table.convert(point, to: nil)
+                guard let content = window.contentView,
+                      content.hitTest(content.convert(location, from: nil))?.isDescendant(of: table) == true else {
+                    throw PerchError("History disclosure was blocked in the native window event path")
+                }
+                for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                    NSApp.sendEvent(NSEvent.mouseEvent(with: type, location: location,
+                        modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                        context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!)
+                }
+            }
+            func animatedLayers(_ layer: CALayer?) -> [CALayer] {
+                guard let layer else { return [] }
+                return ((layer.animationKeys()?.isEmpty == false) ? [layer] : []) +
+                    (layer.sublayers ?? []).flatMap { animatedLayers($0) }
+            }
+            func conversationViews() -> [NSTableRowView] {
+                table.conversationIDs.indices.filter { table.conversationIDs[$0] != nil }
+                    .compactMap { table.rowView(atRow: $0, makeIfNecessary: false) }
+            }
+            func capturePixels(_ name: String) throws -> NSBitmapImageRep? {
+                guard let path = ProcessInfo.processInfo.environment["PERCH_LAYOUT_EVIDENCE"] else { return nil }
+                let directory = URL(fileURLWithPath: path)
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                let file = directory.appendingPathComponent("history-\(name).png")
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+                process.arguments = ["-x", "-o", "-l", String(window.windowNumber), file.path]
+                try process.run(); process.waitUntilExit()
+                guard process.terminationStatus == 0,
+                      let bitmap = NSBitmapImageRep(data: try Data(contentsOf: file)) else {
+                    throw PerchError("History window pixel capture failed")
+                }
+                return bitmap
+            }
+            func pixelDistance(_ first: NSBitmapImageRep, _ second: NSBitmapImageRep, fromY: Int) -> Double {
+                var difference = 0.0
+                for y in stride(from: fromY, to: first.pixelsHigh, by: 2) {
+                    for x in stride(from: 0, to: first.pixelsWide, by: 2) {
+                        guard let a = first.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB),
+                              let b = second.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else { continue }
+                        difference += abs(a.redComponent - b.redComponent) +
+                            abs(a.greenComponent - b.greenComponent) + abs(a.blueComponent - b.blueComponent)
+                    }
+                }
+                return difference
+            }
+            func darkestPixel(_ bitmap: NSBitmapImageRep, fromY: Int) -> Double {
+                var darkest = 1.0
+                for y in stride(from: fromY, to: bitmap.pixelsHigh, by: 2) {
+                    for x in stride(from: 0, to: bitmap.pixelsWide, by: 2) {
+                        guard let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else { continue }
+                        darkest = min(darkest, (color.redComponent + color.greenComponent + color.blueComponent) / 3)
+                    }
+                }
+                return darkest
+            }
+            let coordinator = table.delegate as! AIHistoryList.Coordinator
+            func refresh(_ conversations: [AISession]) {
+                coordinator.parent = AIHistoryList(conversations: conversations, active: sessions[8].id,
+                    open: { _ in }, delete: { _ in }, fork: { _ in })
+                coordinator.refresh()
+            }
+            try await Task.sleep(nanoseconds: 200_000_000)
+            try pressHeader("Chat")
+            try await Task.sleep(nanoseconds: 300_000_000)
+            guard !table.conversationIDs.contains(sessions[0].id) else { throw PerchError("Chat header did not collapse") }
+            for (cycle, closing) in [true, false, true, false].enumerated() {
+                let oldRows = conversationViews()
+                let checkPixels = webCount == 3 && cycle == 0
+                let beforePixels = checkPixels ? try capturePixels("expanded-before-collapse") : nil
+                let header = table.conversationIDs.firstIndex(of: sessions[8].id).map { $0 - 1 }
+                let contentTop = header.map { table.convert(NSPoint(x: 0, y: table.rect(ofRow: $0).maxY), to: nil).y } ?? 0
+                try pressHeader(fraction: closing ? 0.9 : 0.05)
+                try await Task.sleep(nanoseconds: 20_000_000)
+                var refreshed = coordinator.parent.conversations
+                refreshed[8].summaryTitle = "动画期间刷新 \(cycle)"
+                refresh(refreshed)
+                try await Task.sleep(nanoseconds: 25_000_000)
+                let layers = animatedLayers(table.layer)
+                let visibleRows = closing ? oldRows : conversationViews()
+                let webIDs = Set(sessions.dropFirst(8).map(\.id))
+                let groupHeight = table.conversationIDs.indices.filter { table.conversationIDs[$0].map { webIDs.contains($0) } == true }
+                    .reduce(CGFloat(0)) { $0 + table.rect(ofRow: $1).height }
+                let fullHeight = CGFloat(webCount) * (40 * PerchTheme.shared.chatScale + 2)
+                let intermediate = groupHeight > 0.01 && groupHeight < fullHeight - 0.01 &&
+                    visibleRows.contains { $0.window === window } &&
+                    visibleRows.allSatisfy { $0.alphaValue == 1 && $0.layer?.opacity == 1 }
+                let disclosure = layers.contains {
+                    guard let shown = $0.presentation(), $0.animation(forKey: "disclosure") != nil else { return false }
+                    return !CATransform3DEqualToTransform(shown.transform, $0.transform)
+                }
+                print("History disclosure count=\(webCount), closing=\(closing), visibleRows=\(intermediate), arrow=\(disclosure)")
+                if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                    guard intermediate && disclosure else { throw PerchError("History disclosure has no visible row/arrow intermediate frame") }
+                }
+                let middlePixels = checkPixels ? try capturePixels("collapse-intermediate") : nil
+                try await Task.sleep(nanoseconds: 250_000_000)
+                let afterPixels = checkPixels ? try capturePixels("collapsed-after-animation") : nil
+                if let beforePixels, let middlePixels, let afterPixels,
+                   !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                    let scale = CGFloat(beforePixels.pixelsWide) / window.frame.width
+                    let top = max(0, Int((window.frame.height - contentTop) * scale))
+                    let fullDifference = pixelDistance(beforePixels, afterPixels, fromY: top)
+                    let remaining = pixelDistance(middlePixels, afterPixels, fromY: top)
+                    let ratio = remaining / max(1, fullDifference)
+                    print("History collapse screen pixels: remaining=\(ratio)")
+                    let beforeInk = darkestPixel(beforePixels, fromY: top)
+                    let middleInk = darkestPixel(middlePixels, fromY: top)
+                    guard fullDifference > 100, ratio > 0.01, ratio < 1.1,
+                          abs(beforeInk - middleInk) < 0.05 else {
+                        throw PerchError("History collapse removed all visible content before the transition finished")
+                    }
+                }
+                guard table.conversationIDs.contains(sessions[8].id) != closing else {
+                    throw PerchError("History disclosure lost its final row state")
+                }
+                if !closing, let row = table.conversationIDs.firstIndex(of: sessions[8].id) {
+                    guard (table.view(atColumn: 0, row: row, makeIfNecessary: true) as? AIHistoryCell)?
+                        .textField?.stringValue == refreshed[8].summaryTitle else {
+                        throw PerchError("History disclosure dropped a pending content refresh")
+                    }
+                }
+            }
+            try pressHeader("Chat")
+            try await Task.sleep(nanoseconds: 300_000_000)
+            let originalIDs = table.conversationIDs
+            let selectedIDs = Set(sessions.prefix(2).map(\.id))
+            table.selectRowIndexes(IndexSet(originalIDs.indices.filter { originalIDs[$0].map { selectedIDs.contains($0) } == true }),
+                                   byExtendingSelection: false)
+            try pressHeader(fraction: 0.9)
+            try await Task.sleep(nanoseconds: 20_000_000)
+            var refreshed = coordinator.parent.conversations
+            refreshed[0].summaryTitle = "反向切换期间刷新的 Chat 标题"
+            var added = AISession(id: UUID())
+            added.origin = .chat; added.summaryTitle = "反向切换期间新增的 Chat 会话"
+            refreshed.append(added)
+            var expectedIDs = originalIDs
+            expectedIDs.insert(added.id, at: originalIDs.firstIndex(of: sessions[8].id)! - 1)
+            refresh(refreshed)
+            try pressHeader(fraction: 0.05)
+            guard table.conversationIDs == originalIDs else {
+                throw PerchError("History reversal mixed pending structural changes into the row animation")
+            }
+            try await Task.sleep(nanoseconds: 350_000_000)
+            let row = table.conversationIDs.firstIndex(of: sessions[0].id)!
+            guard table.conversationIDs == expectedIDs,
+                  Set(table.selectedRowIndexes.compactMap { table.conversationIDs[$0] }) == selectedIDs,
+                  (table.view(atColumn: 0, row: row, makeIfNecessary: true) as? AIHistoryCell)?
+                    .textField?.stringValue == refreshed[0].summaryTitle else {
+                throw PerchError("History rapid reversal lost rows, selection or another group's pending update")
+            }
+            print("PASS: history count=\(webCount) rapid reversal preserves rows, multiselection and pending content")
+            if webCount == 3 {
+                try pressHeader()
+                try await Task.sleep(nanoseconds: 120_000_000)
+                try pressHeader("Chat")
+                try await Task.sleep(nanoseconds: 130_000_000)
+                try pressHeader("Chat")
+                guard table.numberOfRows == table.conversationIDs.count,
+                      table.conversationIDs == expectedIDs else {
+                    throw PerchError("Overlapping history transitions removed rows before all animations finished")
+                }
+                try await Task.sleep(nanoseconds: 350_000_000)
+                let webIDs = Set(sessions.dropFirst(8).map(\.id))
+                guard table.numberOfRows == table.conversationIDs.count,
+                      table.conversationIDs == expectedIDs.filter({ $0.map { !webIDs.contains($0) } ?? true }) else {
+                    throw PerchError("Overlapping history transitions lost their final group state")
+                }
+                print("PASS: overlapping history transitions preserve table/model consistency")
+            }
+        }
+        print("PASS: native history disclosure event path, visible collapse/expand frames, full-row clicks and content refreshes")
+    }
+
     static func quoteRequests(baseURL: String) async throws {
         let suite = "dev.perch.quote.\(UUID())"
         let defaults = UserDefaults(suiteName: suite)!
@@ -165,7 +382,7 @@ extension AISelfCheck {
         try await wait { labels().first == "置顶会话" && labels().firstIndex(of: "网页会话")! < labels().firstIndex(of: "Chat")! }
         precondition(ai.sessions[webOwner]?.origin == .web)
         table.choose(0, modifiers: [])
-        precondition(!table.conversationIDs.contains(id) && !table.conversationIDs.contains(web))
+        try await wait { !table.conversationIDs.contains(id) && !table.conversationIDs.contains(web) }
         table.choose(0, modifiers: [])
         try await wait { table.conversationIDs.contains(id) && table.conversationIDs.contains(web) }
         try action("取消置顶", id: web)
@@ -321,24 +538,26 @@ extension AISelfCheck {
             window.contentView = host
             window.setContentSize(NSSize(width: fullPage ? 850 : 360, height: 720))
             ai.drafts[AIController.homeID] = "输入草稿 English 中文 🙂\n字号变化后保留选区。"
+            ai.draftQuotes[AIController.homeID] = AIQuote(messageID: answer.id,
+                text: String(repeating: "长引用需要保持原有三行截断，中文 English 🙂。\n", count: 8))
+            let reference = Tab(title: "DeepSeek · 参考网页", address: "https://example.invalid")
+            store.tabs.append(reference)
+            ai.draftReferences[AIController.homeID] = [reference.id]
             window.makeKeyAndOrderFront(nil)
-            try await wait { !views(host, of: AIMarkdownWebView.self).isEmpty && !views(host, of: AIComposerTextView.self).isEmpty }
-            let web = views(host, of: AIMarkdownWebView.self)[0]
-            let editor = views(host, of: AIComposerTextView.self)[0]
-            try await wait { (web.navigationDelegate as? AIMarkdownView.Coordinator)?.loaded == true }
-            try await wait { element(host, "正在加载对话") == nil }
+            try await wait { views(host, of: AIChatWebView.self).first?.controller?.ready == true }
+            let web = views(host, of: AIChatWebView.self)[0]
             _ = try await web.evaluateJavaScript("""
-            window.typographyNode = document.querySelector('#content p');
+            window.typographyNode = document.querySelector('.markdown p');
             const r = document.createRange(); r.selectNodeContents(typographyNode);
             window.getSelection().removeAllRanges(); window.getSelection().addRange(r);
             window.typographySelection = window.getSelection().toString();
+            document.getElementById('composer').setSelectionRange(2,6);
             """)
-            editor.setSelectedRange(NSRange(location: 2, length: 4))
             var heights: [Double] = []
             for size in [11.0, 13.0, 22.0, 13.0] {
                 var settings = store.settings; settings.chatFontSize = size
                 try store.saveSettings(settings)
-                try await wait { editor.font?.pointSize == CGFloat(size) }
+                try await wait { PerchTheme.shared.chatFontSize == size }
                 try await Task.sleep(nanoseconds: 200_000_000)
                 host.layoutSubtreeIfNeeded()
                 if let table = views(host, of: AIHistoryTable.self).first {
@@ -363,14 +582,38 @@ extension AISelfCheck {
                     }
                 }
                 let metrics = try await web.callAsyncJavaScript("""
-                const content = document.getElementById('content');
+                const content = document.querySelector('.markdown'), input=document.getElementById('composer');
+                const quote=document.getElementById('draft-quote'), quoteText=quote.querySelector('.quote-text'),
+                  chip=document.querySelector('#draft-items .chip'), box=document.getElementById('composer-box'),
+                  toolbar=document.getElementById('toolbar'), quoteRect=quote.getBoundingClientRect(),
+                  textRect=quoteText.getBoundingClientRect(), closeRect=quote.querySelector('[aria-label="移除引用"]').getBoundingClientRect(),
+                  chipRect=chip.getBoundingClientRect(), inputRect=input.getBoundingClientRect();
                 return {size:parseFloat(getComputedStyle(document.body).fontSize),
+                  inputSize:parseFloat(getComputedStyle(input).fontSize),start:input.selectionStart,end:input.selectionEnd,draft:input.value,
                   height:content.getBoundingClientRect().height,
                   bounded:content.scrollWidth <= window.innerWidth + 1,
-                  preserved:typographyNode === document.querySelector('#content p') &&
+                  preserved:typographyNode === document.querySelector('.markdown p') &&
                     window.getSelection().toString() === typographySelection,
                   code:parseFloat(getComputedStyle(content.querySelector('code')).fontSize),
                   button:parseFloat(getComputedStyle(content.querySelector('pre button')).fontSize),
+                  sourceStyle:[...document.querySelectorAll('.message .source-chip')].every(chip=>{
+                    const style=getComputedStyle(chip),glyph=chip.querySelector('svg');
+                    return glyph && style.textDecorationLine==='none' &&
+                      Math.abs(parseFloat(style.fontSize)-parseFloat(getComputedStyle(input).fontSize)*10/13)<.01 &&
+                      Math.abs(glyph.getBoundingClientRect().width-parseFloat(style.fontSize))<.02 &&
+                      chip.getBoundingClientRect().height < parseFloat(style.fontSize)*1.5+7;
+                  }),
+                  composerStyle:quote.firstElementChild.tagName==='svg' &&
+                    quoteText.textContent.includes('长引用') && quoteText.scrollHeight > quoteText.clientHeight &&
+                    textRect.height < parseFloat(getComputedStyle(quoteText).fontSize)*4 &&
+                    Math.abs(closeRect.top-textRect.top)<1 && Math.abs(quoteRect.height-textRect.height-16)<1 &&
+                    Math.abs(chipRect.top-quoteRect.bottom-8)<1 && Math.abs(inputRect.top-chipRect.bottom-8)<1 &&
+                    Math.abs(toolbar.getBoundingClientRect().top-inputRect.bottom-8)<1 &&
+                    getComputedStyle(box).gap==='8px' && getComputedStyle(input).paddingLeft==='5px' &&
+                    Math.abs(parseFloat(getComputedStyle(quoteText).fontSize)-parseFloat(getComputedStyle(input).fontSize)*11/13)<.01 &&
+                    Math.abs(parseFloat(getComputedStyle(chip).fontSize)-parseFloat(getComputedStyle(input).fontSize)*10/13)<.01 &&
+                    chip.querySelector('button').getBoundingClientRect().width===9 &&
+                    chipRect.height < parseFloat(getComputedStyle(chip).fontSize)*1.5+13,
                   toolbarBounded:[...content.querySelectorAll('pre button')].every(b => {
                     const p=b.closest('pre').getBoundingClientRect(), r=b.getBoundingClientRect();
                     return r.top >= p.top && r.bottom <= p.bottom && r.right <= p.right &&
@@ -386,13 +629,16 @@ extension AISelfCheck {
                       abs((metrics["code"] as! Double) - size * 12 / 13) < 0.01,
                       abs((metrics["button"] as! Double) - size * 11 / 13) < 0.01,
                       metrics["toolbarBounded"] as? Bool == true,
+                      metrics["composerStyle"] as? Bool == true,
+                      metrics["sourceStyle"] as? Bool == true,
                       metrics["bounded"] as? Bool == true, metrics["preserved"] as? Bool == true else {
                     throw PerchError("Chat typography layout failed: fullPage=\(fullPage), \(metrics)")
                 }
                 heights.append(metrics["height"] as! Double)
-                precondition(editor.selectedRange() == NSRange(location: 2, length: 4) && editor.string == ai.drafts[AIController.homeID])
-                let send = try frame(host, "发送")
-                let input = try frame(host, "向 AI 提问，输入 @ 引用标签页")
+                precondition(metrics["inputSize"] as? Double == size && metrics["start"] as? Int == 2 &&
+                             metrics["end"] as? Int == 6 && metrics["draft"] as? String == ai.drafts[AIController.homeID])
+                let send = try await AIChatPageSelfCheck.frame("发送", web: web)
+                let input = try await AIChatPageSelfCheck.frame("向 AI 提问，输入 @ 引用标签页", web: web)
                 precondition(!input.intersects(send) && send.width >= 33 && send.height >= 33)
                 let contentFrame = window.convertToScreen(window.contentView!.bounds)
                 precondition(contentFrame.insetBy(dx: -1, dy: -1).contains(send))
@@ -404,6 +650,9 @@ extension AISelfCheck {
             try await Task.sleep(nanoseconds: 200_000_000)
             try snapshot(host, "\(fullPage ? "full" : "sidebar")-font-22-edit")
             ai.cancelEditing(AIController.homeID)
+            ai.draftQuotes[AIController.homeID] = nil
+            ai.draftReferences[AIController.homeID] = []
+            store.tabs.removeAll { $0.id == reference.id }
             print("PASS: \(fullPage ? "full Chat" : "360 pt sidebar") proportional text/history sizing, 11/13/22 pt reflow, centered history sources, Markdown/control bounds and DOM/selection/draft preservation")
         }
         let reasoningHost = NSHostingView(rootView: AIReasoningText(text: answer.reasoning!, active: false).frame(height: 150))
@@ -489,7 +738,12 @@ extension AISelfCheck {
                 }
                 precondition(ai.send("Thinking streaming fixture", tab: tab, browser: nil, usePage: false))
                 try await wait { ai.sessions[tab]?.messages.last?.reasoning?.count ?? 0 > 1000 }
-                guard renderer(host) == nil else { throw PerchError("Body renderer was created before the first text delta") }
+                try await wait { (renderer(host) as? AIChatWebView)?.controller?.ready == true }
+                try await AIChatPageSelfCheck.check(renderer(host)!,
+                    "document.querySelector('.message.assistant .markdown').textContent===''",
+                    "思考阶段不应提前显示正文")
+                try await AIChatPageSelfCheck.waitFor(renderer(host)!,
+                    "document.querySelector('.assistant .reasoning-text').parentElement.open && document.querySelector('.assistant .reasoning-text').scrollHeight>220")
                 for prefix in ["第一段", "第一段\n\n第二段", "第一段\n\n第二段\n\n第三段"] {
                     try await wait { ai.sessions[tab]?.messages.last?.text == prefix }
                     let expected = prefix.components(separatedBy: .whitespacesAndNewlines).joined()
@@ -497,13 +751,15 @@ extension AISelfCheck {
                     var rendered = ""
                     while rendered != expected && Date() < deadline {
                         if let web = renderer(host) {
-                            rendered = (try? await web.evaluateJavaScript("document.getElementById('content').textContent.replace(/\\s/g,'')")) as? String ?? ""
+                            rendered = (try? await web.evaluateJavaScript("document.querySelector('.message.assistant .markdown').textContent.replace(/\\s/g,'')")) as? String ?? ""
                         }
                         if rendered != expected { try await Task.sleep(nanoseconds: 20_000_000) }
                     }
                     guard rendered == expected, ai.sessions[tab]?.requestID != nil else {
                         throw PerchError("Chat body failed to stream after thinking: \(api.rawValue), fullPage=\(fullPage), rendered=\(rendered)")
                     }
+                    try await AIChatPageSelfCheck.check(renderer(host)!,
+                        "!document.querySelector('.assistant .reasoning-text').parentElement.open", "正文开始后思考区未折叠")
                 }
                 try await wait { ai.sessions[tab]?.requestID == nil }
                 precondition(ai.sessions[tab]?.error == nil)
@@ -527,13 +783,12 @@ extension AISelfCheck {
         var lengths: [Int] = []
         let deadline = Date().addingTimeInterval(12)
         func answer(_ view: NSView) -> WKWebView? {
-            if let web = view as? AIMarkdownWebView,
-               (web.navigationDelegate as? AIMarkdownView.Coordinator)?.text.hasPrefix("正文增量片段") == true { return web }
+            if let web = view as? AIChatWebView, web.controller?.ready == true { return web }
             return view.subviews.lazy.compactMap { answer($0) }.first
         }
         while Date() < deadline, live.sessions[AIController.homeID]?.requestID != nil {
             if let web = answer(host),
-               let count = try? await web.evaluateJavaScript("document.getElementById('content').textContent.length") as? Int,
+               let count = try? await web.evaluateJavaScript("Array.from(document.querySelectorAll('.markdown')).find(e=>e.textContent.startsWith('正文增量片段'))?.textContent.length || 0") as? Int,
                count > 0, lengths.last != count {
                 lengths.append(count)
             }
@@ -776,15 +1031,12 @@ extension AISelfCheck {
         window.contentView = host; window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         defer { window.orderOut(nil); window.contentView = nil }
-        func renderer(_ node: NSView) -> AIMarkdownWebView? {
-            (node as? AIMarkdownWebView) ?? node.subviews.lazy.compactMap(renderer).first
-        }
-        try await wait { NSApp.isActive && window.isKeyWindow && renderer(host)?.navigationDelegate != nil }
-        let web = renderer(host)!, bridge = web.navigationDelegate as! AIMarkdownView.Coordinator
-        try await wait { bridge.loaded }
+        try await wait { NSApp.isActive && window.isKeyWindow }
+        let web = try await AIChatPageSelfCheck.ready(window), bridge = web.controller!.markdown
+        let recorder = AIChatPageSelfCheck.BridgeRecorder(web)
         precondition(window.acceptsMouseMovedEvents, "A Chat-only window must accept mouse moves before any browser page opens")
         let point = try await web.callAsyncJavaScript("""
-        for(let attempt=0;document.querySelectorAll('a.source-citation').length<15;attempt++){
+        for(let attempt=0;document.querySelectorAll('.markdown a.source-citation').length<15;attempt++){
           if(attempt===150) throw new Error('Citation rendering did not finish');
           await new Promise(resolve=>setTimeout(resolve,20));
         }
@@ -793,7 +1045,7 @@ extension AISelfCheck {
         for(const type of ['mousemove','mouseenter']) document.addEventListener(type,e=>{
           nativeCitationEvents.push({type,trusted:e.isTrusted,target:e.target.tagName});
         },true);
-        const a=document.querySelectorAll('a.source-citation')[1],r=a.getClientRects()[0];
+        const a=document.querySelectorAll('.markdown a.source-citation')[1],r=a.getClientRects()[0];
         const x=r.x+r.width/2,y=r.bottom-parseFloat(getComputedStyle(a).paddingBottom)+1;
         if(document.elementFromPoint(x,y)!==a) throw new Error('Citation underline is outside the link hit area');
         return {x,y};
@@ -822,11 +1074,11 @@ extension AISelfCheck {
         }
         if !bridge.citationPreview.popover.isShown {
             let events = try await web.evaluateJavaScript("JSON.stringify(nativeCitationEvents)")
-            throw PerchError("Native citation hover failed during continuous mouse movement: active=\(NSApp.isActive), key=\(window.isKeyWindow), bounds=\(web.bounds), visible=\(web.visibleRect), point=\(native), events=\(events ?? "")")
+            throw PerchError("Native citation hover failed during continuous mouse movement: active=\(NSApp.isActive), key=\(window.isKeyWindow), bounds=\(web.bounds), visible=\(web.visibleRect), point=\(native), events=\(events ?? ""), bridge=\(recorder.actions)")
         }
         for index in [0, 1] {
             let position = try await web.callAsyncJavaScript("""
-            const r=document.querySelectorAll('a.source-citation')[index].getClientRects()[0];
+            const r=document.querySelectorAll('.markdown a.source-citation')[index].getClientRects()[0];
             return {x:r.x+r.width/2,y:r.y+r.height/2};
             """, arguments: ["index": index], in: nil, contentWorld: .page) as! [String: Double]
             let location = web.convert(NSPoint(x: position["x"]!,
@@ -982,10 +1234,11 @@ extension AISelfCheck {
         getSelection().removeAllRanges();getSelection().addRange(range);
         await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
         const button=document.getElementById('quote-selection'), rect=button.getBoundingClientRect();
-        return {x:rect.x+rect.width/2,y:rect.y+rect.height/2,visible:!button.hidden,
-          hittable:document.elementFromPoint(rect.x+rect.width/2,rect.y+rect.height/2)===button};
+        return {x:rect.right-3,y:rect.y+rect.height/2,visible:!button.hidden,
+          hittable:document.elementFromPoint(rect.right-3,rect.y+rect.height/2)===button};
         """, arguments: [:], in: nil, contentWorld: .page) as! [String: Any]
         precondition(quotePoint["visible"] as? Bool == true && quotePoint["hittable"] as? Bool == true)
+        try await AIChatPageSelfCheck.quoteFade(web, world: .page)
         let deferred = try await web.callAsyncJavaScript("""
         await renderMarkdown(text);
         return getSelection().toString()==='中文句子。' &&
@@ -1015,7 +1268,7 @@ extension AISelfCheck {
         try await Task.sleep(nanoseconds: 100_000_000)
         let resumed = try await web.evaluateJavaScript("document.getElementById('content').textContent.includes('Stream continuation')") as? Bool
         precondition(resumed == true, "Clearing the selection must render the latest buffered answer")
-        print("PASS: selected rendered text exposes a hittable quote button and native clicks deliver the exact excerpt")
+        print("PASS: native clicks on quote-button padding deliver the exact selected excerpt")
         let csv = try await web.callAsyncJavaScript("return tableCSV(rows);", arguments: ["rows": [["a,b", "x\"y", "a\nb", "=SUM(A1)"]]], in: nil, contentWorld: .page) as? String
         precondition(csv == "\"a,b\",\"x\"\"y\",\"a\nb\",\"'=SUM(A1)\"")
         let beforeHover = try await web.evaluateJavaScript("document.getElementById('content').getBoundingClientRect().height") as! Double

@@ -175,9 +175,14 @@ struct AIPageReference: Codable, Identifiable, Equatable {
 }
 
 struct AIQuote: Codable, Equatable {
+    struct SourceRange: Codable, Equatable {
+        let start: Int
+        let end: Int
+    }
     let messageID: UUID?
     let text: String
     var page: AIPageReference? = nil
+    var sourceRange: SourceRange? = nil
     var label: String { page == nil ? "引用的回答" : "引用的网页文字" }
     var valid: Bool {
         (messageID != nil || page?.url.flatMap(AIController.pageURL) != nil) &&
@@ -700,6 +705,8 @@ final class AIController: ObservableObject {
     @Published var drafts: [UUID: String] = [:] { didSet { scheduleConversationSave() } }
     @Published var draftQuotes: [UUID: AIQuote] = [:] { didSet { scheduleConversationSave() } }
     @Published var composerFocusRequests: [UUID: UUID] = [:]
+    // Presentation bookmarks survive switching between the sidebar and full Chat.
+    var composerSelections: [UUID: (start: Int, end: Int, scroll: Double, focused: Bool)] = [:]
     @Published var draftFiles: [UUID: [AIAttachment]] = [:] { didSet { scheduleConversationSave() } }
     @Published var draftReferences: [UUID: [UUID]] = [:] { didSet { scheduleConversationSave() } }
     @Published var draftClosedReferences: [UUID: [AIPageReference]] = [:] { didSet { scheduleConversationSave() } }
@@ -1219,10 +1226,14 @@ final class AIController: ObservableObject {
         draftReferences[tab] = edit.references; draftClosedReferences[tab] = edit.closedReferences
     }
     @discardableResult
-    func quoteSelection(_ text: String, messageID: UUID, tab: UUID) -> Bool {
+    func quoteSelection(_ text: String, messageID: UUID, tab: UUID, sourceRange: AIQuote.SourceRange? = nil) -> Bool {
         guard sessions[tab]?.isArchived != true,
               sessions[tab]?.messages.contains(where: { $0.id == messageID && $0.role == "assistant" }) == true else { return false }
-        let quote = AIQuote(messageID: messageID, text: text.trimmingCharacters(in: .whitespacesAndNewlines))
+        var quote = AIQuote(messageID: messageID, text: text.trimmingCharacters(in: .whitespacesAndNewlines))
+        if let range = sourceRange, range.start >= 0, range.end > range.start,
+           range.end - range.start == quote.text.utf16.count {
+            quote.sourceRange = range
+        }
         guard quote.valid else {
             sessions[tab]?.error = "请选择 1–12,000 字的回答片段。"
             return false
@@ -1266,6 +1277,7 @@ final class AIController: ObservableObject {
             sessions.removeValue(forKey: owner); pendingEdits.removeValue(forKey: owner)
             drafts.removeValue(forKey: owner); draftFiles.removeValue(forKey: owner)
             draftQuotes.removeValue(forKey: owner)
+            composerSelections.removeValue(forKey: owner)
             draftReferences.removeValue(forKey: owner); draftClosedReferences.removeValue(forKey: owner)
         }
         for id in ids { conversations.removeValue(forKey: id); readingPositions.removeValue(forKey: id) }
@@ -1322,7 +1334,7 @@ final class AIController: ObservableObject {
         conversations[copy.id] = copy; saveConversations()
         return copy.id
     }
-    func seedPreview(answer: String? = nil, sources: [AISearchSource] = []) {
+    func seedPreview(answer: String? = nil, sources: [AISearchSource] = [], references: [AIPageReference] = []) {
         guard defaults !== UserDefaults.standard else { return }
         sessions[Self.homeID] = AISession(messages: [
             AIMessage(role: "user", text: "请结合这份笔记，整理一下重点。", source: "选中文字", sourceURL: URL(string: "https://example.com/notes"), timestamp: Date().addingTimeInterval(-60)),
@@ -1351,6 +1363,7 @@ final class AIController: ObservableObject {
             ```
             """, providerName: "\(configuration.name) · \(configuration.model)", timestamp: Date().addingTimeInterval(-45))
         ], origin: .chat)
+        sessions[Self.homeID]?.messages[0].references = references
         sessions[Self.homeID]?.messages[1].searchSources = sources
         if CommandLine.arguments.contains("--preview-generating") { sessions[Self.homeID]?.requestID = UUID() }
         for session in [
