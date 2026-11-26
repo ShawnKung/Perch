@@ -620,7 +620,11 @@ final class TabCell: NSTableCellView {
             : downloadsPage
                 ? NSImage(systemSymbolName: "arrow.down.to.line", accessibilityDescription: "下载记录")?
                     .withSymbolConfiguration(.init(pointSize: 12, weight: .regular))
-                : image ?? NSImage(systemSymbolName: "globe", accessibilityDescription: "网站")
+                : tab.address.isEmpty
+                    ? NSImage(systemSymbolName: "house", accessibilityDescription: "新标签页")?
+                        .withSymbolConfiguration(.init(pointSize: 16, weight: .medium)
+                            .applying(.init(paletteColors: [.labelColor])))
+                    : image ?? NSImage(systemSymbolName: "globe", accessibilityDescription: "网站")
         icon.setAccessibilityLabel(tab.title)
         pin.image = tab.pinned ? NSImage(systemSymbolName: "pin.fill", accessibilityDescription: "已固定") : nil
         pinWidth.constant = tab.pinned ? 9 : 0
@@ -675,10 +679,13 @@ final class TabGroupCell: NSTableCellView {
         }
         if expansion > 0 {
             let paragraph = NSMutableParagraphStyle(); paragraph.lineBreakMode = .byTruncatingTail
-            (group.name.isEmpty ? "未命名分组" : group.name as NSString).draw(
-                in: NSRect(x: 11, y: bounds.midY - 8, width: max(0, bounds.width - 39), height: 17),
-                withAttributes: [.font: NSFont.systemFont(ofSize: 12, weight: .semibold),
-                                 .foregroundColor: group.color.foreground.withAlphaComponent(expansion), .paragraphStyle: paragraph])
+            let font = NSFont.systemFont(ofSize: 12, weight: .semibold)
+            let title = NSAttributedString(string: group.name.isEmpty ? "未命名分组" : group.name,
+                attributes: [.font: font,
+                             .foregroundColor: group.color.foreground.withAlphaComponent(expansion), .paragraphStyle: paragraph])
+            let height = ceil(font.ascender - font.descender + font.leading)
+            title.draw(in: NSRect(x: 11, y: bounds.midY - height / 2,
+                                 width: max(0, bounds.width - 39), height: height))
         }
         let center = NSPoint(x: 18 + expansion * (bounds.maxX - 33), y: bounds.midY)
         let arrow = NSBezierPath()
