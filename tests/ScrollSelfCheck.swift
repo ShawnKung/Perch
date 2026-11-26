@@ -199,17 +199,15 @@ enum ScrollSelfCheck {
         window.contentView = host
         window.makeKeyAndOrderFront(nil)
         defer { window.close() }
-        func renderers(_ view: NSView) -> [AIMarkdownWebView] {
-            (view as? AIMarkdownWebView).map { [$0] } ?? view.subviews.flatMap(renderers)
+        func renderers(_ view: NSView) -> [AIChatWebView] {
+            (view as? AIChatWebView).map { [$0] } ?? view.subviews.flatMap(renderers)
         }
-        func textPoints(_ renderer: AIMarkdownWebView) -> [NSPoint] {
+        func textPoints(_ renderer: AIChatWebView) -> [NSPoint] {
             let viewport = renderer.bounds.intersection(renderer.visibleRect)
             guard viewport.height > 40 else { return [] }
             return [0.1, 0.5, 0.9].compactMap { fraction in
                 let point = NSPoint(x: viewport.midX, y: viewport.minY + viewport.height * fraction)
-                let pagePoint = NSPoint(x: point.x,
-                    y: renderer.isFlipped ? point.y : renderer.bounds.height - point.y)
-                return renderer.diagramRects.contains { $0.contains(pagePoint) } ? nil : point
+                return point
             }
         }
         try await AISelfCheck.wait { renderers(host).contains {
@@ -242,8 +240,6 @@ enum ScrollSelfCheck {
                             baseURL: URL(string: "https://scroll-fixture.invalid"))
         try await AISelfCheck.wait { !page.isLoading && page.window === window }
         try await Task.sleep(nanoseconds: 250_000_000)
-        let event = NSEvent(cgEvent: CGEvent(scrollWheelEvent2Source: nil, units: .line,
-                                            wheelCount: 1, wheel1: -3, wheel2: 0, wheel3: 0)!)!
         guard chatController.view.window == nil, retained.allSatisfy({ $0.window == nil }),
               renderers(host).isEmpty,
               tabs.tabViewItems.contains(where: { $0.viewController === chatController }) else {
@@ -255,7 +251,7 @@ enum ScrollSelfCheck {
             throw PerchError("The selected webpage must receive events directly")
         }
         store.activate(store.tabs.first { $0.chatOwner != nil }!.id)
-        func visibleTextPoint() -> (AIMarkdownWebView, NSPoint)? {
+        func visibleTextPoint() -> (AIChatWebView, NSPoint)? {
             for renderer in renderers(host) {
                 for point in textPoints(renderer) {
                     let windowPoint = renderer.convert(point, to: nil)
@@ -271,14 +267,19 @@ enum ScrollSelfCheck {
             host.layoutSubtreeIfNeeded()
             return visibleTextPoint() != nil
         }
-        let (renderer, point) = visibleTextPoint()!
+        let (renderer, _) = visibleTextPoint()!
         guard chatController.view.window === window, retained.contains(where: { $0 === renderer }),
               page.window == nil else {
             throw PerchError("Tab switching must restore the same Chat controller and renderer")
         }
-        guard renderer.forwardVerticalScroll(event, at: point) else {
-            throw PerchError("Visible Chat must regain normal wheel forwarding")
-        }
+        let point = try await renderer.evaluateJavaScript("""
+            (()=>{const r=document.getElementById('scroll').getBoundingClientRect();return [r.x+r.width/2,r.y+r.height/2]})()
+            """) as! [Double]
+        let local = renderer.convert(NSPoint(x: point[0], y: renderer.isFlipped ? point[1] : renderer.bounds.height-point[1]), to: nil)
+        let before = try await renderer.evaluateJavaScript("document.getElementById('scroll').scrollTop") as! Double
+        try await AIChatPageSelfCheck.wheel(120, at: local, web: renderer, window: window)
+        try await AIChatPageSelfCheck.check(renderer, "document.getElementById('scroll').scrollTop<before-60",
+                                           "可见 Chat 必须恢复滚轮响应", arguments: ["before": before])
         print("PASS: peer native Chat controller leaves the window when inactive, retains its renderer and resumes scrolling when selected")
     }
 }

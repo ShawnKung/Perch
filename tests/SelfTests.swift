@@ -3011,8 +3011,15 @@ final class LayoutSelfCheck {
               "The draft must reference both the page and the frozen text")
         check(store.ai.drafts[owner] == "保留已有草稿" && store.ai.sessions[owner]?.requestID == nil,
               "Ask AI must preserve the question and wait for explicit sending")
-        for _ in 0..<20 where !(panel.firstResponder is AIComposerTextView) { await settle() }
-        check(panel.firstResponder is AIComposerTextView, "Ask AI must focus the native composer; responder=\(String(describing: panel.firstResponder)), active=\(NSApp.isActive), key=\(panel.isKeyWindow)")
+        var chatFocused = false
+        for _ in 0..<20 {
+            if let web = AIChatPageSelfCheck.find(panel.contentView!) {
+                chatFocused = (try? await web.evaluateJavaScript("document.activeElement.id==='composer'")) as? Bool == true
+            }
+            if chatFocused { break }
+            await settle()
+        }
+        check(chatFocused && panel.firstResponder is NSTextInputClient, "Ask AI must focus the native WebKit input client; responder=\(String(describing: panel.firstResponder)), active=\(NSApp.isActive), key=\(panel.isKeyWindow)")
         check(store.ai.composerFocusRequests[owner] == nil, "Focus requests must be consumed instead of replaying on later tab switches")
         let snapshot = store.ai.draftQuotes[owner]!
         let restored = try? JSONDecoder().decode(AIQuote.self, from: JSONEncoder().encode(snapshot))
@@ -3020,6 +3027,9 @@ final class LayoutSelfCheck {
               "Page quotes must persist and escape quoted markup")
         store.askAI(selected, tabID: id)
         check(store.ai.draftReferences[owner] == [id], "Repeated Ask AI must not duplicate the page reference")
+        let repeatedSnapshot = store.ai.draftQuotes[owner]!
+        check(repeatedSnapshot.text == snapshot.text && repeatedSnapshot.page?.url == snapshot.page?.url,
+              "Repeated Ask AI must preserve the selected text and source")
         let bridge = (try? await browser.webView.evaluateJavaScript("typeof window.webkit?.messageHandlers?.perchSelection")) as? String
         check(bridge == "undefined", "The selection bridge must remain isolated from page scripts")
         check(store.ai.send("已发送的合成消息", tab: owner, browser: nil, usePage: false),
@@ -3041,7 +3051,9 @@ final class LayoutSelfCheck {
             if node.responds(to: NSSelectorFromString("accessibilityChildren")) {
                 children += node.value(forKey: "accessibilityChildren") as? [NSObject] ?? []
             }
-            return children.lazy.compactMap(newChatButton).first
+            // A lazy compactMap can evaluate the transform twice; this search mutates visited.
+            for child in children { if let found = newChatButton(child) { return found } }
+            return nil
         }
         guard let button = newChatButton(panel.contentView!),
               let frame = (button.value(forKey: "accessibilityFrame") as? NSValue)?.rectValue else {
@@ -3055,16 +3067,17 @@ final class LayoutSelfCheck {
         check(store.ai.drafts[newOwner] == "保留文字和引用，开始新会话 🙂" &&
               store.ai.draftFiles[newOwner]?.map(\.id) == [attachment.id] &&
               store.ai.draftFiles[newOwner]?.first?.data == attachment.data && store.ai.draftReferences[newOwner] == [id] &&
-              store.ai.draftQuotes[newOwner] == snapshot,
+              store.ai.draftQuotes[newOwner] == repeatedSnapshot,
               "The new conversation must retain the visible text, attachment, webpage and selection references")
-        check((panel.firstResponder as? AIComposerTextView)?.string == store.ai.drafts[newOwner],
+        let chatInput = try? await AIChatPageSelfCheck.find(panel.contentView!)?.evaluateJavaScript("document.getElementById('composer').value")
+        check(chatInput as? String == store.ai.drafts[newOwner],
               "The new native composer must display the preserved input")
         check(store.ai.sessions[owner]?.messages.map(\.id) == oldMessages &&
               store.ai.sessions[newOwner]?.requestID == nil,
               "Starting a conversation must preserve old history and wait for explicit sending")
         store.newChat()
         check(store.chatOwner == newOwner && store.ai.draftReferences[newOwner] == [id] &&
-              store.ai.draftQuotes[newOwner] == snapshot, "Repeated new-chat clicks must retain the same draft and deduplicate references")
+              store.ai.draftQuotes[newOwner] == repeatedSnapshot, "Repeated new-chat clicks must retain the same draft and deduplicate references")
         print("PASS: actual sidebar new-chat click preserves native composer text, attachments, webpage/selection references and old history without sending")
         print("PASS: actual selected-text context menu, Chinese cleanup, frozen webpage/text references, preserved drafts, composer focus and isolated selection bridge")
     }

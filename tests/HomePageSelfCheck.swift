@@ -46,18 +46,29 @@ struct HomePageFixture {
     func mouse(_ type: NSEvent.EventType, at point: NSPoint) {
         NSApp.sendEvent(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
             timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber,
-            context: nil, eventNumber: 1, clickCount: 1, pressure: type == .leftMouseUp ? 0 : 1)!)
+            context: nil, eventNumber: 1, clickCount: type == .mouseMoved ? 0 : 1,
+            pressure: type == .leftMouseDown || type == .leftMouseDragged ? 1 : 0)!)
     }
     func click(_ selector: String, web: WKWebView) async throws {
-        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
-        panel.focusWindow()
-        try await AISelfCheck.wait { NSApp.isActive && panel.isKeyWindow }
+        if !NSApp.isActive {
+            NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
+        }
+        if !panel.isKeyWindow { panel.focusWindow() }
+        do { try await AISelfCheck.wait { NSApp.isActive && panel.isKeyWindow } }
+        catch {
+            throw PerchError("Native click activation timed out: selector=\(selector), active=\(NSApp.isActive), key=\(panel.isKeyWindow), visible=\(panel.isVisible), policy=\(NSApp.activationPolicy().rawValue), frontmost=\(NSWorkspace.shared.frontmostApplication?.bundleURL?.path ?? "nil")")
+        }
+        _ = try await web.callAsyncJavaScript("""
+            document.querySelector(selector)?.scrollIntoView({block:'nearest',inline:'nearest'});
+            """, arguments: ["selector": selector], in: nil, contentWorld: .defaultClient)
         let location = try await point(selector, web: web)
         let root = panel.contentView!
         let hit = root.hitTest(root.superview?.convert(location, from: nil) ?? location)
         guard hit === web || hit?.isDescendant(of: web) == true else {
             throw PerchError("Home click missed WebKit: \(selector), point=\(location), hit=\(String(describing: hit))")
         }
+        mouse(.mouseMoved, at: location)
+        try await Task.sleep(nanoseconds: 40_000_000)
         mouse(.leftMouseDown, at: location)
         try await Task.sleep(nanoseconds: 40_000_000)
         mouse(.leftMouseUp, at: location)

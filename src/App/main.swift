@@ -3145,6 +3145,20 @@ if CommandLine.arguments.contains("--update-self-test") {
         } catch { print("FAIL: \(error)"); exit(1) }
     }
     NSApplication.shared.run()
+} else if CommandLine.arguments.contains("--ai-chat-html-self-test") || CommandLine.arguments.contains("--ai-chat-style-self-test") || CommandLine.arguments.contains("--ai-quote-self-test") {
+    NSApplication.shared.setActivationPolicy(.regular)
+    Task { @MainActor in
+        setbuf(stdout, nil)
+        NSApp.activate(ignoringOtherApps: true)
+        do {
+            let index = CommandLine.arguments.firstIndex { $0 == "--ai-chat-html-self-test" || $0 == "--ai-chat-style-self-test" || $0 == "--ai-quote-self-test" }!
+            let baseURL = CommandLine.arguments.count > index + 1 ? CommandLine.arguments[index + 1] : nil
+            try await AIChatPageSelfCheck.run(baseURL: baseURL, styleOnly: CommandLine.arguments.contains("--ai-chat-style-self-test"),
+                                            quoteOnly: CommandLine.arguments.contains("--ai-quote-self-test"))
+            print("PASS: HTML Chat self-check"); exit(0)
+        } catch { print("FAIL: \(error)"); exit(1) }
+    }
+    NSApplication.shared.run()
 } else if CommandLine.arguments.contains("--ai-typography-self-test") {
     let app = NSApplication.shared
     app.setActivationPolicy(.regular)

@@ -1773,12 +1773,14 @@ enum AISelfCheck {
             guard value.responds(to: NSSelectorFromString("accessibilityChildren")) else { return nil }
             return (value.value(forKey: "accessibilityChildren") as? [Any] ?? []).lazy.compactMap { element(in: $0, label: label) }.first
         }
-        func frame(_ label: String) throws -> NSRect {
-            guard let value = element(in: host, label: label),
-                  let rect = value.value(forKey: "accessibilityFrame") as? NSValue else {
-                throw PerchError("Missing composer control: \(label)")
-            }
-            return rect.rectValue
+        func frame(_ label: String) async throws -> NSRect {
+            guard let web = AIChatPageSelfCheck.find(host) else { throw PerchError("Missing Chat WebView") }
+            return try await AIChatPageSelfCheck.frame(label, web: web)
+        }
+        func frames(_ labels: [String]) async throws -> [NSRect] {
+            var result: [NSRect] = []
+            for label in labels { result.append(try await frame(label)) }
+            return result
         }
         func snapshot(_ name: String) throws {
             guard let path = ProcessInfo.processInfo.environment["PERCH_LAYOUT_EVIDENCE"] else { return }
@@ -1823,10 +1825,9 @@ enum AISelfCheck {
             window.setContentSize(NSSize(width: fullPage ? 1000 : 360, height: 650))
             store.ai.drafts[owner] = "native queue start fixture"
             do {
-                try await wait {
-                    host.layoutSubtreeIfNeeded()
-                    return element(in: host, label: "发送") != nil && element(in: host, label: "选择模型") != nil
-                }
+                try await wait { AIChatPageSelfCheck.find(host)?.controller?.ready == true }
+                try await AIChatPageSelfCheck.waitFor(AIChatPageSelfCheck.find(host)!,
+                    "!document.getElementById('send').hidden && document.getElementById('composer').value==='native queue start fixture'")
             } catch {
                 try snapshot("missing-controls")
                 throw PerchError("Composer controls unavailable: ready=\(store.ai.ready(for: owner)), busy=\(store.ai.sessions[owner]?.requestID != nil), error=\(store.ai.sessions[owner]?.error ?? "none")")
@@ -1834,9 +1835,9 @@ enum AISelfCheck {
             try await Task.sleep(nanoseconds: 150_000_000)
             host.layoutSubtreeIfNeeded()
             let labels = ["添加附件", "联网搜索", "选择模型"]
-            let before = try labels.map(frame)
-            let send = try frame("发送")
-            let inputRect = try frame("向 AI 提问，输入 @ 引用标签页")
+            let before = try await frames(labels)
+            let send = try await frame("发送")
+            let inputRect = try await frame("向 AI 提问，输入 @ 引用标签页")
             for rect in before + [send] {
                 precondition(!inputRect.contains(NSPoint(x: rect.midX, y: rect.midY)),
                              "Icon controls must remain outside the text input")
@@ -1849,24 +1850,43 @@ enum AISelfCheck {
                            NSPoint(x: -15, y: -15), NSPoint(x: 15, y: -15),
                            NSPoint(x: -15, y: 15), NSPoint(x: 15, y: 15)] {
                 store.ai.drafts[owner] = "button hit fixture"
-                try await wait { element(in: host, label: "发送") != nil }
+                try await AIChatPageSelfCheck.waitFor(AIChatPageSelfCheck.find(host)!,
+                    "!document.getElementById('send').hidden && !document.getElementById('send').disabled && document.getElementById('stop').hidden && document.getElementById('composer').value==='button hit fixture'")
                 host.layoutSubtreeIfNeeded()
-                let rect = try frame("发送")
+                let rect = try await frame("发送")
                 precondition(abs(rect.width - 34) < 1 && abs(rect.height - 34) < 1,
                              "Send accessibility frame must cover the complete button label")
                 let count = store.ai.sessions[owner]?.messages.count ?? 0
                 let point = window.convertPoint(fromScreen: NSPoint(x: rect.midX + offset.x, y: rect.midY + offset.y))
+                let web = AIChatPageSelfCheck.find(host)!
+                let local = web.convert(point, from: nil)
+                let target = try await web.callAsyncJavaScript("""
+                    window.composerHitEvents=[];
+                    for(const type of ['mousedown','mouseup','click'])document.addEventListener(type,e=>{
+                        composerHitEvents.push({type,target:e.target.id,trusted:e.isTrusted});
+                    },{once:true});
+                    return document.elementFromPoint(x,y)?.closest('button')?.id;
+                    """, arguments: ["x": local.x, "y": web.isFlipped ? local.y : web.bounds.height-local.y],
+                    in: nil, contentWorld: .defaultClient) as? String
+                guard target == "send" else { throw PerchError("Send edge hits \(target ?? "nothing") at \(offset)") }
+                NSApp.sendEvent(NSEvent.mouseEvent(with: .mouseMoved, location: point, modifierFlags: [],
+                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                    context: nil, eventNumber: 1, clickCount: 0, pressure: 0)!)
+                try await Task.sleep(nanoseconds: 40_000_000)
                 for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
                     NSApp.sendEvent(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
                         timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
                         context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!)
+                    try await Task.sleep(nanoseconds: 40_000_000)
                 }
                 do {
                     try await wait {
                         (store.ai.sessions[owner]?.messages.count ?? 0) > count && store.ai.drafts[owner] == ""
                     }
                 } catch {
-                    throw PerchError("\(prefix) send click missed at \(offset): \(error.localizedDescription)")
+                    let events = try? await web.callAsyncJavaScript("return JSON.stringify({events:composerHitEvents,disabled:document.getElementById('send').disabled,draft:document.getElementById('composer').value})",
+                        arguments: [:], in: nil, contentWorld: .defaultClient)
+                    throw PerchError("\(prefix) send click missed at \(offset): \(error.localizedDescription), events=\(events ?? "")")
                 }
                 try await wait { store.ai.sessions[owner]?.requestID == nil }
             }
@@ -1874,25 +1894,27 @@ enum AISelfCheck {
             store.ai.drafts[owner] = "native queue start fixture"
             precondition(store.ai.send(store.ai.drafts[owner]!, tab: owner, browser: nil, usePage: false))
             store.ai.drafts[owner] = ""
-            try await wait { element(in: host, label: "停止生成") != nil && element(in: host, label: "发送") == nil }
+            try await AIChatPageSelfCheck.waitFor(AIChatPageSelfCheck.find(host)!,
+                "!document.getElementById('stop').hidden && document.getElementById('send').hidden")
             for _ in 0..<12 {
                 try await Task.sleep(nanoseconds: 20_000_000)
                 host.layoutSubtreeIfNeeded()
-                let after = try labels.map(frame)
+                let after = try await frames(labels)
                 for (a, b) in zip(before, after) {
                     precondition(abs(a.minX - b.minX) < 1 && abs(a.minY - b.minY) < 1 &&
                                  abs(a.width - b.width) < 1 && abs(a.height - b.height) < 1,
                                  "Starting generation must not move or resize the composer controls: \(a) -> \(b)")
                 }
-                let stop = try frame("停止生成")
+                let stop = try await frame("停止生成")
                 precondition(abs(send.midX - stop.midX) < 1 && abs(send.midY - stop.midY) < 1,
                              "Send and stop must occupy the same position")
             }
             try snapshot(prefix + "-busy")
             try await wait { store.ai.sessions[owner]?.requestID == nil }
-            try await wait { element(in: host, label: "发送") != nil && element(in: host, label: "停止生成") == nil }
+            try await AIChatPageSelfCheck.waitFor(AIChatPageSelfCheck.find(host)!,
+                "!document.getElementById('send').hidden && document.getElementById('stop').hidden")
             host.layoutSubtreeIfNeeded()
-            for (a, b) in zip(before, try labels.map(frame)) {
+            for (a, b) in zip(before, try await frames(labels)) {
                 precondition(abs(a.minX - b.minX) < 1 && abs(a.minY - b.minY) < 1)
             }
             print("PASS: \(prefix) composer control frames remain stable before, during rotation and after generation")
@@ -1983,6 +2005,14 @@ enum AISelfCheck {
         let historyController = AIController(defaults: defaults, conversationDirectory: historyDirectory)
         precondition(Set(historyController.conversations(for: URL(string: firstPage.address + "?secret=ignored#fragment")).map(\.id)) ==
                      Set([sidebarRecord.id, referencedRecord.id, legacyRecord.id]))
+        let matchingHistory = Set([sidebarRecord.id, referencedRecord.id, legacyRecord.id])
+        for address in [firstPage.address, "https://EXAMPLE.COM/first?different=query#new-fragment"] {
+            precondition(Set(historyController.conversations(for: URL(string: address)).map(\.id)) == matchingHistory)
+        }
+        precondition(historyController.conversations(for: URL(string: "https://example.com/first/other-conversation")).isEmpty)
+        let reloadedHistory = AIController(defaults: defaults, conversationDirectory: historyDirectory)
+        precondition(Set(reloadedHistory.conversations(for: URL(string: firstPage.address)).map(\.id)) == matchingHistory)
+        precondition(Set(reloadedHistory.conversations(for: URL(string: secondPage.address)).map(\.id)) == Set([unrelatedRecord.id]))
         let roundTrip = try JSONDecoder().decode(AISession.self, from: JSONEncoder().encode(sidebarRecord))
         precondition(roundTrip.webPageURLs == sidebarRecord.webPageURLs && roundTrip.readingPosition == nil)
         let persistedStore = Store(defaults: defaults)
@@ -1991,62 +2021,21 @@ enum AISelfCheck {
         store.ai.drafts = [:]; store.ai.draftReferences = [:]
         store.selected = nil
         print("PASS: per-tab sidebar state, current-page reference, filtered history and legacy settings migration")
+        try await AIChatPageSelfCheck.run(baseURL: config.baseURL.replacingOccurrences(of: "/v1", with: ""))
         store.tabs = [Tab(title: "First fixture", address: "about:blank"), Tab(title: "Second fixture", address: "about:blank")]
-        let host = NSHostingView(rootView: AIChatSidebar(store: store, ai: store.ai, close: {}).defaultAppStorage(defaults))
-        let window = NSWindow(contentRect: NSRect(x: 120, y: 200, width: 350, height: 600),
+        let window = Panel(contentRect: NSRect(x: 120, y: 200, width: 1000, height: 650),
                               styleMask: [.titled], backing: .buffered, defer: false)
-        window.contentView = host; window.makeKeyAndOrderFront(nil)
-        defer { window.orderOut(nil); window.contentView = nil }
-        func editor(in view: NSView) -> NSTextView? {
-            if let text = view as? NSTextView, text.isEditable { return text }
-            return view.subviews.lazy.compactMap { editor(in: $0) }.first
-        }
-        try await wait { editor(in: host) != nil }
-        let input = editor(in: host)!
-        var sendCount = 0
-        var selectMention = false
-        var composerText = "question"
-        var composer = AIComposerInput(text: Binding(get: { composerText }, set: { composerText = $0 }),
-                                       enabled: true, mentionChanged: { _, _ in }, mentionCommand: { _ in selectMention },
-                                       send: { sendCount += 1 })
-        let coordinator = AIComposerInput.Coordinator(composer)
-        let shortcutEditor = AIComposerTextView()
-        shortcutEditor.delegate = coordinator
-        func pressReturn(_ flags: NSEvent.ModifierFlags) {
-            let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: flags, timestamp: 0,
-                                        windowNumber: 0, context: nil, characters: "\r", charactersIgnoringModifiers: "\r",
-                                        isARepeat: false, keyCode: 36)!
-            _ = coordinator.handleReturn(event, editor: shortcutEditor)
-        }
-        shortcutEditor.string = "question"; pressReturn([])
-        precondition(sendCount == 1 && composerText == "question")
-        pressReturn(.shift); precondition(sendCount == 1 && shortcutEditor.string.contains("\n"))
-        composer.sendWithCommand = true; coordinator.parent = composer
-        pressReturn([]); precondition(sendCount == 1)
-        pressReturn(.command); precondition(sendCount == 2)
-        shortcutEditor.setMarkedText("拼", selectedRange: NSRange(location: 1, length: 0), replacementRange: NSRange(location: 0, length: 0))
-        pressReturn(.command); precondition(sendCount == 2 && shortcutEditor.hasMarkedText())
-        shortcutEditor.unmarkText()
-        selectMention = true; composer.sendWithCommand = false; coordinator.parent = composer
-        pressReturn([]); precondition(sendCount == 2)
-        print("PASS: Return sends, configurable Cmd+Return, Shift+Return newline, IME and mention selection")
-        window.makeFirstResponder(input)
-        input.insertText("帮我看看@Second", replacementRange: NSRange(location: 0, length: 0))
-        try await wait { store.ai.drafts[AIController.homeID] == "帮我看看@Second" }
-        let selected = input.delegate?.textView?(input, doCommandBy: NSSelectorFromString("insertNewline:"))
-        precondition(selected == true)
-        try await wait { store.ai.draftReferences[AIController.homeID] == [store.tabs[1].id] }
-        precondition(store.ai.drafts[AIController.homeID] == "帮我看看" && store.selected == nil)
-        window.setContentSize(NSSize(width: 1000, height: 650))
+        window.isReleasedWhenClosed = false
         let root = NSHostingView(rootView: RootView(store: store).defaultAppStorage(defaults))
-        window.contentView = root
+        window.contentView = root; window.makeKeyAndOrderFront(nil)
+        defer { window.orderOut(nil); window.contentView = nil }
         try await Task.sleep(nanoseconds: 100_000_000)
-        precondition(editor(in: root) == nil, "Closed AI sidebar must not construct a hidden composer")
+        precondition(AIChatPageSelfCheck.find(root) == nil, "Closed AI sidebar must not construct a hidden composer")
         root.layoutSubtreeIfNeeded()
         let closedX = root.bounds.maxX
         store.aiVisible = true
-        try await wait { editor(in: root) != nil }
-        let sideInput = editor(in: root)!
+        try await wait { AIChatPageSelfCheck.find(root) != nil }
+        let sideInput = AIChatPageSelfCheck.find(root)!
         var samples: [CGFloat] = []
         for _ in 0..<18 {
             try await Task.sleep(nanoseconds: 20_000_000)
@@ -2059,16 +2048,17 @@ enum AISelfCheck {
             precondition(samples.contains { $0 > openedX + 5 && $0 < closedX - 5 }, "AI sidebar must pass through intermediate positions")
         }
         store.aiVisible = false
-        try await wait { editor(in: root) == nil && sideInput.window == nil }
+        try await wait { AIChatPageSelfCheck.find(root) == nil && sideInput.window == nil }
         print("PASS: native right sidebar animates open and removes its composer when closed")
         store.ai.drafts[AIController.homeID] = "Continue here"
         store.openChat(owner: AIController.homeID)
         window.contentView = NSHostingView(rootView: RootView(store: store).defaultAppStorage(defaults))
-        try await wait { editor(in: window.contentView!)?.string == "Continue here" }
-        precondition(store.chatOwner == AIController.homeID && store.ai.draftReferences[store.chatOwner]?.count == 1)
-        let fullInput = editor(in: window.contentView!) as! AIComposerTextView
+        let fullInput = try await AIChatPageSelfCheck.ready(window)
+        let fixture = HomePageFixture(store: store, panel: window)
+        try await AIChatPageSelfCheck.waitFor(fullInput, "document.getElementById('composer').value==='Continue here'")
+        precondition(store.chatOwner == AIController.homeID)
         func composers(in view: NSView) -> Int {
-            (view is AIComposerTextView ? 1 : 0) + view.subviews.reduce(0) { $0 + composers(in: $1) }
+            (view is AIChatWebView ? 1 : 0) + view.subviews.reduce(0) { $0 + composers(in: $1) }
         }
         precondition(composers(in: window.contentView!) == 1, "Full Chat must not construct a duplicate hidden composer")
         precondition(store.ai.searchRoute(for: store.chatOwner) == .off)
@@ -2086,36 +2076,6 @@ enum AISelfCheck {
                 try bitmap.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: directory).appendingPathComponent("chat.png"))
             }
         }
-        let board = NSPasteboard.withUniqueName()
-        defer { board.releaseGlobally() }
-        fullInput.pasteboard = board
-        let image = NSImage(size: NSSize(width: 40, height: 30))
-        image.lockFocus(); NSColor.systemGreen.setFill(); NSRect(x: 0, y: 0, width: 40, height: 30).fill(); image.unlockFocus()
-        let bitmap = NSBitmapImageRep(data: image.tiffRepresentation!)!
-        for (type, format) in [(NSPasteboard.PasteboardType.png, NSBitmapImageRep.FileType.png),
-                               (.tiff, .tiff), (NSPasteboard.PasteboardType("public.jpeg"), .jpeg)] {
-            board.clearContents()
-            board.setData(bitmap.representation(using: format, properties: [:])!, forType: type)
-            let menu = NSMenuItem(title: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "")
-            precondition(fullInput.validateUserInterfaceItem(menu), "Image-only clipboard must enable Paste")
-            window.makeFirstResponder(fullInput)
-            fullInput.paste(nil)
-            try await wait { (store.ai.draftFiles[store.chatOwner] ?? []).count > 0 }
-        }
-        precondition(store.ai.draftFiles[store.chatOwner]?.count == 3 && fullInput.string == "Continue here")
-        precondition(store.ai.draftFiles[store.chatOwner]?.allSatisfy { $0.mime == "image/jpeg" && NSImage(data: $0.data) != nil } == true)
-        for _ in 0..<3 { fullInput.paste(nil) }
-        precondition(store.ai.draftFiles[store.chatOwner]?.count == 5, "Paste must respect attachment count limits")
-        window.makeFirstResponder(fullInput)
-        fullInput.setSelectedRange(NSRange(location: fullInput.string.utf16.count, length: 0))
-        fullInput.setMarkedText("n", selectedRange: NSRange(location: 1, length: 0),
-                                replacementRange: NSRange(location: NSNotFound, length: 0))
-        store.ai.draftFiles[store.chatOwner] = []
-        try await Task.sleep(nanoseconds: 150_000_000)
-        precondition(fullInput.hasMarkedText() && fullInput.string == "Continue heren")
-        precondition(fullInput.delegate?.textView?(fullInput, doCommandBy: NSSelectorFromString("insertNewline:")) != true)
-        fullInput.insertText("你", replacementRange: NSRange(location: NSNotFound, length: 0))
-        try await wait { store.ai.drafts[store.chatOwner] == "Continue here你" }
         let historyRoot = window.contentView!
         historyRoot.layoutSubtreeIfNeeded()
         func accessibilityElement(in node: Any, label: String) -> NSObject? {
@@ -2164,13 +2124,11 @@ enum AISelfCheck {
               let pin = accessibilityElement(in: historyRoot, label: "窗口置顶") else {
             throw PerchError("Chat toolbar controls are missing")
         }
-        guard let globe = accessibilityElement(in: historyRoot, label: "联网搜索"),
-              let modelPicker = accessibilityElement(in: historyRoot, label: "选择模型") else {
-            throw PerchError("Chat search and model controls are missing")
-        }
-        precondition(!accessibilityFrame(globe).intersects(accessibilityFrame(modelPicker)),
+        let globe = try await AIChatPageSelfCheck.frame("联网搜索", web: fullInput)
+        let modelPicker = try await AIChatPageSelfCheck.frame("选择模型", web: fullInput)
+        precondition(!globe.intersects(modelPicker),
                      "Search menu must not overlap the model picker")
-        print("PASS: native globe search menu is accessible beside the model picker without overlap")
+        print("PASS: labeled HTML search and model controls do not overlap")
         let toolbarFrames = [export, newChat, pin].map(accessibilityFrame)
         precondition(toolbarFrames[0].maxX < toolbarFrames[1].minX &&
                      toolbarFrames[1].maxX < toolbarFrames[2].minX, "Export and new chat must sit immediately before pin")
@@ -2289,69 +2247,51 @@ enum AISelfCheck {
         print("PASS: Chat toolbar buttons precede pin with matching frames, warm gutter pixels, native history dragging and persistent width limits")
         store.chatHistoryVisible = false
         print("PASS: Chat defaults open, footer collapse aligns with archive, expand keeps its height and clears the composer, and the top settings shortcut is absent")
-        print("PASS: full Chat PNG/TIFF/JPEG clipboard paste, attachment limits, IME redraw and left history sidebar layout")
-        print("PASS: native composer @ filtering, keyboard reference selection and full-page draft/reference continuity")
         store.ai.drafts[store.chatOwner] = ""
-        try await wait { fullInput.string.isEmpty }
-        guard fullInput.showsPlaceholder else { throw PerchError("Empty composer did not show placeholder; marked=\(fullInput.hasMarkedText())") }
-        fullInput.setMarkedText("a", selectedRange: NSRange(location: 1, length: 0),
+        try await AIChatPageSelfCheck.waitFor(fullInput, "document.getElementById('composer').matches(':placeholder-shown')")
+        try await fixture.click("#composer", web: fullInput)
+        let nativeInput = window.firstResponder as! NSTextInputClient
+        nativeInput.setMarkedText("a", selectedRange: NSRange(location: 1, length: 0),
                                 replacementRange: NSRange(location: NSNotFound, length: 0))
-        guard fullInput.hasMarkedText() && !fullInput.showsPlaceholder else {
-            throw PerchError("First IME letter placeholder state invalid; marked=\(fullInput.hasMarkedText()), placeholder=\(fullInput.showsPlaceholder)")
-        }
+        try await AIChatPageSelfCheck.waitFor(fullInput, "!document.getElementById('composer').matches(':placeholder-shown')")
         guard store.ai.drafts[store.chatOwner]?.isEmpty == true else { throw PerchError("First IME letter prematurely changed the draft") }
         store.ai.draftFiles[store.chatOwner] = []
         try await Task.sleep(nanoseconds: 150_000_000)
-        guard fullInput.string == "a" && fullInput.hasMarkedText() && !fullInput.showsPlaceholder else {
-            throw PerchError("IME redraw changed composition: text=\(fullInput.string), marked=\(fullInput.hasMarkedText())")
-        }
-        fullInput.setMarkedText("adai", selectedRange: NSRange(location: 4, length: 0),
+        try await AIChatPageSelfCheck.check(fullInput, "document.getElementById('composer').value==='a'", "刷新丢失未提交的组合输入")
+        nativeInput.setMarkedText("adai", selectedRange: NSRange(location: 4, length: 0),
                                 replacementRange: NSRange(location: NSNotFound, length: 0))
-        guard !fullInput.showsPlaceholder else { throw PerchError("Placeholder visible during longer composition") }
-        fullInput.insertText("阿黛", replacementRange: NSRange(location: NSNotFound, length: 0))
+        try await AIChatPageSelfCheck.check(fullInput, "!document.getElementById('composer').matches(':placeholder-shown')", "组合输入期间显示占位符")
+        nativeInput.insertText("阿黛", replacementRange: NSRange(location: NSNotFound, length: 0))
         try await wait { store.ai.drafts[store.chatOwner] == "阿黛" }
-        guard !fullInput.showsPlaceholder else { throw PerchError("Placeholder visible after composition commit") }
-        fullInput.insertText("", replacementRange: NSRange(location: 0, length: fullInput.string.utf16.count))
-        try await wait { fullInput.showsPlaceholder && store.ai.drafts[store.chatOwner]?.isEmpty == true }
-        fullInput.setMarkedText("n", selectedRange: NSRange(location: 1, length: 0),
+        try await AIChatPageSelfCheck.type("", fixture: fixture, web: fullInput)
+        try await AIChatPageSelfCheck.waitFor(fullInput, "document.getElementById('composer').matches(':placeholder-shown')")
+        nativeInput.setMarkedText("n", selectedRange: NSRange(location: 1, length: 0),
                                 replacementRange: NSRange(location: NSNotFound, length: 0))
-        fullInput.setMarkedText("", selectedRange: NSRange(location: 0, length: 0),
+        nativeInput.setMarkedText("", selectedRange: NSRange(location: 0, length: 0),
                                 replacementRange: NSRange(location: NSNotFound, length: 0))
-        fullInput.unmarkText()
-        guard fullInput.showsPlaceholder else { throw PerchError("Placeholder did not return after composition cancellation: \(fullInput.string)") }
+        nativeInput.unmarkText()
+        try await AIChatPageSelfCheck.waitFor(fullInput, "document.getElementById('composer').matches(':placeholder-shown')")
         print("PASS: placeholder hides on the first IME letter, survives redraw, and returns after deletion or composition cancellation")
-        func markdownViews(in view: NSView) -> [AIMarkdownWebView] {
-            (view as? AIMarkdownWebView).map { [$0] } ?? view.subviews.flatMap { markdownViews(in: $0) }
-        }
         store.ai.seedPreview()
         store.ai.saveConversations()
-        try await wait { markdownViews(in: historyRoot).contains { $0.visibleRect.width > 20 && $0.visibleRect.height > 20 && $0.bounds.height > 300 } }
-        let initialAnswer = markdownViews(in: historyRoot).first { $0.bounds.height > 300 }!
-        var scrollAncestor = initialAnswer.superview
-        while scrollAncestor != nil && !(scrollAncestor is NSScrollView) { scrollAncestor = scrollAncestor?.superview }
-        let editScroll = scrollAncestor as! NSScrollView
-        editScroll.contentView.scroll(to: NSPoint(x: 0, y: max(0, editScroll.documentView!.bounds.height - editScroll.contentSize.height)))
-        editScroll.reflectScrolledClipView(editScroll.contentView)
-        precondition(editScroll.contentView.bounds.origin.y > 50)
+        try await AIChatPageSelfCheck.waitFor(fullInput, "document.querySelectorAll('.message').length===2 && document.getElementById('scroll').scrollTop>50")
         let editOwner = store.chatOwner
         let editMessage = store.ai.sessions[editOwner]!.messages[0]
         let preservedIDs = store.ai.sessions[editOwner]!.messages.map(\.id)
         let priorDraft = store.ai.drafts[editOwner]
         _ = store.ai.editMessage(editMessage.id, tab: editOwner)
-        try await wait { fullInput.string == editMessage.text }
-        try await Task.sleep(nanoseconds: 100_000_000)
-        try await wait { editScroll.contentView.bounds.origin.y < 30 }
-        window.makeFirstResponder(fullInput)
-        let escaped = fullInput.delegate?.textView?(fullInput, doCommandBy: NSSelectorFromString("cancelOperation:"))
-        precondition(escaped == true)
-        try await wait { store.ai.pendingEdits[editOwner] == nil && fullInput.string == priorDraft }
+        try await AIChatPageSelfCheck.waitFor(fullInput, "document.getElementById('composer').value===text && document.getElementById('scroll').scrollTop<30",
+                                            arguments: ["text": editMessage.text])
+        try await fixture.click("#composer", web: fullInput)
+        try await fixture.key(53, "\u{1b}")
+        try await wait { store.ai.pendingEdits[editOwner] == nil && store.ai.drafts[editOwner] == priorDraft }
         precondition(store.ai.sessions[editOwner]!.messages.map(\.id) == preservedIDs)
         _ = store.ai.editMessage(editMessage.id, tab: editOwner, fork: true)
-        try await wait { fullInput.string == editMessage.text }
+        try await AIChatPageSelfCheck.waitFor(fullInput, "document.getElementById('composer').value===text", arguments: ["text": editMessage.text])
         precondition(store.ai.pendingEdits[editOwner]?.fork == true && store.ai.sessions[editOwner]!.messages.map(\.id) == preservedIDs)
-        window.makeFirstResponder(fullInput)
-        precondition(fullInput.delegate?.textView?(fullInput, doCommandBy: NSSelectorFromString("cancelOperation:")) == true)
-        try await wait { store.ai.pendingEdits[editOwner] == nil && fullInput.string == priorDraft }
+        try await fixture.click("#composer", web: fullInput)
+        try await fixture.key(53, "\u{1b}")
+        try await wait { store.ai.pendingEdits[editOwner] == nil && store.ai.drafts[editOwner] == priorDraft }
         func historyTables(in view: NSView) -> [AIHistoryTable] {
             (view as? AIHistoryTable).map { [$0] } ?? view.subviews.flatMap { historyTables(in: $0) }
         }
@@ -2500,46 +2440,36 @@ enum AISelfCheck {
             precondition(group.hitTest(point) === button)
             mouseClick(button)
         }
-        let priorFocus = (editor(in: historyRoot)?.delegate as? AIComposerInput.Coordinator)?.focusRequest
         try await clickPlus()
         try await wait { store.ai.sessions[store.chatOwner]?.messages.isEmpty == true }
         var newOwner = store.chatOwner
         precondition(newOwner != forkOwner && store.tabs.count == tabCountBeforeNew && store.selected == tabBeforeNew)
         precondition((store.ai.drafts[newOwner] ?? "").isEmpty && store.ai.pendingEdits[newOwner] == nil)
-        try await wait {
-            guard let input = editor(in: historyRoot), let coordinator = input.delegate as? AIComposerInput.Coordinator else { return false }
-            return coordinator.focusRequest != priorFocus && input.string.isEmpty
-        }
-        let draftInput = editor(in: historyRoot)!
-        window.makeFirstResponder(draftInput)
-        draftInput.insertText("加号未发送的草稿 🙂", replacementRange: NSRange(location: 0, length: draftInput.string.utf16.count))
+        try await AIChatPageSelfCheck.waitFor(fullInput, "document.activeElement.id==='composer' && document.getElementById('composer').value===''", timeout: 8)
+        try await AIChatPageSelfCheck.type("加号未发送的草稿 🙂", fixture: fixture, web: fullInput)
         try await wait { store.ai.drafts[newOwner] == "加号未发送的草稿 🙂" }
         let draftFile = AIAttachment(name: "unsent.txt", data: Data("FILE-4729".utf8), text: "FILE-4729", mime: nil)
         store.ai.draftFiles[newOwner] = [draftFile]
         var pickerConfiguration = config
         pickerConfiguration.models = ["fixture", "alternate"]
         precondition(store.ai.save(pickerConfiguration))
-        click(accessibilityElement(in: historyRoot, label: "选择模型")!)
-        func alternateButton() -> NSObject? {
-            NSApp.windows.compactMap(\.contentView).lazy.compactMap { accessibilityElement(in: $0, label: "alternate") }.first
-        }
-        try await wait { alternateButton() != nil }
-        click(alternateButton()!)
+        try await fixture.click("#model-button", web: fullInput)
+        try await AIChatPageSelfCheck.waitFor(fullInput, "document.querySelectorAll('#model-list button').length===2")
+        try await fixture.click("#model-list button:last-child", web: fullInput)
         try await wait { store.ai.model(for: newOwner) == "alternate" }
         store.openChat(owner: editOwner)
         try await wait {
             table.selectedRowIndexes.compactMap { table.conversationIDs[$0] } == [store.ai.sessions[editOwner]!.id]
         }
         try await clickPlus()
-        try await wait {
-            store.chatOwner == newOwner && editor(in: historyRoot)?.string == "加号未发送的草稿 🙂"
-        }
+        try await wait { store.chatOwner == newOwner }
+        try await AIChatPageSelfCheck.waitFor(fullInput, "document.getElementById('composer').value==='加号未发送的草稿 🙂'")
         precondition(store.ai.draftFiles[newOwner]?.first?.id == draftFile.id && store.ai.model(for: newOwner) == "alternate")
         try await clickPlus()
         precondition(store.chatOwner == newOwner && store.ai.drafts[newOwner] == "加号未发送的草稿 🙂")
         print("PASS: native plus mouse clicks return to the unsent draft with text, attachment and model selected through the picker")
         store.ai.selectModel("fixture", provider: config.id, tab: newOwner)
-        click(accessibilityElement(in: historyRoot, label: "发送")!)
+        try await fixture.click("#send", web: fullInput)
         try await wait { store.ai.sessions[newOwner]?.messages.isEmpty == false && store.ai.drafts[newOwner] == "" }
         try await wait { store.ai.sessions[newOwner]?.requestID == nil }
         precondition(store.ai.sessions[newOwner]?.error == nil && store.ai.sessions[newOwner]?.messages.last?.text.isEmpty == false)
@@ -2560,10 +2490,11 @@ enum AISelfCheck {
         store.ai.draftClosedReferences[sentOwner] = [carriedPage]
         store.ai.draftQuotes[sentOwner] = carriedQuote
         store.openChat(owner: sentOwner)
-        try await wait { editor(in: historyRoot)?.string == "新会话继续这份输入 🙂" }
+        try await AIChatPageSelfCheck.waitFor(fullInput, "document.getElementById('composer').value==='新会话继续这份输入 🙂'")
         try await clickPlus()
         let carriedOwner = store.chatOwner
-        try await wait { carriedOwner != sentOwner && editor(in: historyRoot)?.string == "新会话继续这份输入 🙂" }
+        precondition(carriedOwner != sentOwner)
+        try await AIChatPageSelfCheck.waitFor(fullInput, "document.getElementById('composer').value==='新会话继续这份输入 🙂'")
         precondition(store.ai.sessions[carriedOwner]?.messages.isEmpty == true &&
                      store.ai.sessions[carriedOwner]?.requestID == nil &&
                      store.ai.draftFiles[carriedOwner]?.first?.id == draftFile.id &&
@@ -2597,7 +2528,7 @@ enum AISelfCheck {
         precondition(archiveHit === archiveButton)
         hoverCell.archiveButton!.performClick(nil)
         try await wait { store.ai.conversations[hoveredID]?.isArchived == true }
-        precondition(store.selected == tabBeforeNew && store.chatOwner == newOwner, "Hover archive must not activate a conversation")
+        precondition(store.selected == tabBeforeNew && store.chatOwner == carriedOwner, "Hover archive must not activate a conversation")
         store.ai.restoreConversations([hoveredID])
         store.openChat(owner: editOwner)
         store.chatHistoryVisible = false
@@ -2614,37 +2545,7 @@ enum AISelfCheck {
         precondition(store.restoreReference(AIPageReference(title: "invalid", url: URL(string: "file:///tmp"))) == nil)
         precondition(forkOwner != editOwner)
         print("PASS: rewind/Fork preview and native Esc, Ctrl/Shift selection, same-tab new conversation, contained plus, hover archive and reference recovery")
-        func scrollableText() -> (AIMarkdownWebView, NSPoint)? {
-            for answer in markdownViews(in: historyRoot) where answer.bounds.height > 300 {
-                let viewport = answer.bounds.intersection(answer.visibleRect)
-                guard viewport.width > 20, viewport.height > 20 else { continue }
-                for fraction in [0.1, 0.5, 0.9] {
-                    let point = NSPoint(x: viewport.midX, y: viewport.minY + viewport.height * fraction)
-                    let pagePoint = NSPoint(x: point.x, y: answer.isFlipped ? point.y : answer.bounds.height - point.y)
-                    guard !answer.diagramRects.contains(where: { $0.contains(pagePoint) }) else { continue }
-                    let windowPoint = answer.convert(point, to: nil)
-                    let hit = historyRoot.hitTest(historyRoot.superview?.convert(windowPoint, from: nil) ?? windowPoint)
-                    if hit === answer || hit?.isDescendant(of: answer) == true { return (answer, point) }
-                }
-            }
-            return nil
-        }
-        try await wait { scrollableText() != nil }
-        let (answer, textPoint) = scrollableText()!
-        var ancestor = answer.superview
-        while ancestor != nil && !(ancestor is NSScrollView) { ancestor = ancestor?.superview }
-        let conversationScroll = ancestor as! NSScrollView
-        let offset = conversationScroll.contentView.bounds.origin.y
-        let scrollEvent = NSEvent(cgEvent: CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1,
-            wheel1: offset > 50 ? 90 : -90, wheel2: 0, wheel3: 0)!)!
-        guard answer.forwardVerticalScroll(scrollEvent, at: textPoint) else {
-            throw PerchError("Full Chat must forward wheels over visible answer text")
-        }
-        try await Task.sleep(nanoseconds: 150_000_000)
-        guard abs(conversationScroll.contentView.bounds.origin.y - offset) > 10 else {
-            throw PerchError("Full Chat wheel did not move its conversation: before=\(offset), after=\(conversationScroll.contentView.bounds.origin.y)")
-        }
-        print("PASS: real full Chat hierarchy scrolls over rendered answer text")
+        // Long-answer native wheel coverage runs in readingUI below against this same page.
         var queueConfig = config
         queueConfig.baseURL = config.baseURL.replacingOccurrences(of: "/v1", with: "/slow")
         precondition(store.ai.save(queueConfig, key: "synthetic-key"))
@@ -2655,17 +2556,10 @@ enum AISelfCheck {
         store.ai.drafts[queueOwner] = ""
         precondition(store.ai.send("native queue start fixture", tab: queueOwner, browser: nil, usePage: false))
         try await wait { store.ai.sessions[queueOwner]?.messages.last?.text.isEmpty == false }
-        try await wait { fullInput.isEditable }
-        fullInput.string = "queued fixture native"
-        let returnEvent = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
-            timestamp: 0, windowNumber: window.windowNumber, context: nil,
-            characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36)!
-        precondition(fullInput.returnKey?(returnEvent) == true)
-        fullInput.didChangeText()
-        guard store.ai.queuedMessages[queueOwner]?.count == 1 && store.ai.drafts[queueOwner]?.isEmpty == true &&
-              fullInput.string.isEmpty else {
-            throw PerchError("Native Return did not queue and clear the busy composer")
-        }
+        try await AIChatPageSelfCheck.type("queued fixture native", fixture: fixture, web: fullInput)
+        try await fixture.key(36, "\r")
+        try await wait { store.ai.queuedMessages[queueOwner]?.count == 1 && store.ai.drafts[queueOwner]?.isEmpty == true }
+        try await AIChatPageSelfCheck.waitFor(fullInput, "document.getElementById('composer').value==='' && !document.getElementById('queue').hidden")
         if let directory = ProcessInfo.processInfo.environment["PERCH_LAYOUT_EVIDENCE"] {
             try await Task.sleep(nanoseconds: 100_000_000)
             let root = window.contentView!
@@ -2675,9 +2569,10 @@ enum AISelfCheck {
                 try bitmap.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: directory).appendingPathComponent("queue.png"))
             }
         }
-        store.ai.stop(queueOwner)
-        precondition(store.ai.pausedQueues.contains(queueOwner))
-        store.ai.removeQueuedMessage(store.ai.queuedMessages[queueOwner]!.first!.id, tab: queueOwner)
+        try await fixture.click("#stop", web: fullInput)
+        try await wait { store.ai.pausedQueues.contains(queueOwner) }
+        try await fixture.click("#queue-list [aria-label='移除待发送消息']", web: fullInput)
+        try await wait { store.ai.queuedMessages[queueOwner]?.isEmpty != false }
         print("PASS: busy native composer remains editable; Return queues the message and clears the draft")
         try await readingUI(config: config)
         if let directory = ProcessInfo.processInfo.environment["PERCH_LAYOUT_EVIDENCE"] {
@@ -2714,137 +2609,82 @@ enum AISelfCheck {
         precondition(ai.save(config, key: "synthetic-key"))
         let store = Store(defaults: defaults)
         store.openChat(owner: AIController.homeID)
-        let window = NSWindow(contentRect: NSRect(x: 160, y: 150, width: 850, height: 600),
+        let window = Panel(contentRect: NSRect(x: 160, y: 150, width: 850, height: 600),
                               styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
         window.contentView = NSHostingView(rootView: AIChatSidebar(store: store, ai: ai, fullPage: true, close: {}))
         window.makeKeyAndOrderFront(nil)
         defer { window.orderOut(nil); window.contentView = nil }
-        func answers(in view: NSView) -> [AIMarkdownWebView] {
-            (view as? AIMarkdownWebView).map { [$0] } ?? view.subviews.flatMap { answers(in: $0) }
+        var web = try await AIChatPageSelfCheck.ready(window)
+        let fixture = HomePageFixture(store: store, panel: window)
+        try await AIChatPageSelfCheck.waitFor(web, "document.querySelectorAll('.message').length===16 && document.getElementById('scroll').scrollTop>1000")
+        _ = try await web.evaluateJavaScript("""
+            const scroller=document.getElementById('scroll'),last=document.querySelector('.message:last-of-type');
+            scroller.scrollTop+=last.getBoundingClientRect().top-scroller.getBoundingClientRect().top+170;
+            """)
+        try await wait {
+            let position = ai.readingPosition(for: record.id)
+            return position?.messageID == record.messages.last!.id && abs((position?.offset ?? 0) - 170) < 2
         }
-        func lastAnswer() -> AIMarkdownWebView? {
-            answers(in: window.contentView!).first {
-                ($0.navigationDelegate as? AIMarkdownView.Coordinator)?.text.hasPrefix("## Answer 7") == true
-            }
-        }
-        func outer(_ answer: NSView) -> NSScrollView {
-            var view = answer.superview
-            while !(view is NSScrollView) { view = view?.superview }
-            return view as! NSScrollView
-        }
-        do {
-            try await wait(timeout: 15) {
-                window.contentView!.layoutSubtreeIfNeeded()
-                return lastAnswer().map { $0.bounds.height > 1800 && $0.visibleRect.height > 100 } == true
-            }
-        } catch { throw PerchError("Reading initial layout: heights=\(answers(in: window.contentView!).map { $0.bounds.height }), ready=\(ai.ready(for: AIController.homeID)), owner=\(store.chatOwner)") }
-        var initialLayout: [CGFloat] = []
-        var stableSince = Date()
-        try await wait(timeout: 15) {
-            window.contentView!.layoutSubtreeIfNeeded()
-            guard let answer = lastAnswer() else { return false }
-            let scroll = outer(answer)
-            let layout = [answer.bounds.height, answer.convert(answer.bounds, to: scroll.documentView).minY,
-                          scroll.contentView.bounds.minY, scroll.documentView!.bounds.height]
-            if layout != initialLayout { initialLayout = layout; stableSince = Date() }
-            return Date().timeIntervalSince(stableSince) > 0.3
-        }
-        let last = lastAnswer()!
-        let scroll = outer(last)
-        let top = last.convert(last.bounds, to: scroll.documentView).minY
-        let distance = Int32((scroll.contentView.bounds.minY - top - 170).rounded())
-        let wheel = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1, wheel1: distance, wheel2: 0, wheel3: 0)!
-        wheel.setIntegerValueField(.scrollWheelEventScrollPhase, value: Int64(NSEvent.Phase.began.rawValue))
-        last.scrollWheel(with: NSEvent(cgEvent: wheel)!)
-        try await Task.sleep(nanoseconds: 400_000_000)
-        do {
-            try await wait {
-                guard let value = ai.readingPosition(for: record.id) else { return false }
-                return value.messageID == record.messages.last!.id && value.offset >= 170 && value.offset < 300
-            }
-        } catch { throw PerchError("Reading capture: saved=\(String(describing: ai.readingPosition(for: record.id))), y=\(scroll.contentView.bounds.minY), answer top=\(last.convert(last.bounds, to: scroll.documentView).minY)") }
         let bookmark = ai.readingPosition(for: record.id)!
-        guard let currentAnswer = lastAnswer() else { throw PerchError("Reading capture lost its rendered answer") }
-        let visibleOffset = currentAnswer.convert(currentAnswer.bounds, to: scroll.documentView).minY - scroll.contentView.bounds.minY
-        guard abs(visibleOffset + 170) < 2 else {
-            throw PerchError("Reading capture viewport moved: offset=\(visibleOffset), bookmark=\(bookmark), initial renderer attached=\(last.window != nil)")
-        }
-        precondition(scroll.documentView!.bounds.height - scroll.contentSize.height - scroll.contentView.bounds.minY > 500)
+        let restored = """
+            Math.abs(document.querySelector('.message:last-of-type').getBoundingClientRect().top-
+                document.getElementById('scroll').getBoundingClientRect().top+170)<2
+            """
         ai.saveConversations()
         let reloaded = AIController(defaults: defaults, conversationDirectory: directory)
         precondition(reloaded.readingPosition(for: record.id) == bookmark)
         precondition(reloaded.save(config, key: "synthetic-key"))
         window.contentView = NSHostingView(rootView: AIChatSidebar(store: store, ai: reloaded, fullPage: true, close: {}))
-        func restored() -> Bool {
-            window.contentView!.layoutSubtreeIfNeeded()
-            guard let answer = lastAnswer(), answer.bounds.height > 1800 else { return false }
-            let scroll = outer(answer)
-            return abs(answer.convert(answer.bounds, to: scroll.documentView).minY - scroll.contentView.bounds.minY - visibleOffset) < 2
-        }
-        do { try await wait(timeout: 20, restored) }
-        catch {
-            let current = lastAnswer().map { answer -> String in
-                let scroll = outer(answer)
-                return "height=\(answer.bounds.height), top=\(answer.convert(answer.bounds, to: scroll.documentView).minY), y=\(scroll.contentView.bounds.minY), doc=\(scroll.documentView!.bounds.height)"
-            } ?? "target not mounted"
-            throw PerchError("Reading restart restore: \(current), saved=\(String(describing: reloaded.readingPosition(for: record.id)))")
-        }
+        web = try await AIChatPageSelfCheck.ready(window)
+        try await AIChatPageSelfCheck.waitFor(web, restored)
         try await Task.sleep(nanoseconds: 400_000_000)
-        precondition(restored(), "Delayed Markdown layout must retain the saved viewport")
+        try await AIChatPageSelfCheck.check(web, restored, "延迟 Markdown 排版丢失阅读位置")
         let otherOwner = reloaded.resumeConversation(other.id, tab: AIController.homeID)
         window.contentView = NSHostingView(rootView: AIChatSidebar(store: store, ai: reloaded, fullPage: true, owner: otherOwner, close: {}).defaultAppStorage(defaults))
-        try await wait { answers(in: window.contentView!).isEmpty }
+        web = try await AIChatPageSelfCheck.ready(window)
+        try await AIChatPageSelfCheck.waitFor(web, "document.querySelectorAll('.message').length===1")
         let recordOwner = reloaded.resumeConversation(record.id, tab: AIController.homeID)
         window.contentView = NSHostingView(rootView: AIChatSidebar(store: store, ai: reloaded, fullPage: true, owner: recordOwner, close: {}).defaultAppStorage(defaults))
-        try await wait(timeout: 20, restored)
-        // Match the previous 350pt chat viewport after collapsing the 240pt history sidebar.
+        web = try await AIChatPageSelfCheck.ready(window)
+        try await AIChatPageSelfCheck.waitFor(web, restored)
         store.chatHistoryVisible = false
         window.setContentSize(NSSize(width: 390, height: 600))
-        try await wait(timeout: 20) {
-            lastAnswer().map { $0.bounds.width < 330 && $0.bounds.height > 3000 } == true
-        }
         try await Task.sleep(nanoseconds: 400_000_000)
-        try await wait(timeout: 20, restored)
-        let conversationScroll = outer(lastAnswer()!)
+        try await AIChatPageSelfCheck.waitFor(web, restored)
+        func scrollTop() async throws -> Double {
+            try await web.evaluateJavaScript("document.getElementById('scroll').scrollTop") as! Double
+        }
         func wheelScroll(_ delta: Int32) async throws {
-            let event = NSEvent(cgEvent: CGEvent(scrollWheelEvent2Source: nil, units: .pixel,
-                wheelCount: 1, wheel1: delta, wheel2: 0, wheel3: 0)!)!
-            if let answer = answers(in: window.contentView!).first(where: { $0.bounds.intersection($0.visibleRect).height > 100 }) {
-                answer.scrollWheel(with: event)
-            } else { conversationScroll.scrollWheel(with: event) }
-            try await Task.sleep(nanoseconds: 40_000_000)
-            try await wait(timeout: 3) {
-                window.contentView!.layoutSubtreeIfNeeded()
-                return answers(in: window.contentView!).contains { $0.bounds.intersection($0.visibleRect).height > 100 }
-            }
+            let point = try await fixture.point("#scroll", web: web)
+            // Deliver only inside the isolated window; never post to the system event queue.
+            try await AIChatPageSelfCheck.wheel(delta, at: point, web: web, window: window)
+            try await AIChatPageSelfCheck.check(web,
+                "!!document.elementFromPoint(innerWidth/2,document.getElementById('scroll').clientHeight/2)?.closest('.message')",
+                "连续滚动出现空白消息区")
         }
-        let beforeWheel = conversationScroll.contentView.bounds.minY
+        let beforeWheel = try await scrollTop()
         try await wheelScroll(120)
-        guard conversationScroll.contentView.bounds.minY < beforeWheel - 60 else {
-            throw PerchError("Phase-less wheel was overridden: \(beforeWheel) → \(conversationScroll.contentView.bounds.minY)")
+        guard try await scrollTop() < beforeWheel - 60 else {
+            throw PerchError("Phase-less wheel was overridden")
         }
-        for _ in 0..<60 { try await wheelScroll(700) }
-        precondition(conversationScroll.contentView.bounds.minY < 2, "Continuous upward scrolling must reach the first message")
-        for _ in 0..<60 { try await wheelScroll(-700) }
-        let bottomGap = conversationScroll.documentView!.bounds.height -
-            conversationScroll.contentSize.height - conversationScroll.contentView.bounds.minY
-        precondition(abs(bottomGap) < 4, "Continuous downward scrolling must reach the last message")
+        for _ in 0..<100 { try await wheelScroll(700) }
+        try await AIChatPageSelfCheck.check(web, "document.getElementById('scroll').scrollTop<2", "连续向上滚动未到达首条消息")
+        for _ in 0..<100 { try await wheelScroll(-700) }
+        try await AIChatPageSelfCheck.check(web,
+            "Math.abs(document.getElementById('scroll').scrollHeight-document.getElementById('scroll').clientHeight-document.getElementById('scroll').scrollTop)<4",
+            "连续向下滚动未到达末尾")
         print("PASS: phase-less mouse wheels and continuous scrolling across every long answer without a blank viewport"); fflush(stdout)
         try await wheelScroll(700)
         try await Task.sleep(nanoseconds: 400_000_000)
-        let growing = lastAnswer()!
-        let originalHeight = growing.bounds.height
-        let originalOffset = growing.convert(growing.bounds, to: conversationScroll.documentView).minY -
-            conversationScroll.contentView.bounds.minY
-        let originalText = (growing.navigationDelegate as! AIMarkdownView.Coordinator).text
-        AIMarkdownView.render(originalText + "\n\n" + String(repeating: "A newly streamed long paragraph with more content.\n\n", count: 100), web: growing)
-        try await wait { growing.bounds.height > originalHeight + 1500 }
+        let originalOffset = try await scrollTop()
+        _ = try await web.evaluateJavaScript("""
+            const last=document.querySelector('.message:last-of-type .markdown');
+            for(let i=0;i<100;i++){const p=document.createElement('p');p.textContent='A newly streamed long paragraph with more content.';last.append(p);}
+            """)
         try await Task.sleep(nanoseconds: 400_000_000)
-        let grownOffset = growing.convert(growing.bounds, to: conversationScroll.documentView).minY -
-            conversationScroll.contentView.bounds.minY
-        precondition(abs(grownOffset - originalOffset) < 2, "A new long block must not move a reader who left the bottom")
-        precondition(answers(in: window.contentView!).count <= 3, "Offscreen answers must release their WebKit renderers")
-        print("PASS: new long Markdown block retains the reader's position; offscreen renderers are released"); fflush(stdout)
+        guard abs(try await scrollTop() - originalOffset) < 2 else { throw PerchError("Content growth moved a reader away from the bottom") }
+        print("PASS: one shared WebKit renderer and growing long content retain the reader's position"); fflush(stdout)
         let saved = reloaded.readingPosition(for: record.id)!
         reloaded.saveConversations()
         let fork = reloaded.forkConversation(record.id)!
