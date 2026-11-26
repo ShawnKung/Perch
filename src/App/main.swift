@@ -3135,6 +3135,16 @@ if CommandLine.arguments.contains("--update-self-test") {
         catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
     }
     app.run()
+} else if CommandLine.arguments.contains("--ai-history-self-test") {
+    NSApplication.shared.setActivationPolicy(.regular)
+    Task { @MainActor in
+        setbuf(stdout, nil)
+        do {
+            try await AISelfCheck.historyDisclosureUI()
+            exit(0)
+        } catch { print("FAIL: \(error)"); exit(1) }
+    }
+    NSApplication.shared.run()
 } else if CommandLine.arguments.contains("--ai-typography-self-test") {
     let app = NSApplication.shared
     app.setActivationPolicy(.regular)

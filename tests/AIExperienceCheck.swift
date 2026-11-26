@@ -21,6 +21,223 @@ private struct AIHistoryManagementProbe: View {
 }
 
 extension AISelfCheck {
+    static func historyDisclosureUI() async throws {
+        for webCount in [1, 3, 20] {
+            let sessions = (0..<(8 + webCount)).map { index -> AISession in
+                var session = AISession(id: UUID())
+                session.summaryTitle = "合成网页会话 \(index)"
+                session.origin = index < 8 ? .chat : .web
+                return session
+            }
+            let host = NSHostingView(rootView: AIHistoryList(conversations: sessions, active: sessions[8].id,
+                open: { _ in }, delete: { _ in }, fork: { _ in }))
+            let window = NSWindow(contentRect: NSRect(x: 120, y: 160, width: 280, height: 500),
+                                  styleMask: [.titled], backing: .buffered, defer: false)
+            window.contentView = host; window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            defer { window.orderOut(nil); window.contentView = nil }
+            func find(_ view: NSView) -> AIHistoryTable? {
+                (view as? AIHistoryTable) ?? view.subviews.lazy.compactMap(find).first
+            }
+            try await wait { NSApp.isActive && window.isKeyWindow && find(host)?.conversationIDs.contains(sessions[8].id) == true }
+            let table = find(host)!
+            func pressHeader(_ title: String = "网页对话", fraction: CGFloat = 0.5) throws {
+                let header = (0..<table.numberOfRows).first {
+                    (table.view(atColumn: 0, row: $0, makeIfNecessary: true) as? AIHistoryCell)?.textField?.stringValue == title
+                }!
+                if !table.visibleRect.contains(table.rect(ofRow: header)) { table.scrollRowToVisible(header) }
+                table.layoutSubtreeIfNeeded()
+                let headerView = table.rowView(atRow: header, makeIfNecessary: true)!
+                // Floating headers can be displayed below their logical row position.
+                var rect = headerView.convert(headerView.bounds, to: table)
+                if !table.visibleRect.contains(NSPoint(x: rect.midX, y: rect.midY)), let scroll = table.enclosingScrollView {
+                    var bounds = scroll.contentView.bounds
+                    bounds.origin.y = table.rect(ofRow: header).minY
+                    scroll.contentView.scroll(to: scroll.contentView.constrainBoundsRect(bounds).origin)
+                    scroll.reflectScrolledClipView(scroll.contentView)
+                    table.layoutSubtreeIfNeeded()
+                    rect = headerView.convert(headerView.bounds, to: table)
+                }
+                let point = NSPoint(x: rect.minX + rect.width * fraction, y: rect.midY)
+                guard table.visibleRect.contains(point),
+                      table.hitTest(point)?.isDescendant(of: table) == true, table.row(at: point) == header else {
+                    throw PerchError("History disclosure missed the native table")
+                }
+                let location = table.convert(point, to: nil)
+                guard let content = window.contentView,
+                      content.hitTest(content.convert(location, from: nil))?.isDescendant(of: table) == true else {
+                    throw PerchError("History disclosure was blocked in the native window event path")
+                }
+                for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                    NSApp.sendEvent(NSEvent.mouseEvent(with: type, location: location,
+                        modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                        context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!)
+                }
+            }
+            func animatedLayers(_ layer: CALayer?) -> [CALayer] {
+                guard let layer else { return [] }
+                return ((layer.animationKeys()?.isEmpty == false) ? [layer] : []) +
+                    (layer.sublayers ?? []).flatMap { animatedLayers($0) }
+            }
+            func conversationViews() -> [NSTableRowView] {
+                table.conversationIDs.indices.filter { table.conversationIDs[$0] != nil }
+                    .compactMap { table.rowView(atRow: $0, makeIfNecessary: false) }
+            }
+            func capturePixels(_ name: String) throws -> NSBitmapImageRep? {
+                guard let path = ProcessInfo.processInfo.environment["PERCH_LAYOUT_EVIDENCE"] else { return nil }
+                let directory = URL(fileURLWithPath: path)
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                let file = directory.appendingPathComponent("history-\(name).png")
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+                process.arguments = ["-x", "-o", "-l", String(window.windowNumber), file.path]
+                try process.run(); process.waitUntilExit()
+                guard process.terminationStatus == 0,
+                      let bitmap = NSBitmapImageRep(data: try Data(contentsOf: file)) else {
+                    throw PerchError("History window pixel capture failed")
+                }
+                return bitmap
+            }
+            func pixelDistance(_ first: NSBitmapImageRep, _ second: NSBitmapImageRep, fromY: Int) -> Double {
+                var difference = 0.0
+                for y in stride(from: fromY, to: first.pixelsHigh, by: 2) {
+                    for x in stride(from: 0, to: first.pixelsWide, by: 2) {
+                        guard let a = first.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB),
+                              let b = second.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else { continue }
+                        difference += abs(a.redComponent - b.redComponent) +
+                            abs(a.greenComponent - b.greenComponent) + abs(a.blueComponent - b.blueComponent)
+                    }
+                }
+                return difference
+            }
+            func darkestPixel(_ bitmap: NSBitmapImageRep, fromY: Int) -> Double {
+                var darkest = 1.0
+                for y in stride(from: fromY, to: bitmap.pixelsHigh, by: 2) {
+                    for x in stride(from: 0, to: bitmap.pixelsWide, by: 2) {
+                        guard let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else { continue }
+                        darkest = min(darkest, (color.redComponent + color.greenComponent + color.blueComponent) / 3)
+                    }
+                }
+                return darkest
+            }
+            let coordinator = table.delegate as! AIHistoryList.Coordinator
+            func refresh(_ conversations: [AISession]) {
+                coordinator.parent = AIHistoryList(conversations: conversations, active: sessions[8].id,
+                    open: { _ in }, delete: { _ in }, fork: { _ in })
+                coordinator.refresh()
+            }
+            try await Task.sleep(nanoseconds: 200_000_000)
+            try pressHeader("Chat")
+            try await Task.sleep(nanoseconds: 300_000_000)
+            guard !table.conversationIDs.contains(sessions[0].id) else { throw PerchError("Chat header did not collapse") }
+            for (cycle, closing) in [true, false, true, false].enumerated() {
+                let oldRows = conversationViews()
+                let checkPixels = webCount == 3 && cycle == 0
+                let beforePixels = checkPixels ? try capturePixels("expanded-before-collapse") : nil
+                let header = table.conversationIDs.firstIndex(of: sessions[8].id).map { $0 - 1 }
+                let contentTop = header.map { table.convert(NSPoint(x: 0, y: table.rect(ofRow: $0).maxY), to: nil).y } ?? 0
+                try pressHeader(fraction: closing ? 0.9 : 0.05)
+                try await Task.sleep(nanoseconds: 20_000_000)
+                var refreshed = coordinator.parent.conversations
+                refreshed[8].summaryTitle = "动画期间刷新 \(cycle)"
+                refresh(refreshed)
+                try await Task.sleep(nanoseconds: 25_000_000)
+                let layers = animatedLayers(table.layer)
+                let visibleRows = closing ? oldRows : conversationViews()
+                let webIDs = Set(sessions.dropFirst(8).map(\.id))
+                let groupHeight = table.conversationIDs.indices.filter { table.conversationIDs[$0].map { webIDs.contains($0) } == true }
+                    .reduce(CGFloat(0)) { $0 + table.rect(ofRow: $1).height }
+                let fullHeight = CGFloat(webCount) * (40 * PerchTheme.shared.chatScale + 2)
+                let intermediate = groupHeight > 0.01 && groupHeight < fullHeight - 0.01 &&
+                    visibleRows.contains { $0.window === window } &&
+                    visibleRows.allSatisfy { $0.alphaValue == 1 && $0.layer?.opacity == 1 }
+                let disclosure = layers.contains {
+                    guard let shown = $0.presentation(), $0.animation(forKey: "disclosure") != nil else { return false }
+                    return !CATransform3DEqualToTransform(shown.transform, $0.transform)
+                }
+                print("History disclosure count=\(webCount), closing=\(closing), visibleRows=\(intermediate), arrow=\(disclosure)")
+                if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                    guard intermediate && disclosure else { throw PerchError("History disclosure has no visible row/arrow intermediate frame") }
+                }
+                let middlePixels = checkPixels ? try capturePixels("collapse-intermediate") : nil
+                try await Task.sleep(nanoseconds: 250_000_000)
+                let afterPixels = checkPixels ? try capturePixels("collapsed-after-animation") : nil
+                if let beforePixels, let middlePixels, let afterPixels,
+                   !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                    let scale = CGFloat(beforePixels.pixelsWide) / window.frame.width
+                    let top = max(0, Int((window.frame.height - contentTop) * scale))
+                    let fullDifference = pixelDistance(beforePixels, afterPixels, fromY: top)
+                    let remaining = pixelDistance(middlePixels, afterPixels, fromY: top)
+                    let ratio = remaining / max(1, fullDifference)
+                    print("History collapse screen pixels: remaining=\(ratio)")
+                    let beforeInk = darkestPixel(beforePixels, fromY: top)
+                    let middleInk = darkestPixel(middlePixels, fromY: top)
+                    guard fullDifference > 100, ratio > 0.01, ratio < 1.1,
+                          abs(beforeInk - middleInk) < 0.05 else {
+                        throw PerchError("History collapse removed all visible content before the transition finished")
+                    }
+                }
+                guard table.conversationIDs.contains(sessions[8].id) != closing else {
+                    throw PerchError("History disclosure lost its final row state")
+                }
+                if !closing, let row = table.conversationIDs.firstIndex(of: sessions[8].id) {
+                    guard (table.view(atColumn: 0, row: row, makeIfNecessary: true) as? AIHistoryCell)?
+                        .textField?.stringValue == refreshed[8].summaryTitle else {
+                        throw PerchError("History disclosure dropped a pending content refresh")
+                    }
+                }
+            }
+            try pressHeader("Chat")
+            try await Task.sleep(nanoseconds: 300_000_000)
+            let originalIDs = table.conversationIDs
+            let selectedIDs = Set(sessions.prefix(2).map(\.id))
+            table.selectRowIndexes(IndexSet(originalIDs.indices.filter { originalIDs[$0].map { selectedIDs.contains($0) } == true }),
+                                   byExtendingSelection: false)
+            try pressHeader(fraction: 0.9)
+            try await Task.sleep(nanoseconds: 20_000_000)
+            var refreshed = coordinator.parent.conversations
+            refreshed[0].summaryTitle = "反向切换期间刷新的 Chat 标题"
+            var added = AISession(id: UUID())
+            added.origin = .chat; added.summaryTitle = "反向切换期间新增的 Chat 会话"
+            refreshed.append(added)
+            var expectedIDs = originalIDs
+            expectedIDs.insert(added.id, at: originalIDs.firstIndex(of: sessions[8].id)! - 1)
+            refresh(refreshed)
+            try pressHeader(fraction: 0.05)
+            guard table.conversationIDs == originalIDs else {
+                throw PerchError("History reversal mixed pending structural changes into the row animation")
+            }
+            try await Task.sleep(nanoseconds: 350_000_000)
+            let row = table.conversationIDs.firstIndex(of: sessions[0].id)!
+            guard table.conversationIDs == expectedIDs,
+                  Set(table.selectedRowIndexes.compactMap { table.conversationIDs[$0] }) == selectedIDs,
+                  (table.view(atColumn: 0, row: row, makeIfNecessary: true) as? AIHistoryCell)?
+                    .textField?.stringValue == refreshed[0].summaryTitle else {
+                throw PerchError("History rapid reversal lost rows, selection or another group's pending update")
+            }
+            print("PASS: history count=\(webCount) rapid reversal preserves rows, multiselection and pending content")
+            if webCount == 3 {
+                try pressHeader()
+                try await Task.sleep(nanoseconds: 120_000_000)
+                try pressHeader("Chat")
+                try await Task.sleep(nanoseconds: 130_000_000)
+                try pressHeader("Chat")
+                guard table.numberOfRows == table.conversationIDs.count,
+                      table.conversationIDs == expectedIDs else {
+                    throw PerchError("Overlapping history transitions removed rows before all animations finished")
+                }
+                try await Task.sleep(nanoseconds: 350_000_000)
+                let webIDs = Set(sessions.dropFirst(8).map(\.id))
+                guard table.numberOfRows == table.conversationIDs.count,
+                      table.conversationIDs == expectedIDs.filter({ $0.map { !webIDs.contains($0) } ?? true }) else {
+                    throw PerchError("Overlapping history transitions lost their final group state")
+                }
+                print("PASS: overlapping history transitions preserve table/model consistency")
+            }
+        }
+        print("PASS: native history disclosure event path, visible collapse/expand frames, full-row clicks and content refreshes")
+    }
+
     static func quoteRequests(baseURL: String) async throws {
         let suite = "dev.perch.quote.\(UUID())"
         let defaults = UserDefaults(suiteName: suite)!
@@ -165,7 +382,7 @@ extension AISelfCheck {
         try await wait { labels().first == "置顶会话" && labels().firstIndex(of: "网页会话")! < labels().firstIndex(of: "Chat")! }
         precondition(ai.sessions[webOwner]?.origin == .web)
         table.choose(0, modifiers: [])
-        precondition(!table.conversationIDs.contains(id) && !table.conversationIDs.contains(web))
+        try await wait { !table.conversationIDs.contains(id) && !table.conversationIDs.contains(web) }
         table.choose(0, modifiers: [])
         try await wait { table.conversationIDs.contains(id) && table.conversationIDs.contains(web) }
         try action("取消置顶", id: web)

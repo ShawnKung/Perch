@@ -38,6 +38,7 @@ test: verify
 	@"$(BIN)" --home-page-state-self-test
 
 check: test
+	@"$(BIN)" --ai-history-self-test
 	@"$(BIN)" --ai-typography-self-test
 	@python3 tests/ai-self-check.py "$(BIN)" --background-only
 	@python3 tests/ai-self-check.py "$(BIN)"
@@ -56,6 +57,7 @@ test-web: verify
 	@"$(BIN)" --scroll-self-test
 
 test-ai: verify
+	@"$(BIN)" --ai-history-self-test
 	@"$(BIN)" --ai-typography-self-test
 	@python3 tests/ai-self-check.py "$(BIN)" --background-only
 	@python3 tests/ai-self-check.py "$(BIN)"

@@ -285,9 +285,10 @@ final class TabWipeAnimation: NSAnimation {
     private let from: CGFloat
     private let to: CGFloat
     private let changed: @MainActor (CGFloat, Bool) -> Void
-    @MainActor init(from: CGFloat, to: CGFloat, changed: @escaping @MainActor (CGFloat, Bool) -> Void) {
+    @MainActor init(from: CGFloat, to: CGFloat, duration: TimeInterval? = nil,
+                    changed: @escaping @MainActor (CGFloat, Bool) -> Void) {
         self.from = from; self.to = to; self.changed = changed
-        super.init(duration: TabListContainer.groupAnimationDuration, animationCurve: .easeInOut)
+        super.init(duration: duration ?? TabListContainer.groupAnimationDuration, animationCurve: .easeInOut)
         animationBlockingMode = .nonblocking
         frameRate = Float(NSScreen.main?.maximumFramesPerSecond ?? 60)
     }

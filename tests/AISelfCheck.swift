@@ -2363,13 +2363,12 @@ enum AISelfCheck {
         let table = historyTables(in: historyRoot).first!
         table.scrollRowToVisible(0)
         let originalHistoryIDs = table.conversationIDs
-        let webGroupRow = originalHistoryIDs.dropFirst().firstIndex(of: nil)!
         let chatGroupCell = table.view(atColumn: 0, row: 0, makeIfNecessary: true) as! AIHistoryCell
         guard chatGroupCell.disclosure?.shape.path != nil else { throw PerchError("History group chevron missing") }
         table.choose(0, modifiers: [])
-        guard table.conversationIDs == [nil] + Array(originalHistoryIDs[webGroupRow...]),
+        guard table.conversationIDs == originalHistoryIDs,
               table.numberOfRows == table.conversationIDs.count else {
-            throw PerchError("History collapse rows: \(originalHistoryIDs) → \(table.conversationIDs), count=\(table.numberOfRows)")
+            throw PerchError("History collapse must retain its rows until the height transition finishes")
         }
         guard table.view(atColumn: 0, row: 0, makeIfNecessary: true) === chatGroupCell else {
             throw PerchError("History collapse replaced its header")
