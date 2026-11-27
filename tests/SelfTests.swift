@@ -781,9 +781,9 @@ enum SelfTests {
         table.reloadData()
         var closed: [UUID] = []
         table.closeTab = { closed.append($0) }
-        func event(_ row: Int, _ type: NSEvent.EventType) -> NSEvent {
+        func event(_ row: Int, _ type: NSEvent.EventType, yOffset: CGFloat = 0) -> NSEvent {
             let rect = table.rect(ofRow: row)
-            let point = table.convert(NSPoint(x: rect.midX, y: rect.midY), to: nil)
+            let point = table.convert(NSPoint(x: rect.midX, y: rect.midY + yOffset), to: nil)
             let event = NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
                                           timestamp: 0, windowNumber: 0, context: nil,
                                           eventNumber: 0, clickCount: 1, pressure: 0)!
@@ -794,6 +794,9 @@ enum SelfTests {
         table.otherMouseDown(with: event(1, .otherMouseDown))
         table.otherMouseUp(with: event(2, .otherMouseUp))
         precondition(closed.isEmpty, "Pointer drift must not close the release row")
+        table.otherMouseDown(with: event(0, .otherMouseDown, yOffset: 17))
+        table.otherMouseUp(with: event(1, .otherMouseUp, yOffset: -17))
+        precondition(closed.isEmpty, "Even a two-point movement across the row boundary must cancel the click")
         table.otherMouseDown(with: event(1, .otherMouseDown))
         table.ids.swapAt(0, 1)
         table.reloadData()
@@ -1347,6 +1350,9 @@ final class LayoutSelfCheck {
                 }
                 if CommandLine.arguments.contains("--verify-tab-performance") {
                     await verifyTabPerformance()
+                }
+                if CommandLine.arguments.contains("--verify-internal-tab-performance") {
+                    await verifyInternalTabPerformance()
                 }
                 if CommandLine.arguments.contains("--verify-tab-burst") {
                     await verifyTabBurst()
@@ -4339,6 +4345,69 @@ final class LayoutSelfCheck {
         }
         store.tabs = savedTabs; store.tabGroups = savedGroups; store.selected = savedSelection
         await settle()
+    }
+    private func verifyInternalTabPerformance() async {
+        store.tabs = (0..<12).map { Tab(title: "性能 \($0)", address: "") }
+        store.tabGroups = []
+        store.sites = (0..<120).map { Site(title: "书签 \($0)", address: "https://site-\($0).fixture.invalid/") }
+        let icon = NSImage(size: NSSize(width: 32, height: 32), flipped: false) { rect in
+            NSColor.systemGreen.setFill(); NSBezierPath(ovalIn: rect).fill(); return true
+        }
+        for site in store.sites { FaviconCache.save(icon, for: site.address, defaults: defaults) }
+        store.history = (0..<1000).map {
+            Visit(title: "记录 \($0)", address: "https://fixture.invalid/history/\($0)",
+                  date: Date().addingTimeInterval(-Double($0) * 60))
+        }
+        store.activate(store.tabs[0].id)
+        // Retain the original home instead of measuring only pristine-home reuse.
+        store.homeAddressDrafts[store.selected!] = [true: "retained fixture"]
+        await settle()
+        let list = table()
+        for attempt in 0..<4 {
+            for kind in ["home", "downloads", "history"] {
+                let start = ProcessInfo.processInfo.systemUptime
+                switch kind {
+                case "downloads": store.openDownloads()
+                case "history": store.openHistory()
+                default: store.newTab()
+                }
+                let created = ProcessInfo.processInfo.systemUptime
+                let added = store.selected!
+                let internalPage = kind != "home"
+                precondition(!internalPage || store.cachedBrowser(for: added) == nil,
+                             "Selecting a fresh internal tab must not synchronously create its browser")
+                var previous = start, gaps: [Double] = [], intermediate = 0
+                for _ in 0..<36 {
+                    try? await Task.sleep(nanoseconds: 16_000_000)
+                    let now = ProcessInfo.processInfo.systemUptime
+                    gaps.append((now - previous) * 1000); previous = now
+                    if let row = list.ids.firstIndex(of: added) {
+                        let height = list.rect(ofRow: row).height
+                        if height > 0.5 && height < TabSelectionRow.rowHeight - 0.5 {
+                            intermediate += 1
+                            precondition(!internalPage || store.cachedBrowser(for: added) == nil,
+                                         "WebKit must wait for the native insertion to finish")
+                        }
+                    }
+                }
+                print(String(format: "MEASURE: internal %@ attempt=%d create=%.1f first=%.1f animation-max=%.1f ms intermediate=%d",
+                             kind, attempt, (created - start) * 1000, gaps.first ?? 0,
+                             gaps.dropFirst().max() ?? 0, intermediate))
+                fflush(stdout)
+                precondition(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion || intermediate >= 4,
+                             "Internal page opening skipped its tab animation: \(kind), gaps=\(gaps)")
+                precondition(!internalPage || store.cachedBrowser(for: added) != nil,
+                             "The selected page must start after the wipe")
+                store.close(added)
+                await settle()
+            }
+        }
+        store.openHistory()
+        let cancelled = store.selected!
+        store.close(cancelled)
+        await settle()
+        precondition(store.cachedBrowser(for: cancelled) == nil && !store.pendingInternalPageLoads.contains(cancelled))
+        print("PASS: native insertion precedes first WebKit load; closing a pending internal tab cancels its load")
     }
     private func verifyGroupTransition() async {
         func check(_ condition: @autoclosure () -> Bool, _ message: String) {

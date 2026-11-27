@@ -811,6 +811,22 @@ final class AIController: ObservableObject {
     }
     var activeConversations: [AISession] { recentConversations.filter { $0.isArchived != true } }
     var archivedConversations: [AISession] { recentConversations.filter { $0.isArchived == true } }
+    func recoverLegacyChatDrafts(_ owners: Set<UUID>) {
+        var recovered = false
+        for owner in owners where sessions[owner]?.messages.isEmpty != false {
+            guard drafts[owner]?.isEmpty == false || draftFiles[owner]?.isEmpty == false ||
+                  draftReferences[owner]?.isEmpty == false || draftClosedReferences[owner]?.isEmpty == false ||
+                  draftQuotes[owner] != nil else { continue }
+            var session = sessions[owner] ?? AISession()
+            guard conversations[session.id] == nil else { continue }
+            session.origin = .chat
+            sessions[owner] = session
+            // Legacy tab bindings are going away; give draft-only conversations a history entry.
+            conversations[session.id] = session
+            recovered = true
+        }
+        if recovered { saveConversations() }
+    }
     nonisolated static func pageURL(_ url: URL) -> URL? {
         guard var parts = URLComponents(url: url, resolvingAgainstBaseURL: false),
               ["http", "https"].contains(parts.scheme?.lowercased() ?? ""), parts.host != nil else { return nil }

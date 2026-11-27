@@ -15,6 +15,18 @@ enum FaviconCache {
         return FaviconLoader.decode(data)
     }
 
+    static func pngDataURLs(for addresses: [String], defaults: UserDefaults) -> [String: String] {
+        guard let cache = defaults.dictionary(forKey: "favicons") else { return [:] }
+        var urls: [String: String] = [:]
+        for address in addresses {
+            guard let key = key(address), urls[key] == nil,
+                  let png = cache[key] as? Data, png.count <= 65536,
+                  png.starts(with: [137, 80, 78, 71, 13, 10, 26, 10]) else { continue }
+            urls[key] = "data:image/png;base64," + png.base64EncodedString()
+        }
+        return urls
+    }
+
     static func save(_ image: NSImage, for address: String, defaults: UserDefaults) {
         guard let key = key(address),
               let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
