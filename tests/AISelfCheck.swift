@@ -1979,11 +1979,8 @@ enum AISelfCheck {
         restoredStore.ai.recoverLegacyChatDrafts([legacyDraftOwner])
         let recovered = restoredStore.ai.activeConversations.first { $0.id == restoredStore.ai.sessions[legacyDraftOwner]?.id }
         precondition(recovered != nil, "A legacy draft-only Chat must have a history entry after migration")
-        let entry = AISession(messages: [AIMessage(role: "user", text: "History fixture")], origin: .chat)
-        let archiveOwner = UUID()
-        restoredStore.ai.sessions[archiveOwner] = entry
-        restoredStore.ai.saveConversations()
-        restoredStore.ai.sessions.removeValue(forKey: archiveOwner)
+        restoredStore.ai.seedPreview()
+        let entry = restoredStore.ai.activeConversations.first { $0.messages.first?.text == "整理下一周的计划" }!
         restoredStore.openChat(owner: blankDraftOwner)
         restoredStore.openChat(conversation: entry.id)
         precondition(restoredStore.chatOwner != blankDraftOwner && restoredStore.ai.drafts[restoredStore.chatOwner] == nil &&
