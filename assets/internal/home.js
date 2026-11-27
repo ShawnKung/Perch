@@ -166,6 +166,7 @@
         const card=document.createElement('button');card.type='button';card.className='shortcut';card.dataset.id=site.id;
         const icon=document.createElement('img');icon.alt='';icon.draggable=false;
         const fallback=document.createElement('span');fallback.className='site-symbol';fallback.setAttribute('aria-hidden','true');
+        icon.addEventListener('error',()=>{icon.hidden=true;fallback.hidden=false;});
         const info=document.createElement('span');info.className='site-info';
         const title=document.createElement('span'),host=document.createElement('small');info.append(title,host);card.append(icon,fallback,info);
         entry={card,icon,fallback,title,host};cards.set(site.id,entry);
@@ -175,8 +176,12 @@
         const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('viewBox','0 0 24 24');
         svg.innerHTML=artwork[site.symbol] || artwork.globe;entry.fallback.replaceChildren(svg);entry.fallback.dataset.symbol=site.symbol;
       }
-      entry.icon.hidden=!site.icon;entry.fallback.hidden=!!site.icon;
-      if(entry.icon.getAttribute('src')!==site.icon)entry.icon.src=site.icon;
+      if(entry.icon.getAttribute('src')!==(site.icon||null)){
+        if(site.icon)entry.icon.src=site.icon;
+        else entry.icon.removeAttribute('src');
+      }
+      const hasIcon=!!site.icon && (!entry.icon.complete || entry.icon.naturalWidth>0);
+      entry.icon.hidden=!hasIcon;entry.fallback.hidden=hasIcon;
     });
     order=incoming;if(!drag)arrange(order);
     document.getElementById('date').textContent=state.date;

@@ -686,6 +686,7 @@ final class Store: ObservableObject {
         } catch { notice = "保存首页顺序失败：\(error.localizedDescription)"; return false }
     }
     @Published var tabs: [Tab] = [] { didSet {
+        pendingInternalPageLoads = pendingInternalPageLoads.filter { id in tabs.contains { $0.id == id } }
         for page in oldValue where !tabs.contains(where: { $0.id == page.id }) {
             var parts = URLComponents(string: page.address)
             parts?.user = nil; parts?.password = nil; parts?.query = nil; parts?.fragment = nil
@@ -758,6 +759,8 @@ final class Store: ObservableObject {
     @Published var settings: BrowserSettings
     @Published var icons: [UUID: NSImage] = [:]
     private var browsers: [UUID: Browser] = [:]
+    private(set) var pendingInternalPageLoads: Set<UUID> = []
+    var hasWindowedTabList: (() -> Bool)?
     private var activationHistory: [UUID] = []
     let defaults: UserDefaults
     func receiveUpdate(_ version: String?) {
@@ -903,7 +906,8 @@ final class Store: ObservableObject {
         if select, selected != id, let groupID = tab.groupID, let index = tabGroups.firstIndex(where: { $0.id == groupID }),
            tabGroups[index].collapsed { tabGroups[index].collapsed = false }
         if icons[id] == nil { icons[id] = FaviconCache.image(for: tab.address, defaults: defaults) }
-        if browsers[id] == nil, let url = URLInput.parseNavigation(tab.address, search: false) {
+        if browsers[id] == nil, !pendingInternalPageLoads.contains(id),
+           let url = URLInput.parseNavigation(tab.address, search: false) {
             let view = Browser(url: url, userAgent: settings.userAgent,
                                dataStore: defaults === UserDefaults.standard ? .default() : .nonPersistent(),
                                trackHoverLinks: true, previewDefaults: defaults, startsAtHome: startsAtHome, downloads: downloads)
@@ -989,6 +993,10 @@ final class Store: ObservableObject {
 
     func newTab(address: String = "", title: String = "新标签页", after: UUID? = nil, select: Bool = true) {
         var tab = Tab(title: title == "新标签页" ? URL(string: address)?.host ?? title : title, address: address)
+        let url = URL(string: address)
+        if select, hasWindowedTabList?() == true, DownloadsPage.matches(url) || HistoryPage.matches(url) {
+            pendingInternalPageLoads.insert(tab.id)
+        }
         let source = after ?? tabs.first(where: { $0.id == selected && $0.groupID != nil })?.id
         if let source, let index = tabs.firstIndex(where: { $0.id == source }) {
             tab.groupID = tabs[index].groupID
@@ -997,6 +1005,13 @@ final class Store: ObservableObject {
         activate(tab.id, select: select)
         if select && address.isEmpty { pendingAddressFocus = tab.id }
         persistTabs()
+    }
+
+    func tabInsertionDidFinish(_ id: UUID) {
+        guard pendingInternalPageLoads.remove(id) != nil, selected == id else { return }
+        // Publish the arrival of the content controller without changing the selected tab.
+        objectWillChange.send()
+        activate(id, select: false)
     }
 
     func openDownloads() {
@@ -1500,7 +1515,10 @@ final class Store: ObservableObject {
         else {
             if let selected, let index = tabs.firstIndex(where: { $0.id == selected }) {
                 tabs[index].chatOwner = nil
-                tabs[index].address = url.absoluteString; activate(selected, startsAtHome: true)
+                let startsAtHome = tabs[index].address.isEmpty
+                pendingInternalPageLoads.remove(selected)
+                tabs[index].address = url.absoluteString
+                activate(selected, startsAtHome: startsAtHome)
             } else {
                 newTab()
                 if let selected { homeAddressDrafts[selected] = homeAddressDrafts.removeValue(forKey: AIController.homeID) }

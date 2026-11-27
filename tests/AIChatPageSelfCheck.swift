@@ -538,6 +538,18 @@ enum AIChatPageSelfCheck {
         }
         try await fixture.click("#model-list button", web: web)
         print("PASS: native keyboard focus keeps model search borderless and model selection works")
+        _ = try await web.callAsyncJavaScript("""
+            const scroll=document.getElementById('scroll'), body=document.querySelector('.assistant .markdown'),
+                summary=document.querySelector('.assistant details:has(.sources) summary');
+            body.style.maxHeight='180px';body.style.overflow='hidden';
+            document.querySelector('.assistant').style.marginTop='900px';
+            await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+            scroll.scrollTop=scroll.scrollHeight;
+            await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+            window.fixtureSearchTop=summary.getBoundingClientRect().top;
+            window.fixtureSearchBottomGap=scroll.scrollHeight-scroll.clientHeight-scroll.scrollTop;
+            """, arguments: [:], in: nil, contentWorld: .defaultClient)
+        try await check(web, "window.fixtureSearchBottomGap < 2", "搜索展开夹具必须从底部开始")
         try await fixture.click(".assistant details:has(.sources) summary", web: web)
         try await check(web, """
             document.querySelector('.assistant .sources').parentElement.open &&
@@ -546,6 +558,13 @@ enum AIChatPageSelfCheck {
                 getComputedStyle(document.querySelector('.assistant .sources').previousElementSibling).listStyleType==='none' &&
                 getComputedStyle(document.querySelector('.assistant .sources').previousElementSibling,'::before').borderTopStyle==='solid'
             """, "联网搜索结果缺少高度限制或空心折叠箭头")
+        try await check(web, """
+            (()=>{const summary=document.querySelector('.assistant .sources').previousElementSibling,
+                scroll=document.getElementById('scroll');
+                return Math.abs(summary.getBoundingClientRect().top-window.fixtureSearchTop)<2 &&
+                    scroll.scrollHeight-scroll.clientHeight-scroll.scrollTop>100;
+            })()
+            """, "从底部展开联网搜索时，标题应留在原位，结果向下展开")
         _ = try await web.evaluateJavaScript("""
             document.addEventListener('wheel',e=>window.fixtureWheel={trusted:e.isTrusted,x:e.clientX,y:e.clientY,
                 target:e.target.className,delta:e.deltaY},true);
@@ -561,7 +580,12 @@ enum AIChatPageSelfCheck {
         }
         try await fixture.click(".assistant details:has(.sources) summary", web: web)
         try await check(web, "!document.querySelector('.assistant .sources').parentElement.open", "搜索结果无法收起")
-        print("PASS: hollow disclosure, bounded search results and native inner scrolling")
+        _ = try await web.evaluateJavaScript("""
+            document.querySelector('.assistant').style.removeProperty('margin-top');
+            const body=document.querySelector('.assistant .markdown');
+            body.style.removeProperty('max-height');body.style.removeProperty('overflow');
+            """)
+        print("PASS: native search disclosure anchors its title at the bottom, bounds results, and allows inner scrolling")
         _ = try await web.evaluateJavaScript("document.querySelector('.markdown pre').scrollIntoView({block:'center'})")
         fixture.mouse(.mouseMoved, at: try await fixture.point(".markdown pre", web: web))
         do {

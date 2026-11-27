@@ -56,7 +56,6 @@ final class HomePageController: NSObject, WKScriptMessageHandler, WKNavigationDe
     private(set) var pristine = true
     private var ready = false
     private var search: Task<Void, Never>?
-    private var iconCache: [UUID: (NSImage, String)] = [:]
     private static let chatIcon: String = {
         // Rasterize at 2× for the homepage's 27px Retina icon.
         guard let image = NSImage(systemSymbolName: "sparkles", accessibilityDescription: nil)?
@@ -89,17 +88,15 @@ final class HomePageController: NSObject, WKScriptMessageHandler, WKNavigationDe
     func update() {
         guard ready, let web, let store else { return }
         PerchTheme.shared.update(web)
-        let sites = store.homeShortcuts.map { site -> [String: Any] in
-            var icon = ""
-            if let image = store.cachedFavicon(site.address) {
-                if iconCache[site.id]?.0 !== image { iconCache[site.id] = (image, InternalPage.icon(image)) }
-                icon = iconCache[site.id]?.1 ?? ""
-            }
+        let shortcuts = store.homeShortcuts
+        // The cache already stores PNG thumbnails; don't decode and re-encode them during tab layout.
+        let icons = FaviconCache.pngDataURLs(for: shortcuts.map(\.address), defaults: store.defaults)
+        let sites = shortcuts.map { site -> [String: Any] in
+            let icon = FaviconCache.key(site.address).flatMap { icons[$0] } ?? ""
             let symbols = ["magnifyingglass": "search", "chevron.left.forwardslash.chevron.right": "code", "bubble.left": "chat"]
             return ["id": site.id.uuidString, "title": site.title, "host": URL(string: site.address)?.host ?? site.address,
                     "symbol": symbols[site.symbol] ?? "globe", "icon": icon]
         }
-        iconCache = iconCache.filter { id, _ in sites.contains { $0["id"] as? String == id.uuidString } }
         if let anchoredID, !sites.contains(where: { $0["id"] as? String == anchoredID.uuidString }) {
             anchor.removeFromSuperview(); self.anchoredID = nil
         }

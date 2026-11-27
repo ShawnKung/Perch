@@ -226,6 +226,11 @@ struct TabContentView: View {
             HStack(spacing: 6) {
                 if let browser {
                     BrowserAddressBar(browser: browser, store: store, tabID: tabID).id(ObjectIdentifier(browser))
+                } else if let tab, !tab.address.isEmpty {
+                    Text(tab.address).font(.system(size: 13)).lineLimit(1)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                        .padding(.horizontal, 8)
+                        .accessibilityLabel("地址：\(tab.address)")
                 } else if let cached = store.cachedBrowser(for: tabID) {
                     HomeHistoryAddressBar(browser: cached, store: store, tabID: tabID)
                 } else { HomeAddressBar(store: store, tabID: tabID) }
@@ -238,6 +243,8 @@ struct TabContentView: View {
                     Color.clear
                 } else if let browser {
                     BrowserTabContent(browser: browser)
+                } else if tab?.address.isEmpty == false {
+                    Style.paper
                 } else { HomeScreen(page: page) }
             }.modifier(ContentTopChrome(enabled: true))
         }

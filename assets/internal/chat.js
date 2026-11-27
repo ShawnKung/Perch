@@ -92,7 +92,7 @@
   window.updateDiagramBounds = () => {};
   const style = node('style'); style.textContent = ''; document.head.append(style);
   window.perchDiagramStyle = css => { style.textContent = css; };
-  function capture() {
+  function capture(allowBottomFollow = true) {
     if (!state || applying || !cards.size || scroll.clientHeight === 0) return;
     // Layout-generated scroll events can arrive before ResizeObserver; preserve the previous anchor first.
     if (layoutSize() !== restoredLayout) { restore(); return; }
@@ -101,7 +101,7 @@
       Array.from(messages.children).reverse().find(card => card.dataset.id);
     if (!card) return;
     anchor = {messageID:card.dataset.id,offset:top-card.getBoundingClientRect().top};
-    followsBottom = scroll.scrollHeight-scroll.clientHeight-scroll.scrollTop < 4;
+    followsBottom = allowBottomFollow && scroll.scrollHeight-scroll.clientHeight-scroll.scrollTop < 4;
     send('reading',{id:anchor.messageID,offset:anchor.offset});
   }
   function restore() {
@@ -115,6 +115,18 @@
     }
     applying = false;
   }
+  function anchorDisclosure(summary) {
+    summary.addEventListener('click', event => {
+      if (event.defaultPrevented) return;
+      event.preventDefault();
+      const top = summary.getBoundingClientRect().top;
+      const details = summary.parentElement;
+      details.open = !details.open;
+      scroll.scrollTop += summary.getBoundingClientRect().top - top;
+      restoredLayout = layoutSize();
+      capture(false);
+    });
+  }
   let scrolling = false;
   scroll.addEventListener('scroll',() => {
     if (applying) return;
@@ -124,7 +136,7 @@
     window.updateQuoteSelection?.();
     if (!scrolling) { scrolling = true; requestAnimationFrame(() => { scrolling = false; capture(); }); }
   });
-  scroll.addEventListener('wheel',() => { followsBottom = false; requestAnimationFrame(capture); },{passive:true});
+  scroll.addEventListener('wheel',() => { followsBottom = false; requestAnimationFrame(() => capture()); },{passive:true});
   scroll.addEventListener('keydown',event => {
     if (['PageUp','PageDown','Home','End','ArrowUp','ArrowDown',' '].includes(event.key)) followsBottom = false;
   });
@@ -197,6 +209,8 @@
     const searchTitle = node('summary'); evidence.append(searchTitle,sources);
     const reasoning = node('details'), reasoningTitle = node('summary'), reasoningText = node('div','reasoning-text');
     reasoning.append(reasoningTitle,reasoningText);
+    anchorDisclosure(searchTitle);
+    anchorDisclosure(reasoningTitle);
     const body = node('div',value.role === 'assistant' ? 'markdown' : 'plain-text'), files = node('div'), interactions = node('div'), time = node('time');
     header.append(author,time,actions); root.append(header,refs,quote,evidence,reasoning,body,files,interactions);
     const card = {root,author,actions,refs,quote,evidence,searchTitle,sources,reasoning,reasoningTitle,reasoningText,body,files,interactions,time,revision:0};

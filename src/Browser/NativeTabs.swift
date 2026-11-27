@@ -873,6 +873,7 @@ struct NativeTabList: NSViewRepresentable {
             coordinator?.resetGroupPreview(table)
         }
         let container = TabListContainer()
+        store.hasWindowedTabList = { [weak container] in container?.window != nil }
         container.expansion = expansion
         let scroll = container.scroll
         scroll.documentView = table
@@ -933,7 +934,7 @@ struct NativeTabList: NSViewRepresentable {
                lastSelection == store.selected, self.compact == compact, table.theme == theme {
                 if lastExpansion != expansion {
                     lastExpansion = expansion
-                    updateWipeHeights(table)
+                    updateWipeHeights(table, refreshDecoration: true)
                 }
                 return
             }
@@ -1004,6 +1005,16 @@ struct NativeTabList: NSViewRepresentable {
                     wipe.finished = true
                     self.scheduleWipeUpdate(table)
                 }
+            }
+            finishPageInsertions()
+        }
+
+        private func finishPageInsertions() {
+            let ready = store.pendingInternalPageLoads.filter { storeIDs.contains($0) && rowWipes[$0] == nil }
+            guard !ready.isEmpty else { return }
+            // Give the native layout transaction its own turn before creating any WebKit views.
+            DispatchQueue.main.async { [weak store] in
+                for id in ready { store?.tabInsertionDidFinish(id) }
             }
         }
 
@@ -1124,7 +1135,7 @@ struct NativeTabList: NSViewRepresentable {
                         self.updating = true
                         self.render(table)
                         self.updating = wasUpdating
-                    } else { self.updateWipeHeights(table) }
+                    } else { self.updateWipeHeights(table, refreshDecoration: true) }
                 }
             }
             table.refreshDragPlaceholder()
@@ -1150,9 +1161,10 @@ struct NativeTabList: NSViewRepresentable {
                 self.updating = wasUpdating
                 table.animatingRows = !self.rowWipes.isEmpty
                 table.refreshHover()
+                if !finished.isEmpty { self.finishPageInsertions() }
             }
         }
-        private func updateWipeHeights(_ table: TabTable, allRows: Bool = false) {
+        private func updateWipeHeights(_ table: TabTable, allRows: Bool = false, refreshDecoration: Bool = false) {
             let wasUpdating = updating
             updating = true
             defer { updating = wasUpdating }
@@ -1174,6 +1186,8 @@ struct NativeTabList: NSViewRepresentable {
                 context.duration = 0
                 if !changed.isEmpty { table.noteHeightOfRows(withIndexesChanged: changed) }
                 table.layoutSubtreeIfNeeded()
+                // A row wipe changes geometry only; group disclosure and sidebar width change decoration.
+                guard allRows || refreshDecoration else { return }
                 table.enumerateAvailableRowViews { view, row in
                     guard self.rows.indices.contains(row) else { return }
                     switch self.rows[row] {
