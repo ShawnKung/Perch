@@ -842,6 +842,8 @@ final class Store: ObservableObject {
         }
         fullChatOwner = defaults.string(forKey: "fullChatOwner").flatMap(UUID.init(uuidString:)) ??
             chatTab?.chatOwner ?? tabGroups.flatMap { $0.hiddenTabs ?? [] }.compactMap(\.chatOwner).first ?? AIController.homeID
+        let legacyTabs = restoredTabs + tabGroups.flatMap { $0.hiddenTabs ?? [] }
+        ai.recoverLegacyChatDrafts(Set(legacyTabs.compactMap(\.chatOwner)))
         tabs = restoredTabs.map { var tab = $0; tab.migrateChat(); return tab }
         for index in tabGroups.indices {
             tabGroups[index].hiddenTabs = tabGroups[index].hiddenTabs?.map { var tab = $0; tab.migrateChat(); return tab }
@@ -1079,7 +1081,7 @@ final class Store: ObservableObject {
         persistTabs()
     }
     func openChat(owner: UUID? = nil, conversation: UUID? = nil) {
-        if let conversation { fullChatOwner = ai.resumeConversation(conversation, tab: fullChatOwner) }
+        if let conversation { fullChatOwner = ai.resumeConversation(conversation, tab: UUID()) }
         else if let owner { fullChatOwner = owner }
         else if !isChatPage, aiVisible || ai.drafts[chatOwner]?.isEmpty == false || ai.sessions[chatOwner] != nil ||
                     ai.draftFiles[chatOwner]?.isEmpty == false || ai.draftQuotes[chatOwner] != nil {

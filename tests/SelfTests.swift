@@ -781,9 +781,9 @@ enum SelfTests {
         table.reloadData()
         var closed: [UUID] = []
         table.closeTab = { closed.append($0) }
-        func event(_ row: Int, _ type: NSEvent.EventType) -> NSEvent {
+        func event(_ row: Int, _ type: NSEvent.EventType, yOffset: CGFloat = 0) -> NSEvent {
             let rect = table.rect(ofRow: row)
-            let point = table.convert(NSPoint(x: rect.midX, y: rect.midY), to: nil)
+            let point = table.convert(NSPoint(x: rect.midX, y: rect.midY + yOffset), to: nil)
             let event = NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
                                           timestamp: 0, windowNumber: 0, context: nil,
                                           eventNumber: 0, clickCount: 1, pressure: 0)!
@@ -794,6 +794,9 @@ enum SelfTests {
         table.otherMouseDown(with: event(1, .otherMouseDown))
         table.otherMouseUp(with: event(2, .otherMouseUp))
         precondition(closed.isEmpty, "Pointer drift must not close the release row")
+        table.otherMouseDown(with: event(0, .otherMouseDown, yOffset: 17))
+        table.otherMouseUp(with: event(1, .otherMouseUp, yOffset: -17))
+        precondition(closed.isEmpty, "Even a two-point movement across the row boundary must cancel the click")
         table.otherMouseDown(with: event(1, .otherMouseDown))
         table.ids.swapAt(0, 1)
         table.reloadData()

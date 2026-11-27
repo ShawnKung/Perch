@@ -138,7 +138,7 @@ final class TabTable: NSTableView {
         guard event.buttonNumber == 2 else { super.otherMouseUp(with: event); return }
         guard !animatingGroups, dragID == nil else { middle.cancel(); return }
         let point = event.locationInWindow
-        let stationary = hypot(point.x - middleDownPoint.x, point.y - middleDownPoint.y) < 4
+        let stationary = point == middleDownPoint
         let target = stationary && visibleRect.contains(convert(point, from: nil)) ? middle.target : tab(at: event)
         if let id = middle.end(over: target), isTabOpen?(id) != false { closeTab?(id) }
     }

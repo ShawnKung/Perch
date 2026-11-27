@@ -1973,6 +1973,24 @@ enum AISelfCheck {
             precondition(restoredStore.chatOwner == sharedOwner)
         }
         print("PASS: multiple Chat tabs survive legacy restore/reopen and share owner and sidebar state")
+        let legacyDraftOwner = UUID(), blankDraftOwner = UUID()
+        restoredStore.ai.drafts[legacyDraftOwner] = "Recovered legacy draft"
+        restoredStore.ai.drafts[blankDraftOwner] = "Independent blank draft"
+        restoredStore.ai.recoverLegacyChatDrafts([legacyDraftOwner])
+        let recovered = restoredStore.ai.activeConversations.first { $0.id == restoredStore.ai.sessions[legacyDraftOwner]?.id }
+        precondition(recovered != nil, "A legacy draft-only Chat must have a history entry after migration")
+        let entry = AISession(messages: [AIMessage(role: "user", text: "History fixture")], origin: .chat)
+        let archiveOwner = UUID()
+        restoredStore.ai.sessions[archiveOwner] = entry
+        restoredStore.ai.saveConversations()
+        restoredStore.ai.sessions.removeValue(forKey: archiveOwner)
+        restoredStore.openChat(owner: blankDraftOwner)
+        restoredStore.openChat(conversation: entry.id)
+        precondition(restoredStore.chatOwner != blankDraftOwner && restoredStore.ai.drafts[restoredStore.chatOwner] == nil &&
+                     restoredStore.ai.drafts[blankDraftOwner] == "Independent blank draft")
+        restoredStore.openChat(conversation: recovered!.id)
+        precondition(restoredStore.chatOwner == legacyDraftOwner && restoredStore.ai.drafts[legacyDraftOwner] == "Recovered legacy draft")
+        print("PASS: migrated draft-only Chat remains accessible and opening history does not inherit another draft")
         precondition(store.ai.save(config, key: "synthetic-key"))
         let legacySettings = try JSONDecoder().decode(BrowserSettings.self, from: Data("{}".utf8))
         precondition(!legacySettings.aiSendWithCommand)
