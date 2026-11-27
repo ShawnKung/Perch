@@ -26,7 +26,19 @@ enum AIChatPageSelfCheck {
         return view.subviews.lazy.compactMap(find).first
     }
     static func ready(_ panel: Panel) async throws -> AIChatWebView {
-        try await AISelfCheck.wait { panel.contentView.flatMap(find)?.controller?.ready == true }
+        try await AISelfCheck.wait {
+            panel.contentView?.layoutSubtreeIfNeeded()
+            guard let web = panel.contentView.flatMap(find), web.controller?.ready == true,
+                  web.bounds.width > 100, web.bounds.height > 100 else { return false }
+            var ancestor = web.superview
+            while let view = ancestor {
+                if let container = view as? ChatContentContainer {
+                    return container.tabID == container.store?.selected
+                }
+                ancestor = view.superview
+            }
+            return true
+        }
         let web = find(panel.contentView!)!
         _ = try await web.callAsyncJavaScript("""
             for(let i=0;!document.querySelector('#composer');i++){
@@ -40,7 +52,11 @@ enum AIChatPageSelfCheck {
                       arguments: [String: Any] = [:], line: UInt = #line) async throws {
         guard try await web.callAsyncJavaScript("return (" + expression + ");", arguments: arguments,
                                                 in: nil, contentWorld: .defaultClient) as? Bool == true else {
-            throw PerchError("HTML Chat \(line): \(message)")
+            let focus = try? await web.evaluateJavaScript("""
+                JSON.stringify({active:document.activeElement.id,focused:document.hasFocus(),
+                    visible:document.activeElement.matches(':focus-visible')})
+                """)
+            throw PerchError("HTML Chat \(line): \(message); key=\(web.window?.isKeyWindow == true), focus=\(focus ?? "nil")")
         }
     }
     static func waitFor(_ web: WKWebView, _ expression: String, arguments: [String: Any] = [:],
@@ -128,8 +144,17 @@ enum AIChatPageSelfCheck {
         print("PASS: quote fades through intermediate opacity, disables fading-out hits, retains selection and decorative quote icon")
     }
     static func toolbarCursor(fixture: HomePageFixture, web: WKWebView) async throws {
+        // Only fixture-injected movements should participate in this asynchronous cursor check.
+        let acceptsMouseMoved = fixture.panel.acceptsMouseMovedEvents
+        fixture.panel.acceptsMouseMovedEvents = false
+        defer { fixture.panel.acceptsMouseMovedEvents = acceptsMouseMoved }
+        try await fixture.focus()
         defer { NSCursor.arrow.set() }
         var restorations = 0, restoredArrow = false
+        var focusLosses = 0
+        let focusObserver = NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification,
+            object: fixture.panel, queue: .main) { _ in focusLosses += 1 }
+        defer { NotificationCenter.default.removeObserver(focusObserver) }
         let tracker = AIWebHoverTracker(web: web, world: .defaultClient) {
             NSCursor.arrow.set()
             restoredArrow = NSCursor.current == NSCursor.arrow
@@ -155,21 +180,33 @@ enum AIChatPageSelfCheck {
         for selector in selectors {
             let point = try await fixture.point(selector, web: web)
             for cursor in [NSCursor.pointingHand, NSCursor.iBeam] {
-                cursor.set()
-                let before = restorations
-                fixture.mouse(.mouseMoved, at: point)
-                do { try await AISelfCheck.wait { restorations > before && restoredArrow } }
-                catch {
-                    let diagnostic = try await web.callAsyncJavaScript("""
-                        const r=document.querySelector(selector).getBoundingClientRect(),
-                            target=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);
-                        return {target:target?.outerHTML,cursor:target && getComputedStyle(target).cursor,
-                            events:window.fixtureCursorHits.slice(),
-                            hover:window.updateChatHover?.(r.x+r.width/2,r.y+r.height/2)};
-                        """, arguments: ["selector": selector], in: nil, contentWorld: .defaultClient)
-                    let root = fixture.panel.contentView!
-                    let hit = root.hitTest(root.superview?.convert(point, from: nil) ?? point)
-                    throw PerchError("Toolbar did not restore arrow from \(cursor) over \(selector): hit=\(String(describing: hit)), key=\(fixture.panel.isKeyWindow), DOM=\(diagnostic ?? "nil"); \(error)")
+                var attempts = 0
+                while true {
+                    try await fixture.focus()
+                    let focusRevision = focusLosses
+                    cursor.set()
+                    let before = restorations
+                    fixture.mouse(.mouseMoved, at: point)
+                    do {
+                        try await AISelfCheck.wait { (restorations > before && restoredArrow) || focusLosses != focusRevision }
+                        if focusLosses != focusRevision {
+                            attempts += 1
+                            guard attempts < 3 else { throw PerchError("Desktop focus repeatedly interrupted the cursor fixture") }
+                            continue
+                        }
+                        break
+                    } catch {
+                        let diagnostic = try await web.callAsyncJavaScript("""
+                            const r=document.querySelector(selector).getBoundingClientRect(),
+                                target=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);
+                            return {target:target?.tagName,id:target?.id,cursor:target && getComputedStyle(target).cursor,
+                                events:window.fixtureCursorHits.slice(),
+                                hover:window.updateChatHover?.(r.x+r.width/2,r.y+r.height/2)};
+                            """, arguments: ["selector": selector], in: nil, contentWorld: .defaultClient)
+                        let root = fixture.panel.contentView!
+                        let hit = root.hitTest(root.superview?.convert(point, from: nil) ?? point)
+                        throw PerchError("Toolbar did not restore arrow from \(cursor) over \(selector): hit=\(String(describing: hit)), key=\(fixture.panel.isKeyWindow), DOM=\(diagnostic ?? "nil"); \(error)")
+                    }
                 }
             }
         }
@@ -205,6 +242,7 @@ enum AIChatPageSelfCheck {
                           styleMask: [.titled, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
         panel.isReleasedWhenClosed = false
         panel.hidesOnDeactivate = false
+        panel.level = .floating
         defer { panel.orderOut(nil); panel.contentView = nil; defaults.removePersistentDomain(forName: suite) }
         let config = AIConfiguration(provider: .custom, baseURL: (baseURL ?? "http://127.0.0.1:9") + "/v1", model: "fixture")
         precondition(store.ai.save(config, key: "synthetic-key"))
@@ -231,10 +269,80 @@ enum AIChatPageSelfCheck {
             AIPageReference(title: "热量高低判断依据", url: referenceURL),
             AIPageReference(title: "无网址的来源", url: nil)
         ])
-        store.openChat(owner: owner)
+        store.newTab()
         panel.contentView = RootHostingView(rootView: RootView(store: store).defaultAppStorage(defaults))
         panel.bindTabFocus(to: store); panel.makeKeyAndOrderFront(nil)
-        let fixture = HomePageFixture(store: store, panel: panel), web = try await ready(panel)
+        let fixture = HomePageFixture(store: store, panel: panel)
+        let home = try await fixture.home()
+        try await fixture.click("[data-action='chat']", web: home)
+        let web = try await ready(panel)
+        guard fixture.toolbar().currentEditor() == nil else {
+            throw PerchError("Opening Chat from home automatically focused the address")
+        }
+        let expandedChatWidth = web.bounds.width
+        let firstChat = store.selected!
+        store.newTab(address: "perch://chat")
+        let secondChat = store.selected!
+        guard try await ready(panel) === web else { throw PerchError("Chat tabs created duplicate renderers") }
+        guard fixture.toolbar().currentEditor() == nil else {
+            throw PerchError("Opening a new Chat tab automatically focused the address")
+        }
+        NotificationCenter.default.post(name: .focusAddress, object: nil)
+        guard let editor = fixture.toolbar().currentEditor() as? NSTextView,
+              editor.selectedRange().length == "perch://chat".utf16.count else {
+            throw PerchError("Explicit address focus must still select the Chat URL")
+        }
+        print("PASS: home and new-tab Chat opening leave the address unfocused; explicit address shortcut selects its URL")
+        try await type("跨标签共享草稿", fixture: fixture, web: web)
+        _ = try await web.evaluateJavaScript("document.getElementById('composer').setSelectionRange(1,4);document.documentElement.dataset.fixtureShared='true'")
+        store.chatHistoryVisible = false
+        for id in [firstChat, secondChat, firstChat, secondChat] {
+            store.activate(id)
+            guard try await ready(panel) === web, store.chatOwner == owner, !store.chatHistoryVisible else {
+                throw PerchError("Switching Chat tabs replaced shared presentation state")
+            }
+            try await check(web, """
+                document.documentElement.dataset.fixtureShared==='true' && document.getElementById('composer').value==='跨标签共享草稿' &&
+                document.getElementById('composer').selectionStart===1 && document.getElementById('composer').selectionEnd===4
+                """, "切换 Chat 标签丢失 DOM、草稿或选区", arguments: [:])
+        }
+        let routeBrowser = store.cachedBrowser(for: secondChat)!
+        try await AISelfCheck.wait { !routeBrowser.loading && ChatPage.matches(routeBrowser.webView.url) }
+        guard routeBrowser.address == "perch://chat" else { throw PerchError("Chat address bar lacks its route") }
+        if let baseURL {
+            _ = try await web.callAsyncJavaScript("""
+                const update=window.perchUpdate;window.fixtureUpdates=0;
+                window.perchUpdate=state=>{window.fixtureUpdates++;update(state)};
+                """, arguments: [:], in: nil, contentWorld: .defaultClient)
+            store.navigate(baseURL + "/nav/chat-route")
+            try await AISelfCheck.wait { !routeBrowser.loading && routeBrowser.webView.url?.path == "/nav/chat-route" }
+            guard !store.isChatPage else { throw PerchError("Chat address bar cannot leave Chat") }
+            try await AISelfCheck.wait { web.window == nil }
+            _ = try await web.callAsyncJavaScript("window.fixtureUpdates=0", arguments: [:], in: nil, contentWorld: .defaultClient)
+            store.ai.drafts[owner] = "后台更新的共享草稿"
+            web.controller?.update()
+            try await check(web, "window.fixtureUpdates===0", "离窗 Chat 仍在重复渲染")
+            routeBrowser.goBack()
+            try await AISelfCheck.wait { store.isChatPage && !routeBrowser.loading }
+            guard try await ready(panel) === web else { throw PerchError("Back navigation replaced shared Chat") }
+            try await waitFor(web, "document.getElementById('composer').value==='后台更新的共享草稿'")
+            try await type("跨标签共享草稿", fixture: fixture, web: web)
+        }
+        store.close(firstChat)
+        guard try await ready(panel) === web, store.ai.drafts[owner] == "跨标签共享草稿" else {
+            throw PerchError("Closing another Chat tab lost its draft")
+        }
+        store.chatHistoryVisible = true
+        try await AISelfCheck.wait {
+            panel.contentView?.layoutSubtreeIfNeeded()
+            return abs(web.bounds.width - expandedChatWidth) < 1
+        }
+        try await type("", fixture: fixture, web: web)
+        if let root = panel.contentView, let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds) {
+            root.cacheDisplay(in: root.bounds, to: bitmap)
+            try bitmap.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: "/tmp/perch-chat-tabs.png"))
+        }
+        print("PASS: Chat tabs share one renderer, draft, selection and history state; address navigation/back preserve Chat")
         if quoteOnly {
             try await fixture.click("#composer", web: web)
             _ = try await web.evaluateJavaScript("""
@@ -466,6 +574,7 @@ enum AIChatPageSelfCheck {
         try await waitFor(web, "getComputedStyle(document.querySelector('.code-tools')).opacity==='0' && getComputedStyle(document.querySelector('.code-tools')).pointerEvents==='none'")
         try await check(web, "document.querySelector('.markdown pre').getBoundingClientRect().height===height",
                         "隐藏代码操作改变了代码框布局", arguments: ["height": codeHeight])
+        try await fixture.focus()
         _ = try await web.evaluateJavaScript("document.querySelector('.code-tools button').focus()")
         try await waitFor(web, "getComputedStyle(document.querySelector('.code-tools')).opacity==='1'")
         _ = try await web.evaluateJavaScript("document.activeElement.blur()")
@@ -482,7 +591,9 @@ enum AIChatPageSelfCheck {
                     style.top==='2px' && style.backgroundColor!=='rgba(0, 0, 0, 0)';})()
             """, arguments: ["selector": copySelector])
         try await fixture.click(copySelector, web: web)
-        guard NSPasteboard.general.string(forType: .string) == store.ai.sessions[owner]?.messages.first?.text else {
+        do {
+            try await AISelfCheck.wait { NSPasteboard.general.string(forType: .string) == store.ai.sessions[owner]?.messages.first?.text }
+        } catch {
             throw PerchError("Compact message copy missed the native bridge")
         }
         print("PASS: inset message action highlight and unchanged full button hit area")
@@ -754,6 +865,7 @@ enum AIChatPageSelfCheck {
         let panel = Panel(contentRect: NSRect(x: 140, y: 100, width: 950, height: 760),
                           styleMask: [.titled, .resizable], backing: .buffered, defer: false)
         panel.isReleasedWhenClosed = false; panel.hidesOnDeactivate = false
+        panel.level = .floating
         let host = NSHostingView(rootView: AIChatSidebar(store: store, ai: ai, fullPage: true, owner: owner, close: {}).defaultAppStorage(defaults))
         panel.contentView = host
         panel.makeKeyAndOrderFront(nil)
@@ -769,14 +881,15 @@ enum AIChatPageSelfCheck {
         try await toolbarCursor(fixture: fixture, web: web)
         _ = try await web.callAsyncJavaScript("""
             const update=window.perchUpdate;
-            window.perchUpdate=state=>{window.fixtureState=state;update(state)};
+            window.perchUpdate=state=>{window.fixtureState=state;update({...state,busy:window.fixtureBusy ?? state.busy})};
             """, arguments: [:], in: nil, contentWorld: .defaultClient)
         web.controller?.update()
         try await waitFor(web, "!!window.fixtureState")
-        _ = try await web.callAsyncJavaScript("window.perchUpdate({...window.fixtureState,busy:true});",
+        _ = try await web.callAsyncJavaScript("window.fixtureBusy=true;window.perchUpdate(window.fixtureState);",
                                              arguments: [:], in: nil, contentWorld: .defaultClient)
         try await waitFor(web, "!document.getElementById('stop').hidden")
         try await toolbarCursor(fixture: fixture, web: web)
+        _ = try await web.callAsyncJavaScript("delete window.fixtureBusy;", arguments: [:], in: nil, contentWorld: .defaultClient)
         web.controller?.update()
         host.rootView = AIChatSidebar(store: store, ai: ai, fullPage: true, owner: owner, close: {}).defaultAppStorage(defaults)
         try await waitFor(web, "!document.body.classList.contains('sidebar') && document.getElementById('stop').hidden")

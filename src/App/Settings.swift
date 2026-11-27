@@ -117,6 +117,11 @@ struct Tab: Identifiable, Codable, Equatable {
     var aiOwner: UUID?
     var aiSidebarOpen: Bool?
     var groupID: UUID?
+    var isChat: Bool { ChatPage.matches(URL(string: address)) || chatOwner != nil }
+    mutating func migrateChat() {
+        guard chatOwner != nil else { return }
+        address = ChatPage.url.absoluteString; title = "AI 聊天"; chatOwner = nil
+    }
 }
 
 enum TabGroupColor: String, Codable, CaseIterable {
@@ -214,7 +219,7 @@ struct Visit: Identifiable, Codable {
 }
 
 enum LibraryPage: String, Identifiable, CaseIterable {
-    case settings = "常规", ai = "AI", bookmarks = "书签与历史", passwords = "密码", importer = "导入导出"
+    case settings = "常规", ai = "AI", bookmarks = "书签与分组", passwords = "密码", importer = "导入导出"
     var id: String { rawValue }
 }
 

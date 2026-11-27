@@ -3,7 +3,7 @@ import SwiftUI
 import QuartzCore
 
 struct MiddlePress {
-    private var target: UUID?
+    private(set) var target: UUID?
     mutating func begin(_ id: UUID?) { target = id }
     mutating func cancel() { target = nil }
     mutating func end(over id: UUID?) -> UUID? {
@@ -16,7 +16,9 @@ final class TabTable: NSTableView {
     var ids: [UUID] = []
     var theme: ThemeColor = .green
     var middle = MiddlePress()
+    private var middleDownPoint = NSPoint.zero
     var closeTab: ((UUID) -> Void)?
+    var isTabOpen: ((UUID) -> Bool)?
     var tabMenu: ((Int) -> NSMenu?)?
     var animatingRows = false
     var animatingGroups = false
@@ -117,18 +119,28 @@ final class TabTable: NSTableView {
     func tab(at event: NSEvent) -> UUID? {
         let point = convert(event.locationInWindow, from: nil)
         guard visibleRect.contains(point) else { return nil }
-        let index = row(at: point)
-        return ids.indices.contains(index) && !groupIDs.contains(ids[index]) ? ids[index] : nil
+        var index = row(at: point)
+        // Closing rows retain their artwork, but subsequent presses belong to the next live tab.
+        while ids.indices.contains(index) {
+            guard !groupIDs.contains(ids[index]) else { return nil }
+            if isTabOpen?(ids[index]) != false { return ids[index] }
+            index += 1
+        }
+        return nil
     }
     override func otherMouseDown(with event: NSEvent) {
         guard event.buttonNumber == 2 else { super.otherMouseDown(with: event); return }
-        guard !animatingRows, !animatingGroups else { middle.cancel(); return }
+        guard !animatingGroups, dragID == nil else { middle.cancel(); return }
+        middleDownPoint = event.locationInWindow
         middle.begin(tab(at: event))
     }
     override func otherMouseUp(with event: NSEvent) {
         guard event.buttonNumber == 2 else { super.otherMouseUp(with: event); return }
-        guard !animatingRows, !animatingGroups else { middle.cancel(); return }
-        if let id = middle.end(over: tab(at: event)) { closeTab?(id) }
+        guard !animatingGroups, dragID == nil else { middle.cancel(); return }
+        let point = event.locationInWindow
+        let stationary = hypot(point.x - middleDownPoint.x, point.y - middleDownPoint.y) < 4
+        let target = stationary && visibleRect.contains(convert(point, from: nil)) ? middle.target : tab(at: event)
+        if let id = middle.end(over: target), isTabOpen?(id) != false { closeTab?(id) }
     }
     override func scrollWheel(with event: NSEvent) { middle.cancel(); clearHover(); super.scrollWheel(with: event) }
     override func reloadData() { middle.cancel(); clearHover(); super.reloadData() }
@@ -614,17 +626,19 @@ final class TabCell: NSTableCellView {
         }
         label.stringValue = tab.title
         let downloadsPage = DownloadsPage.matches(URL(string: tab.address))
-        icon.imageScaling = downloadsPage ? .scaleProportionallyDown : .scaleProportionallyUpOrDown
-        icon.image = tab.chatOwner != nil
-            ? NSImage(systemSymbolName: "bubble.left.and.bubble.right.fill", accessibilityDescription: "Chat")
-            : downloadsPage
-                ? NSImage(systemSymbolName: "arrow.down.to.line", accessibilityDescription: "下载记录")?
-                    .withSymbolConfiguration(.init(pointSize: 12, weight: .regular))
-                : tab.address.isEmpty
-                    ? NSImage(systemSymbolName: "house", accessibilityDescription: "新标签页")?
-                        .withSymbolConfiguration(.init(pointSize: 16, weight: .medium)
-                            .applying(.init(paletteColors: [.labelColor])))
-                    : image ?? NSImage(systemSymbolName: "globe", accessibilityDescription: "网站")
+        let historyPage = HistoryPage.matches(URL(string: tab.address))
+        let symbol: String? = tab.isChat ? "bubble.left.and.bubble.right.fill" :
+            historyPage ? "clock.arrow.circlepath" : downloadsPage ? "arrow.down.to.line" :
+            tab.address.isEmpty ? "house" : nil
+        label.font = .systemFont(ofSize: 12, weight: symbol != nil ? .semibold : .regular)
+        icon.imageScaling = .scaleProportionallyUpOrDown
+        if let symbol {
+            icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: tab.title)?
+                .withSymbolConfiguration(.init(pointSize: 16, weight: .medium)
+                    .applying(.init(paletteColors: [.labelColor])))
+        } else {
+            icon.image = image ?? NSImage(systemSymbolName: "globe", accessibilityDescription: "网站")
+        }
         icon.setAccessibilityLabel(tab.title)
         pin.image = tab.pinned ? NSImage(systemSymbolName: "pin.fill", accessibilityDescription: "已固定") : nil
         pinWidth.constant = tab.pinned ? 9 : 0
@@ -843,6 +857,7 @@ struct NativeTabList: NSViewRepresentable {
         table.registerForDraggedTypes([.string])
         table.setDraggingSourceOperationMask(.move, forLocal: true)
         table.closeTab = { [weak store] id in store?.close(id) }
+        table.isTabOpen = { [weak store] id in store?.tabs.contains(where: { $0.id == id }) == true }
         table.prepareSelection = { [weak store] in store?.prepareTabSelection?() }
         table.tabMenu = { [weak coordinator = context.coordinator] index in coordinator?.menu(index) }
         table.applyPreviewOrder = { [weak table, weak coordinator = context.coordinator] order in
@@ -1050,8 +1065,9 @@ struct NativeTabList: NSViewRepresentable {
                 }
             }
             if oldIDs != newIDs {
-                table.middle.cancel()
                 let oldSet = Set(oldIDs), newSet = Set(newIDs)
+                // Finishing a neighboring close must not cancel a stationary press on a live tab.
+                if oldIDs.filter(newSet.contains) != newIDs.filter(oldSet.contains) { table.middle.cancel() }
                 let removed = IndexSet(oldIDs.indices.filter { !newSet.contains(oldIDs[$0]) })
                 let inserted = IndexSet(newIDs.indices.filter { !oldSet.contains(newIDs[$0]) })
                 var previous = oldIDs.filter { newSet.contains($0) }

@@ -733,20 +733,18 @@ struct AIChatSidebar: View {
     @ObservedObject var ai: AIController
     var fullPage = false
     var owner: UUID? = nil
-    var windowControlsInset: CGFloat = 0
     let close: () -> Void
     @State private var showArchived = false
     @State private var confirmClearArchive = false
     @AppStorage(LayoutPreference.chatHistoryWidth.rawValue) private var historyWidth = 240.0
     @State private var historyDragWidth: Double?
     @State private var liveHistoryWidth: Double?
-    private var tab: UUID { owner ?? store.chatOwner }
+    private var tab: UUID { owner ?? (fullPage ? store.fullChatOwner : store.chatOwner) }
     private var session: AISession { ai.sessions[tab] ?? AISession() }
 
     var body: some View {
         VStack(spacing: 0) {
-            header
-            if !fullPage { Divider() }
+            if !fullPage { header; Divider() }
             GeometryReader { geometry in
             HStack(spacing: 0) {
                 if fullPage && store.chatHistoryVisible {
@@ -773,12 +771,17 @@ struct AIChatSidebar: View {
                     .background(Style.paper)
                     .overlay(alignment: .bottomLeading) {
                         if fullPage && !store.chatHistoryVisible {
-                            historyToggle.padding(.leading, 14).padding(.bottom, 14)
+                            VStack(spacing: 8) {
+                                GlyphButton(symbol: "square.and.arrow.up", label: "导出 Markdown", size: 24, action: exportMarkdown)
+                                    .disabled(session.messages.isEmpty)
+                                GlyphButton(symbol: "square.and.pencil", label: "新对话", size: 24, action: newChat)
+                                historyToggle
+                            }.padding(.leading, 8).padding(.bottom, 14)
                         }
                     }
             }.clipped()
                 .transaction { if historyDragWidth != nil { $0.animation = nil; $0.disablesAnimations = true } }
-            }.modifier(ContentTopChrome(enabled: fullPage))
+            }
         }.font(.system(size: theme.chatFontSize)).clipped()
             .animation(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil : .easeInOut(duration: 0.22), value: store.chatHistoryVisible)
     }
@@ -790,14 +793,6 @@ struct AIChatSidebar: View {
                 Image(systemName: "sparkles").foregroundStyle(Style.accent)
                 Text("AI 聊天").font(.system(size: 13, weight: .semibold)).lineLimit(1)
                 Spacer(minLength: 0)
-                if fullPage {
-                    HStack(spacing: 3) {
-                        GlyphButton(symbol: "square.and.arrow.up", label: "导出 Markdown", size: 28, action: exportMarkdown)
-                            .disabled(session.messages.isEmpty)
-                        GlyphButton(symbol: "square.and.pencil", label: "新对话", size: 28, action: newChat)
-                        WindowTools(store: store)
-                    }
-                }
                 if !fullPage {
                     Button(action: newChat) { Image(systemName: "square.and.pencil") }.help("新对话")
                         .accessibilityLabel("新对话")
@@ -823,14 +818,13 @@ struct AIChatSidebar: View {
                     Button { store.openChat(owner: tab) } label: { Image(systemName: "arrow.up.left.and.arrow.down.right") }.help("打开完整 Chat")
                     Button(action: close) { Image(systemName: "sidebar.right") }.help("收起 AI 侧栏")
                 }
-            }.buttonStyle(.plain).padding(.horizontal, 12).padding(.leading, windowControlsInset)
-                .frame(minHeight: fullPage ? 44 : 40).background(Style.paper)
-                .background { if fullPage { WindowDragArea() } }.zIndex(10)
+            }.buttonStyle(.plain).padding(.horizontal, 12)
+                .frame(minHeight: 40).background(Style.paper).zIndex(10)
     }
     private var chatContent: some View {
         AIChatPage(controller: page, store: store, ai: ai, owner: tab, fullPage: fullPage)
             .onAppear {
-                ai.classifyWebConversations(owners: Set(store.tabs.filter { !$0.address.isEmpty && $0.chatOwner == nil }.map { $0.aiOwner ?? $0.id }))
+                ai.classifyWebConversations(owners: Set(store.tabs.filter { !$0.address.isEmpty && !$0.isChat }.map { $0.aiOwner ?? $0.id }))
             }
     }
     private func newChat() {
@@ -852,8 +846,12 @@ struct AIChatSidebar: View {
     private var history: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text(showArchived ? "已归档对话" : "历史对话").font(.system(size: theme.chatFontSize, weight: .semibold))
-                Spacer()
+                Label { Text("AI 聊天") } icon: { Image(systemName: "sparkles").foregroundStyle(Style.accent) }
+                    .font(.system(size: 13, weight: .semibold))
+                Spacer(minLength: 0)
+                GlyphButton(symbol: "square.and.arrow.up", label: "导出 Markdown", size: 24, action: exportMarkdown)
+                    .disabled(session.messages.isEmpty)
+                GlyphButton(symbol: "square.and.pencil", label: "新对话", size: 24, action: newChat)
             }.padding(.bottom, 8)
             AIHistoryList(conversations: showArchived ? ai.archivedConversations : ai.activeConversations, active: ai.sessions[tab]?.id,
                           open: { store.openChat(conversation: $0) },

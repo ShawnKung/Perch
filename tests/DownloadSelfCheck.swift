@@ -337,7 +337,7 @@ enum DownloadSelfCheck {
             try await Task.sleep(nanoseconds: 200_000_000)
         }
         window.makeKeyAndOrderFront(nil)
-        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+        NSApp.activate(ignoringOtherApps: true)
         try await AISelfCheck.wait { NSApp.isActive && window.isKeyWindow }
         let rowPoint = try await web.evaluateJavaScript("""
             const rect=document.querySelector('.row').getBoundingClientRect();

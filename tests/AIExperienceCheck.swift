@@ -904,6 +904,19 @@ extension AISelfCheck {
             precondition(ai.send("Background fixture " + runB, tab: ownerB, browser: nil, usePage: false))
             let b = ai.sessions[ownerB]!.id, requestB = ai.sessions[ownerB]!.requestID!
             ai.drafts[ownerB] = "B unfinished draft"
+            let firstChatID = store.selected!
+            try await wait { AIChatPageSelfCheck.find(host) != nil }
+            let sharedWeb = AIChatPageSelfCheck.find(host)!
+            store.newTab(address: "perch://chat")
+            let secondChatID = store.selected!
+            for id in [firstChatID, secondChatID, firstChatID, secondChatID] {
+                store.activate(id)
+                try await wait { AIChatPageSelfCheck.find(host) === sharedWeb }
+                precondition(store.chatOwner == ownerB && ai.sessions[ownerA]?.requestID == requestA &&
+                             ai.sessions[ownerB]?.requestID == requestB && ai.drafts[ownerB] == "B unfinished draft")
+            }
+            store.close(firstChatID)
+            print("PASS: two running conversations survive switching multiple Chat tabs with one shared renderer")
             var changedModel = config
             changedModel.models = ["fixture", "alternate"]
             precondition(ai.save(changedModel))
@@ -972,7 +985,7 @@ extension AISelfCheck {
             store.aiVisible = false; store.aiVisible = true
             store.openChat(conversation: b)
             precondition(store.chatOwner == ownerB && ai.sessions[ownerB]?.requestID == requestB)
-            precondition(store.tabs.filter { $0.chatOwner != nil }.count == 1)
+            precondition(store.tabs.filter(\.isChat).count == 1)
             try await release(runB, "waiting", expectRequest: false)
             try await wait { ai.sessions[ownerB]?.phase == .thinking }
             precondition(ai.send("Background fixture " + UUID().uuidString, tab: ownerB, browser: nil, usePage: false))

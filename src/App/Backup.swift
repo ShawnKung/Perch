@@ -207,6 +207,7 @@ struct SettingsBackup: Codable {
             var value = group; value.id = UUID()
             value.hiddenTabs = group.hiddenTabs?.map { tab in
                 var page = tab; page.id = UUID(); page.groupID = value.id
+                page.migrateChat()
                 page.chatOwner = nil; page.aiOwner = nil; page.aiSidebarOpen = nil
                 return page
             }

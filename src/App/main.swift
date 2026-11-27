@@ -134,6 +134,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     let previewDefaults: UserDefaults
     let downloads: DownloadController?
     let downloadsPage = DownloadsPageBridge()
+    let historyPage = HistoryPageBridge()
     @Published var address = ""
     @Published var title = ""
     @Published var loading = false
@@ -211,8 +212,9 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         let bridge = PasswordBridge()
         passwordBridge = bridge
         let configuration = WKWebViewConfiguration()
-        configuration.setURLSchemeHandler(DownloadsSchemeHandler(), forURLScheme: "perch")
+        configuration.setURLSchemeHandler(InternalPageSchemeHandler(), forURLScheme: "perch")
         InternalPage.install("downloads", handler: downloadsPage, in: configuration)
+        InternalPage.install("history", handler: historyPage, in: configuration, bridge: "perchHistory")
         if startsAtHome { configuration.setURLSchemeHandler(HomeHistoryPage(), forURLScheme: "perch-home") }
         configuration.websiteDataStore = dataStore ?? .default()
         configuration.userContentController.add(selectionTracker, contentWorld: .defaultClient, name: "perchSelection")
@@ -231,6 +233,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         webView = PageWebView(frame: .zero, configuration: configuration)
         downloadsPage.web = webView
         downloadsPage.downloads = downloads
+        historyPage.web = webView
         super.init()
         webView.extendMenu = { [weak self] menu in self?.extendContextMenu(menu) }
         webView.navigationDelegate = self
@@ -495,6 +498,8 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         title = webView.title ?? ""
         if DownloadsPage.matches(webView.url) { downloadsPage.start() }
         else { downloadsPage.stop() }
+        if HistoryPage.matches(webView.url) { historyPage.start() }
+        else { historyPage.stop() }
         address = displayAddress(webView.url)
         if startsAtHome && firstHomeDestination == nil { onHomeChanged?(isHome) }
         syncNavigationState()
@@ -506,6 +511,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         error = nil; httpAlternative = nil
         syncNavigationState()
         title = webView.title ?? ""
+        historyPage.restoreView()
         if isHome {
             if let destination = firstHomeDestination { load(destination) }
             else { onHomeChanged?(true) }
@@ -546,6 +552,8 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
               ["http", "https", "about"].contains(url.scheme?.lowercased() ?? "") ||
                 (downloads != nil && ["blob", "data"].contains(url.scheme?.lowercased() ?? "")) ||
                 DownloadsPage.matches(url) ||
+                HistoryPage.matches(url) ||
+                ChatPage.matches(url) ||
                 (startsAtHome && url == HomeHistoryPage.url && navigationAction.targetFrame?.isMainFrame == true) else {
             error = "此链接使用其他应用的专用协议，Perch 暂不支持打开。"
             decisionHandler(.cancel)
@@ -639,6 +647,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         downloadsPage.stop()
+        historyPage.stop()
         error = "网页进程已退出，点击重新加载即可恢复。"
     }
 }
@@ -683,7 +692,7 @@ final class Store: ObservableObject {
             ai.referenceClosed(page.id, reference: AIPageReference(title: page.title, url: parts?.url))
         }
         let retained = tabs + tabGroups.flatMap { $0.hiddenTabs ?? [] }
-        ai.retainTabs(Set(retained.map(\.id) + retained.compactMap(\.chatOwner) + retained.compactMap(\.aiOwner) + [AIController.homeID]))
+        ai.retainTabs(Set(retained.map(\.id) + retained.compactMap(\.aiOwner) + [AIController.homeID, fullChatOwner]))
     } }
     @Published var history: [Visit] = [] { didSet { suggestionRevision &+= 1 } }
     @Published var tabGroups: [TabGroup] = []
@@ -727,7 +736,6 @@ final class Store: ObservableObject {
         }
         if pendingAddressFocus != selected { pendingAddressFocus = nil }
         if oldValue != selected, let oldValue { browsers[oldValue]?.passwordBridge.dismiss() }
-        if oldValue != selected && isChatPage { chatHistoryVisible = true }
         if oldValue != selected { selectionChanged?(oldValue, selected) }
         persistTabs()
     } }
@@ -793,6 +801,7 @@ final class Store: ObservableObject {
     var applyHotkeys: ((BrowserSettings) throws -> Void)?
     var shortcutRecording: ((Bool) -> Void)?
     var prepareTabSelection: (() -> Void)?
+    var prepareNavigation: (() -> Void)?
     var selectionChanged: ((UUID?, UUID?) -> Void)?
     var homeAddressDrafts: [UUID: [Bool: String]] = [:]
 
@@ -828,14 +837,19 @@ final class Store: ObservableObject {
             protectedKeys.insert("tabGroups"); tabGroups = []
             notice = "标签组数据无法读取，已保留原数据。\(error.localizedDescription)"
         }
-        tabs = restoredTabs.filter { $0.chatOwner == nil || $0.id == chatTab?.id }
+        fullChatOwner = defaults.string(forKey: "fullChatOwner").flatMap(UUID.init(uuidString:)) ??
+            chatTab?.chatOwner ?? tabGroups.flatMap { $0.hiddenTabs ?? [] }.compactMap(\.chatOwner).first ?? AIController.homeID
+        tabs = restoredTabs.map { var tab = $0; tab.migrateChat(); return tab }
+        for index in tabGroups.indices {
+            tabGroups[index].hiddenTabs = tabGroups[index].hiddenTabs?.map { var tab = $0; tab.migrateChat(); return tab }
+        }
         // Tabs and group metadata form one logical snapshot; preserve both if either cannot be decoded.
         if protectedKeys.contains("tabs") || protectedKeys.contains("tabGroups") {
             protectedKeys.formUnion(["tabs", "tabGroups"])
         }
         normalizeTabGroups()
         let savedPages = tabs + tabGroups.flatMap { $0.hiddenTabs ?? [] }
-        ai.classifyWebConversations(owners: Set(savedPages.filter { !$0.address.isEmpty && $0.chatOwner == nil }.map { $0.aiOwner ?? $0.id }))
+        ai.classifyWebConversations(owners: Set(savedPages.filter { !$0.address.isEmpty && !$0.isChat }.map { $0.aiOwner ?? $0.id }))
         for tab in tabs { icons[tab.id] = FaviconCache.image(for: tab.address, defaults: defaults) }
         history = restore([Visit].self, key: "history") ?? []
         importedBookmarks = restore([String: [BookmarkNode]].self, key: "importedBookmarks") ?? [:]
@@ -844,11 +858,11 @@ final class Store: ObservableObject {
             selected = id
             activate(id, select: false)
         }
-        if tabs.count != restoredTabs.count { persistTabs() }
+        if tabs != restoredTabs { persistTabs() }
     }
 
     var browser: Browser? {
-        guard let selected, tabs.contains(where: { $0.id == selected && !$0.address.isEmpty && $0.chatOwner == nil }) else { return nil }
+        guard let selected, tabs.contains(where: { $0.id == selected && !$0.address.isEmpty && !$0.isChat }) else { return nil }
         return browsers[selected]
     }
     func cachedBrowser(for id: UUID) -> Browser? { browsers[id] }
@@ -863,7 +877,7 @@ final class Store: ObservableObject {
         guard let page = AIController.pageURL(url),
               let safeURL = URLInput.parse(url.absoluteString, search: false) else { return }
         if let tab = tabs.first(where: { tab in
-            guard tab.chatOwner == nil, let address = URL(string: browsers[tab.id]?.address ?? tab.address) else { return false }
+            guard !tab.isChat, let address = URL(string: browsers[tab.id]?.address ?? tab.address) else { return false }
             return AIController.pageURL(address) == page
         }) {
             activate(tab.id)
@@ -893,9 +907,9 @@ final class Store: ObservableObject {
             let view = Browser(url: url, userAgent: settings.userAgent,
                                dataStore: defaults === UserDefaults.standard ? .default() : .nonPersistent(),
                                trackHoverLinks: true, previewDefaults: defaults, startsAtHome: startsAtHome, downloads: downloads)
+            view.historyPage.store = self
             view.onHomeChanged = { [weak self, weak view] home in
-                guard let self, let view, let index = self.tabs.firstIndex(where: { $0.id == id }),
-                      self.tabs[index].chatOwner == nil else { return }
+                guard let self, let view, let index = self.tabs.firstIndex(where: { $0.id == id }) else { return }
                 self.tabs[index].address = home ? "" : view.address
                 self.tabs[index].title = home ? "新标签页" :
                     (view.title.isEmpty ? URL(string: view.address)?.host ?? view.address : view.title)
@@ -990,12 +1004,20 @@ final class Store: ObservableObject {
         else { newTab(address: DownloadsPage.url.absoluteString, title: "下载记录") }
     }
 
+    func openHistory() {
+        if let tab = tabs.first(where: { HistoryPage.matches(URL(string: $0.address)) }) { activate(tab.id) }
+        else { newTab(address: HistoryPage.url.absoluteString, title: "历史记录") }
+    }
+
     @Published var chatHistoryVisible = true
+    @Published var fullChatOwner = AIController.homeID {
+        didSet { defaults.set(fullChatOwner.uuidString, forKey: "fullChatOwner") }
+    }
     var chatOwner: UUID {
         let page = tabs.first(where: { $0.id == selected })
-        return page?.chatOwner ?? page?.aiOwner ?? selected ?? AIController.homeID
+        return page?.isChat == true ? fullChatOwner : page?.aiOwner ?? selected ?? AIController.homeID
     }
-    var isChatPage: Bool { tabs.first(where: { $0.id == selected })?.chatOwner != nil }
+    var isChatPage: Bool { tabs.first(where: { $0.id == selected })?.isChat == true }
     var currentPageURL: URL? {
         guard !isChatPage, let page = tabs.first(where: { $0.id == selected }),
               let url = URL(string: browser?.address.isEmpty == false ? browser!.address : page.address),
@@ -1009,7 +1031,7 @@ final class Store: ObservableObject {
         }
     }
     func askAI(_ selection: WebSelection, tabID: UUID) {
-        guard tabs.contains(where: { $0.id == tabID && $0.chatOwner == nil }),
+        guard tabs.contains(where: { $0.id == tabID && !$0.isChat }),
               browsers[tabID]?.webView.url == selection.url,
               let url = AIController.pageURL(selection.url), !selection.text.isEmpty else { return }
         let quote = AIQuote(messageID: nil, text: selection.text,
@@ -1029,7 +1051,7 @@ final class Store: ObservableObject {
         let context = isChatPage || browser == nil ? AIController.homeID : selected ?? AIController.homeID
         let owner = ai.newChatOwner(context: context, previous: previous)
         if let index = tabs.firstIndex(where: { $0.id == selected }) {
-            if isChatPage { tabs[index].chatOwner = owner }
+            if isChatPage { fullChatOwner = owner }
             else { tabs[index].aiOwner = owner }
             persistTabs()
         }
@@ -1042,37 +1064,27 @@ final class Store: ObservableObject {
         persistTabs()
     }
     func openChat(owner: UUID? = nil, conversation: UUID? = nil) {
-        let owner = conversation.map { ai.resumeConversation($0, tab: UUID()) } ?? owner ?? chatOwner
-        if let index = tabs.firstIndex(where: { $0.chatOwner != nil }) {
-            let chatID = tabs[index].id
-            tabs[index].chatOwner = owner
-            tabs.removeAll { $0.chatOwner != nil && $0.id != chatID }
-            activate(chatID)
+        if let conversation { fullChatOwner = ai.resumeConversation(conversation, tab: fullChatOwner) }
+        else if let owner { fullChatOwner = owner }
+        else if !isChatPage, aiVisible || ai.drafts[chatOwner]?.isEmpty == false || ai.sessions[chatOwner] != nil ||
+                    ai.draftFiles[chatOwner]?.isEmpty == false || ai.draftQuotes[chatOwner] != nil {
+            fullChatOwner = chatOwner
         }
-        else if let index = tabs.firstIndex(where: { $0.id == selected && $0.address.isEmpty && $0.chatOwner == nil }) {
-            if let browser = browsers.removeValue(forKey: tabs[index].id) {
-                browser.onHomeChanged = nil; browser.onVisit = nil; browser.onTitleChanged = nil
-                browser.passwordBridge.dismiss(); browser.favicon.reset(); browser.webView.stopLoading()
-                browser.webView.removeFromSuperview()
-            }
-            tabs[index].chatOwner = owner; tabs[index].title = "Chat"
-            activate(tabs[index].id)
+        if !isChatPage {
+            if selected == nil || tabs.first(where: { $0.id == selected })?.address.isEmpty == true {
+                navigate(ChatPage.url.absoluteString)
+            } else { newTab(address: ChatPage.url.absoluteString, title: "AI 聊天") }
         }
-        else {
-            let tab = Tab(title: "Chat", address: "", chatOwner: owner)
-            tabs.append(tab); activate(tab.id)
-        }
-        chatHistoryVisible = true
         aiVisible = false
     }
     func referenceBrowser(_ id: UUID) -> Browser? {
-        guard tabs.contains(where: { $0.id == id && !$0.address.isEmpty && $0.chatOwner == nil }) else { return nil }
+        guard tabs.contains(where: { $0.id == id && !$0.address.isEmpty && !$0.isChat }) else { return nil }
         activate(id, select: false); return browsers[id]
     }
-    var loadedReferencePages: [Browser] { tabs.filter { !$0.address.isEmpty && $0.chatOwner == nil }.compactMap { browsers[$0.id] } }
+    var loadedReferencePages: [Browser] { tabs.filter { !$0.address.isEmpty && !$0.isChat }.compactMap { browsers[$0.id] } }
     func restoreReference(_ reference: AIPageReference) -> Browser? {
         func matches(_ tab: Tab) -> Bool {
-            guard tab.chatOwner == nil, let url = URL(string: tab.address) else { return false }
+            guard !tab.isChat, let url = URL(string: tab.address) else { return false }
             var parts = URLComponents(url: url, resolvingAgainstBaseURL: false)
             parts?.user = nil; parts?.password = nil; parts?.query = nil; parts?.fragment = nil
             return parts?.url == reference.url
@@ -1100,7 +1112,7 @@ final class Store: ObservableObject {
         for var closed in removed {
             if remember {
                 homeAddressDrafts[closed.id] = nil
-                if closed.chatOwner == nil { closed.aiOwner = closed.aiOwner ?? closed.id }
+                if !closed.isChat { closed.aiOwner = closed.aiOwner ?? closed.id }
                 recentlyClosed.append(closed)
             }
             if let browser = browsers.removeValue(forKey: closed.id) {
@@ -1120,9 +1132,6 @@ final class Store: ObservableObject {
 
     func reopen() {
         guard var tab = recentlyClosed.popLast() else { return }
-        if tab.chatOwner != nil, let existing = tabs.first(where: { $0.chatOwner != nil }) {
-            activate(existing.id); return
-        }
         tab.id = UUID()
         if let groupID = tab.groupID, let last = tabs.lastIndex(where: { $0.groupID == groupID }) {
             tabs.insert(tab, at: last + 1)
@@ -1235,10 +1244,6 @@ final class Store: ObservableObject {
     func openTabGroup(_ id: UUID, tabID: UUID? = nil) {
         guard let group = tabGroups.first(where: { $0.id == id }) else { return }
         if let saved = group.hiddenTabs {
-            // The app has one full Chat page; restoring its saved owner replaces the current Chat page.
-            if saved.contains(where: { $0.chatOwner != nil }), let chat = tabs.first(where: { $0.chatOwner != nil }) {
-                close(chat.id)
-            }
             guard let index = tabGroups.firstIndex(where: { $0.id == id }) else { return }
             var restored = saved
             var selection = tabID
@@ -1270,7 +1275,7 @@ final class Store: ObservableObject {
         tabGroups.removeAll { $0.id == id }
         for index in recentlyClosed.indices where recentlyClosed[index].groupID == id { recentlyClosed[index].groupID = nil }
         let retained = tabs + tabGroups.flatMap { $0.hiddenTabs ?? [] }
-        ai.retainTabs(Set(retained.map(\.id) + retained.compactMap(\.chatOwner) + retained.compactMap(\.aiOwner) + [AIController.homeID]))
+        ai.retainTabs(Set(retained.map(\.id) + retained.compactMap(\.aiOwner) + [AIController.homeID, fullChatOwner]))
         persistTabs()
     }
 
@@ -1345,6 +1350,7 @@ final class Store: ObservableObject {
         persist(tabs, key: "tabs")
         persist(tabGroups, key: "tabGroups")
         defaults.set(selected?.uuidString, forKey: "selectedTab")
+        defaults.set(fullChatOwner.uuidString, forKey: "fullChatOwner")
     }
 
     func mergeHistory(_ visits: [Visit]) {
@@ -1481,7 +1487,9 @@ final class Store: ObservableObject {
             notice = "请输入有效的 http / https 网址，或输入关键词搜索。"
             return
         }
-        if let selected, let browser = browsers[selected], !isChatPage {
+        pendingAddressFocus = nil
+        prepareNavigation?()
+        if let selected, let browser = browsers[selected] {
             if let index = tabs.firstIndex(where: { $0.id == selected }) {
                 tabs[index].address = url.absoluteString
                 tabs[index].title = url.host ?? url.absoluteString
@@ -2198,7 +2206,7 @@ struct WindowTools: View {
     init(store: Store) {
         self.store = store
         chatPage = store.isChatPage; aiVisible = store.aiVisible; pinned = store.pinned
-        hasBrowser = store.browser != nil
+        hasBrowser = store.selected.flatMap { store.cachedBrowser(for: $0) } != nil
         canClearCookies = store.browser?.webView.url?.host != nil && !store.isChatPage
     }
     var body: some View {
@@ -2214,12 +2222,13 @@ struct WindowTools: View {
             DownloadToolbarButton(downloads: store.downloads) { store.openDownloads() }
             Menu {
                 Button("书签管理") { store.openBookmarks() }
-                Button("历史记录") { store.openBookmarks(scope: .history) }
+                Button { store.openHistory() } label: { Label("历史记录", systemImage: "clock.arrow.circlepath") }
                 Button("下载记录") { store.openDownloads() }
                 Button("密码管理") { store.library = .passwords }
                 Divider()
                 Button("在新标签页打开") {
-                    if let url = URLInput.parseNavigation(store.browser?.address ?? "", search: false) { store.newTab(address: url.absoluteString) }
+                    if let id = store.selected, let address = store.tabs.first(where: { $0.id == id })?.address,
+                       let url = URLInput.parseNavigation(address, search: false) { store.newTab(address: url.absoluteString) }
                 }.disabled(!hasBrowser)
                 Divider()
                 Button("回到首页") { store.selected = nil }
@@ -2563,6 +2572,7 @@ final class Panel: NSPanel {
     func bindTabFocus(to store: Store) {
         selectedTab = store.selected
         store.prepareTabSelection = { [weak self, weak store] in self?.captureFocus(for: store?.selected) }
+        store.prepareNavigation = { [weak self] in self?.endAddressEditing() }
         store.selectionChanged = { [weak self, weak store] old, new in
             self?.captureFocus(for: old)
             self?.selectedTab = new
@@ -2577,6 +2587,8 @@ final class Panel: NSPanel {
 
     private func captureFocus(for tab: UUID?) {
         guard let tab, let view = firstResponder as? NSView, view.window === self else { return }
+        // The neutral tab root is a transition target, not a user's saved editing position.
+        if view is ChatContentContainer { return }
         // NSTextField is a transient responder while AppKit attaches its actual field editor.
         if view is NSTextField { return }
         if let editor = view as? NSTextView, editor.isFieldEditor, !(editor.delegate is NSTextField) { return }
@@ -2844,8 +2856,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             ("新建标签页", #selector(newTab), "t", false),
             ("关闭标签页", #selector(closeTab), "w", false),
             ("重新打开关闭的标签页", #selector(reopenTab), "t", true),
-            ("设置…", #selector(settings), ",", false),
-            ("历史记录", #selector(history), "y", false)
+            ("设置…", #selector(settings), ",", false)
         ] {
             let item = appMenu.addItem(withTitle: title, action: action, keyEquivalent: shift ? key.uppercased() : key)
             item.target = self
@@ -2897,13 +2908,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     @objc func reopenTab() { guard store.library == nil && !store.adding else { return }; store.reopen() }
     @objc func settings() { store.library = .settings }
-    @objc func history() { store.openBookmarks(scope: .history) }
     @objc func focusAddress() { NotificationCenter.default.post(name: .focusAddress, object: nil) }
     private var activeBrowser: Browser? { panel?.attachedSheet == nil && store.library == nil && !store.adding ? store.browser : nil }
     @objc func reloadPage() { activeBrowser?.webView.reload() }
     @objc func reloadFromOrigin() { activeBrowser?.webView.reloadFromOrigin() }
     private var navigationBrowser: Browser? {
-        guard panel?.attachedSheet == nil, store.library == nil, !store.adding, !store.isChatPage,
+        guard panel?.attachedSheet == nil, store.library == nil, !store.adding,
               let id = store.selected else { return nil }
         return store.cachedBrowser(for: id)
     }
@@ -3072,6 +3082,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 enum Perch {
 @MainActor
 static func main() throws {
+if CommandLine.arguments.contains(where: { $0.hasSuffix("-self-test") || $0 == "--verify-preview" }) {
+    _ = SelfCheckApplication.shared
+}
 var appearanceDefaults = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
 appearanceDefaults["AppleShowScrollBars"] = "WhenScrolling"
 UserDefaults.standard.setVolatileDomain(appearanceDefaults, forName: UserDefaults.argumentDomain)
@@ -3107,6 +3120,14 @@ if CommandLine.arguments.contains("--update-self-test") {
     Task { @MainActor in
         setbuf(stdout, nil)
         do { try await HomePageSelfCheck.state(); exit(0) }
+        catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
+    }
+    app.run()
+} else if CommandLine.arguments.contains("--history-page-self-test") {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.regular)
+    Task { @MainActor in
+        do { try await HistoryPageSelfCheck.ui(); exit(0) }
         catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
     }
     app.run()
@@ -3262,7 +3283,7 @@ if CommandLine.arguments.contains("--update-self-test") {
     app.run()
 } else if CommandLine.arguments.contains("--ai-reading-self-test") {
     let app = NSApplication.shared
-    app.setActivationPolicy(.accessory)
+    app.setActivationPolicy(.regular)
     Task { @MainActor in
         do {
             try await AISelfCheck.readingUI(config: AIConfiguration(provider: .custom, baseURL: "http://127.0.0.1:9/v1", model: "synthetic"))

@@ -23,6 +23,7 @@ final class AIChatWebView: WKWebView {
         window?.acceptsMouseMovedEvents = true
         hoverTracker = window == nil ? nil : AIWebHoverTracker(web: self, world: .defaultClient)
         if window == nil { controller?.suspend() }
+        else { controller?.update() }
     }
 }
 
@@ -97,7 +98,7 @@ final class AIChatPageController: NSObject, ObservableObject, WKScriptMessageHan
         return object
     }
     func update() {
-        guard ready, let store, let web else { return }
+        guard ready, let store, let web, web.window != nil else { return }
         PerchTheme.shared.update(web)
         let value = session
         let provider = ai.provider(for: owner)
@@ -125,7 +126,7 @@ final class AIChatPageController: NSObject, ObservableObject, WKScriptMessageHan
             web.evaluateJavaScript(AIMarkdownView.asset("mermaid.js") ?? "", in: nil, in: .defaultClient) { [weak self] _ in self?.update() }
         }
         markdown.sources = value.messages.flatMap { $0.searchSources ?? [] }
-        let pages = store.tabs.filter { !$0.address.isEmpty && $0.chatOwner == nil }
+        let pages = store.tabs.filter { !$0.address.isEmpty && !$0.isChat }
         let files: [[String: Any]] = (ai.draftFiles[owner] ?? []).map {
             var item: [String: Any] = ["id": $0.id.uuidString, "name": $0.name]
             if $0.isImage {
@@ -240,7 +241,7 @@ final class AIChatPageController: NSObject, ObservableObject, WKScriptMessageHan
                     let added = try await Task.detached { try urls.map(AIAttachment.read) }.value
                     guard !Task.isCancelled, self.owner == owner, self.session.id == conversation, self.canEdit,
                           let store = self.store,
-                          owner == AIController.homeID || store.tabs.contains(where: { $0.id == owner || $0.chatOwner == owner || $0.aiOwner == owner }) else { return }
+                          owner == AIController.homeID || owner == store.fullChatOwner || store.tabs.contains(where: { $0.id == owner || $0.aiOwner == owner }) else { return }
                     try self.addFiles(added, owner: owner)
                 } catch { if !Task.isCancelled { self.fail(error) } }
             }
@@ -311,7 +312,7 @@ final class AIChatPageController: NSObject, ObservableObject, WKScriptMessageHan
             }
             ai.draftQuotes[owner] = nil
         case "reference":
-            guard canEdit, let id, store.tabs.contains(where: { $0.id == id && !$0.address.isEmpty && $0.chatOwner == nil }) else { return }
+            guard canEdit, let id, store.tabs.contains(where: { $0.id == id && !$0.address.isEmpty && !$0.isChat }) else { return }
             if !(ai.draftReferences[owner] ?? []).contains(id) { ai.draftReferences[owner, default: []].append(id) }
             _ = store.referenceBrowser(id)
         case "edit", "fork":

@@ -8,6 +8,20 @@ import Security
 import Carbon
 import ApplicationServices
 
+// Self-checks dispatch their own process-local events; desktop input must not race their fixtures.
+final class SelfCheckApplication: NSApplication {
+    override func sendEvent(_ event: NSEvent) {
+        switch event.type {
+        case .mouseMoved, .mouseEntered, .mouseExited, .leftMouseDown, .leftMouseUp, .leftMouseDragged,
+             .rightMouseDown, .rightMouseUp, .rightMouseDragged, .otherMouseDown, .otherMouseUp,
+             .otherMouseDragged, .scrollWheel, .keyDown, .keyUp, .flagsChanged:
+            guard event.cgEvent?.getIntegerValueField(.eventSourceUnixProcessID) == Int64(getpid()) else { return }
+        default: break
+        }
+        super.sendEvent(event)
+    }
+}
+
 enum SelfTests {
     @MainActor
     static func prepareAccessibility() {
@@ -60,7 +74,7 @@ enum SelfTests {
         controller.update(store: store, controlsInset: 0)
         precondition(controller.tabViewItems.count == 1, "Unvisited tabs must not create content controllers")
         let original = controller.tabViewItems[0].viewController!
-        let page = (original as! NSHostingController<TabContentView>).rootView.page
+        let page = (original as! TabContentController).rootView.page
         var updates = 0
         let observation = page.objectWillChange.sink { updates += 1 }
         defer { observation.cancel() }
@@ -76,7 +90,7 @@ enum SelfTests {
         controller.update(store: store, controlsInset: 24)
         precondition(controller.tabViewItems[controller.selectedTabViewItemIndex].viewController === original,
                      "Returning to a visited tab must retain its controller")
-        precondition((original as! NSHostingController<TabContentView>).rootView.controlsInset == 24)
+        precondition((original as! TabContentController).rootView.controlsInset == 24)
         store.close(second)
         controller.update(store: store, controlsInset: 24)
         precondition(controller.tabViewItems.count == 1 && controller.tabViewItems[0].viewController === original)
@@ -131,6 +145,7 @@ enum SelfTests {
     @MainActor
     static func run() throws {
         try DownloadSelfCheck.data()
+        try HistoryPageSelfCheck.data()
         try BackupSelfCheck.run()
         try savedTabGroups()
         tabGroupCreation()
@@ -608,12 +623,13 @@ enum SelfTests {
         precondition(restored.tabs.count == 1 && restored.tabGroups.isEmpty)
         precondition(Store(defaults: defaults).tabGroups.isEmpty)
         restored.openChat(owner: UUID())
-        let chatID = restored.selected!, chatOwner = restored.chatOwner
+        let chatID = restored.selected!
         let chatGroup = restored.createTabGroup(chatID)!
         restored.hideTabGroup(chatGroup)
         restored.openChat(owner: UUID())
+        let chatOwner = restored.chatOwner
         restored.openTabGroup(chatGroup)
-        precondition(restored.tabs.filter { $0.chatOwner != nil }.map(\.id) == [chatID] && restored.chatOwner == chatOwner)
+        precondition(restored.tabs.filter(\.isChat).count == 2 && restored.chatOwner == chatOwner)
         restored.deleteTabGroup(chatGroup)
         restored.newTab(address: "http://127.0.0.1:9/before")
         let webID = restored.selected!, webGroup = restored.createTabGroup(webID)!
@@ -789,6 +805,18 @@ enum SelfTests {
         table.otherMouseUp(with: event(1, .otherMouseUp))
         precondition(closed == [target], "Native row hit-testing must close exactly the pressed ID once")
         print("PASS: native table middle-button hit-testing, pointer drift, reorder cancellation and single close")
+        closed = []
+        var live = Set(table.ids)
+        table.isTabOpen = { live.contains($0) }
+        table.closeTab = { live.remove($0); closed.append($0) }
+        table.animatingRows = true
+        for _ in 0..<4 {
+            table.otherMouseDown(with: event(0, .otherMouseDown))
+            table.otherMouseUp(with: event(0, .otherMouseUp))
+        }
+        precondition(closed == table.ids && live.isEmpty,
+                     "Stationary middle clicks must close each live tab once while outgoing rows still animate")
+        print("PASS: continuous middle clicks skip retained closing rows without waiting for animations")
         let hoverCell = TabCell(frame: NSRect(x: 0, y: 0, width: 200, height: 40))
         hoverCell.configure(Tab(title: "A long synthetic tab title", address: ""), image: nil, compact: false)
         hoverCell.layoutSubtreeIfNeeded()
@@ -1957,7 +1985,7 @@ final class LayoutSelfCheck {
         catch { fputs("FAIL: HTML home drag: \(error)\n", stderr); exit(1) }
     }
     private func clickInPanel(_ point: NSPoint) async {
-        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+        NSApp.activate(ignoringOtherApps: true)
         panel.focusWindow()
         for _ in 0..<60 where !NSApp.isActive || !panel.isKeyWindow {
             try? await Task.sleep(nanoseconds: 16_000_000)
@@ -1979,7 +2007,7 @@ final class LayoutSelfCheck {
         func precondition(_ condition: @autoclosure () -> Bool, _ message: String = "", line: UInt = #line) {
             if !condition() { fputs("FAIL: tab groups line \(line): \(message)\n", stderr); exit(1) }
         }
-        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+        NSApp.activate(ignoringOtherApps: true)
         panel.focusWindow()
         await settle()
         let savedTabs = store.tabs, savedGroups = store.tabGroups, savedSelection = store.selected
@@ -2230,7 +2258,7 @@ final class LayoutSelfCheck {
         func check(_ condition: @autoclosure () -> Bool, _ message: String) {
             if !condition() { fputs("FAIL: saved group manager: \(message)\n", stderr); exit(1) }
         }
-        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+        NSApp.activate(ignoringOtherApps: true)
         panel.sheets.first?.makeKeyAndOrderFront(nil)
         SelfTests.prepareAccessibility()
         await settle()
@@ -2672,7 +2700,10 @@ final class LayoutSelfCheck {
             return find(root)
         }
         func clickAt(_ point: NSPoint, window: NSWindow) async {
+            NSApp.activate(ignoringOtherApps: true)
             window.makeKeyAndOrderFront(nil)
+            do { try await AISelfCheck.wait { NSApp.isActive && window.isKeyWindow } }
+            catch { check(false, "Bookmark input window did not acquire focus: \(error)"); return }
             NSApp.postEvent(NSEvent.mouseEvent(with: .leftMouseUp, location: point, modifierFlags: [],
                 timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
                 context: nil, eventNumber: 1, clickCount: 1, pressure: 0)!, atStart: true)
@@ -2705,9 +2736,10 @@ final class LayoutSelfCheck {
         guard let popup = store.bookmarkEditor.window else {
             check(false, "Missing editor window"); return
         }
-        func verifyPlacement(_ label: String) {
-            guard let node = element(panel.contentView!, label: label),
-                  let rect = (node.value(forKey: "accessibilityFrame") as? NSValue)?.rectValue,
+        func verifyPlacement(_ label: String, rect suppliedRect: NSRect? = nil) {
+            let nativeRect = element(panel.contentView!, label: label)
+                .flatMap { ($0.value(forKey: "accessibilityFrame") as? NSValue)?.rectValue }
+            guard let rect = suppliedRect ?? nativeRect,
                   let editor = store.bookmarkEditor.window else { check(false, "Missing placement fixture"); return }
             check(editor.styleMask.contains(.borderless) && editor.parent === panel, "Editor must be a plain child window")
             let gap = rect.minY - editor.frame.maxY
@@ -2780,6 +2812,23 @@ final class LayoutSelfCheck {
         fflush(stdout)
         store.newTab()
         await settle()
+        let fixture = HomePageFixture(store: store, panel: panel)
+        guard let home = try? await fixture.home(), let site = store.bookmark(for: address) else {
+            check(false, "Missing HTML home fixture"); return
+        }
+        let shortcut = ".shortcut[data-id='\(site.id.uuidString)']"
+        func shortcutRect() async -> NSRect {
+            let result = try? await home.callAsyncJavaScript("""
+                const rect=document.querySelector(selector).getBoundingClientRect();
+                return {x:rect.x,y:rect.y,width:rect.width,height:rect.height};
+                """, arguments: ["selector": shortcut], in: nil, contentWorld: .defaultClient)
+            guard let rect = result as? [String: Double],
+                  let x = rect["x"], let y = rect["y"], let width = rect["width"], let height = rect["height"] else {
+                check(false, "Missing HTML home shortcut"); return .zero
+            }
+            return panel.convertToScreen(home.convert(NSRect(x: x, y: home.isFlipped ? y : home.bounds.height-y-height,
+                                                               width: width, height: height), to: nil))
+        }
         trackedWebMenu = nil
         let observer = NotificationCenter.default.addObserver(forName: NSMenu.didBeginTrackingNotification, object: nil, queue: .main) { [weak self] note in
             MainActor.assumeIsolated {
@@ -2793,10 +2842,7 @@ final class LayoutSelfCheck {
         func menu() async -> NSMenu {
             trackedWebMenu = nil
             panel.focusWindow()
-            guard let node = element(panel.contentView!, label: "首页菜单合成书签"),
-                  let rect = (node.value(forKey: "accessibilityFrame") as? NSValue)?.rectValue else {
-                check(false, "Missing home shortcut"); return NSMenu()
-            }
+            let rect = await shortcutRect()
             let point = panel.convertPoint(fromScreen: NSPoint(x: rect.midX, y: rect.midY))
             DispatchQueue.main.async {
                 NSApp.sendEvent(NSEvent.mouseEvent(with: .rightMouseDown, location: point, modifierFlags: [],
@@ -2820,7 +2866,7 @@ final class LayoutSelfCheck {
         await perform("编辑书签…", in: firstMenu)
         check(store.bookmarkEditor.window?.isVisible == true && store.bookmarkEditor.draft?.request.showAddress == true,
               "Home menu editing must include the address")
-        verifyPlacement("首页菜单合成书签")
+        verifyPlacement("首页菜单合成书签", rect: await shortcutRect())
         browser.webView.loadHTMLString("<title>Background bookmark fixture</title>",
                                       baseURL: URL(string: "http://127.0.0.1:9/background-bookmark"))
         for _ in 0..<20 where browser.address == address { await settle() }
@@ -2842,7 +2888,9 @@ final class LayoutSelfCheck {
         check(store.bookmark(for: address)?.title == forcedTitle, "Forced AppKit dismissal must save the draft before clearing it")
         let hideMenu = await menu()
         await perform("从首页移除", in: hideMenu)
-        check(store.bookmark(for: address)?.showOnHome == false && element(panel.contentView!, label: "首页菜单合成书签") == nil,
+        let removed = try? await home.callAsyncJavaScript("return !document.querySelector(selector);",
+            arguments: ["selector": shortcut], in: nil, contentWorld: .defaultClient)
+        check(store.bookmark(for: address)?.showOnHome == false && removed as? Bool == true,
               "Removing a shortcut must keep the bookmark and remove its actual home target")
         print("PASS: plain editor sits next to actual star/home buttons and follows parent movement; native editing, outside/forced dismissal and home menu actions")
         fflush(stdout)
@@ -2860,7 +2908,7 @@ final class LayoutSelfCheck {
         coordinator.controlTextDidChange(Notification(name: NSTextField.textDidChangeNotification, object: field))
     }
     func verifyHomeFocusRestoration() async {
-        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+        NSApp.activate(ignoringOtherApps: true)
         panel.focusWindow()
         await settle()
         let focusDeadline = Date().addingTimeInterval(3)
@@ -3274,7 +3322,7 @@ final class LayoutSelfCheck {
                     })()
                     """)
                 try? await Task.sleep(nanoseconds: 80_000_000)
-                if browser.hoverLinks?.site?.address == expected { return }
+                if browser.hoverLinks?.site?.address == expected { await focus(); return }
             }
             check(false, "Link preview fixture did not track \(selector)")
         }
@@ -3297,15 +3345,9 @@ final class LayoutSelfCheck {
             trigger.settingsChanged()
         }
         func focus() async {
-            let deadline = Date().addingTimeInterval(3)
-            while Date() < deadline {
-                NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
-                panel.focusWindow()
-                panel.makeFirstResponder(browser.webView)
-                await settle()
-                if NSApp.isActive && panel.isKeyWindow && browser.webView.window === panel { return }
-            }
-            check(false, "Link preview fixture could not activate its isolated window")
+            do { try await HomePageFixture(store: store, panel: panel).focus() }
+            catch { check(false, "Link preview fixture could not activate its isolated window: \(error)") }
+            panel.makeFirstResponder(browser.webView)
         }
         let isolated = try? await browser.webView.evaluateJavaScript("typeof window.webkit?.messageHandlers?.perchHoverLink")
         check(isolated as? String == "undefined", "Page scripts must not access the hover bridge")
@@ -3501,7 +3543,7 @@ final class LayoutSelfCheck {
         }
         precondition(root.bounds.size == NSSize(width: 780, height: 580),
                      "Settings must open at the shared bookmark manager size")
-        precondition(LibraryPage.allCases.map(\.rawValue) == ["常规", "AI", "书签与历史", "密码", "导入导出"],
+        precondition(LibraryPage.allCases.map(\.rawValue) == ["常规", "AI", "书签与分组", "密码", "导入导出"],
                      "Manager tabs must keep the requested labels and order")
         precondition(!(sheet.firstResponder is NSTextView), "Opening settings must not auto-focus numeric input")
         SelfTests.prepareAccessibility()
@@ -3542,7 +3584,7 @@ final class LayoutSelfCheck {
             return view.subviews.lazy.compactMap { numberField($0) }.first
         }
         let field = numberField(root)!
-        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+        NSApp.activate(ignoringOtherApps: true)
         sheet.makeKeyAndOrderFront(nil)
         sheet.makeFirstResponder(field)
         await settle()
@@ -3718,7 +3760,16 @@ final class LayoutSelfCheck {
         print("PASS: rendered sidebar resize gutter matches the sidebar background")
         await verifyWindowControlsLayout(handle: handle)
         await verifyLinkPreview()
-        await settle()
+        // Navigation checks above add pages; the drag scenario owns a fresh three-tab fixture.
+        for id in store.tabs.map(\.id) { store.close(id) }
+        for title in ["阅读", "工作", "新标签页"] { store.newTab(title: title) }
+        do {
+            try await AISelfCheck.wait {
+                let table = self.table()
+                return !table.animatingRows && !table.animatingGroups &&
+                    table.ids == self.store.tabs.map(\.id) && table.numberOfRows == self.store.tabs.count
+            }
+        } catch { fputs("FAIL: tab fixture animations did not settle: \(error)\n", stderr); exit(1) }
         if defaults.bool(forKey: "sidebarHidden") {
             verify(width: 32)
             defaults.set(false, forKey: "sidebarHidden")
@@ -3785,7 +3836,7 @@ final class LayoutSelfCheck {
         print("PASS: original-row pointer preview and single-tab no-op drag restore visible content")
         print("PASS: native row insertion preview in both directions, middle slot, stable hidden content during metadata changes and cancellation")
         await verifyTabGroups()
-        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+        NSApp.activate(ignoringOtherApps: true)
         panel.focusWindow()
         check(panel.shouldHideForStatusClick(), "Focusing the panel must establish status-click intent")
         let other = Panel(contentRect: NSRect(x: 100, y: 100, width: 160, height: 100),
@@ -3874,7 +3925,7 @@ final class LayoutSelfCheck {
         await settle()
         precondition(!table().enclosingScrollView!.hasVerticalScroller)
         }
-        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+        NSApp.activate(ignoringOtherApps: true)
         panel.focusWindow()
         await settle()
         _ = store.add(title: "地址建议合成书签", address: "http://127.0.0.1:9/suggestion-fixture")
@@ -4293,7 +4344,7 @@ final class LayoutSelfCheck {
         func check(_ condition: @autoclosure () -> Bool, _ message: String) {
             if !condition() { fputs("FAIL: group transition: \(message)\n", stderr); exit(1) }
         }
-        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+        NSApp.activate(ignoringOtherApps: true)
         panel.focusWindow()
         let savedTabs = store.tabs, savedGroups = store.tabGroups, savedSelection = store.selected
         let compact = defaults.bool(forKey: "sidebarHidden")
@@ -4633,7 +4684,7 @@ final class LayoutSelfCheck {
         let fixedToggleFrame = (initialToggle.value(forKey: "accessibilityFrame") as! NSValue).rectValue
         let firstRow = table().view(atColumn: 0, row: 0, makeIfNecessary: true)!
         let fixedFirstRowMidY = panel.convertToScreen(firstRow.convert(firstRow.bounds, to: nil)).midY
-        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+        NSApp.activate(ignoringOtherApps: true)
         panel.focusWindow()
         await settle()
         let previousDelegate = panel.delegate
@@ -4898,8 +4949,8 @@ enum NavigationSelfCheck {
         homeBrowser.goBack()
         try await AISelfCheck.wait(timeout: 10) { store.browser == nil && !homeBrowser.loading }
         store.openChat()
-        guard store.isChatPage, store.cachedBrowser(for: homeID) == nil else { throw PerchError("Home to Chat retained a web controller") }
-        print("PASS: home bookmark reuse/back, source/current group inheritance, batch bookmarks and home-to-Chat cleanup")
+        guard store.isChatPage, store.cachedBrowser(for: homeID) === homeBrowser else { throw PerchError("Home to Chat lost navigation history") }
+        print("PASS: home bookmark reuse/back, source/current group inheritance, batch bookmarks and home-to-Chat navigation")
         print("PASS: native home back/forward, URL/search branching, drafts, failed/pending navigation and tab isolation")
     }
 }

@@ -6,24 +6,8 @@ import Combine
 enum DownloadsPage {
     static let url = URL(string: "perch://downloads")!
     static func matches(_ url: URL?) -> Bool {
-        guard let url else { return false }
-        return url.scheme?.lowercased() == "perch" && url.host?.lowercased() == "downloads" &&
-            ["", "/"].contains(url.path) && url.query == nil && url.fragment == nil &&
-            url.user == nil && url.password == nil && url.port == nil
+        InternalPage.matches(url, host: "downloads")
     }
-}
-
-final class DownloadsSchemeHandler: NSObject, WKURLSchemeHandler {
-    func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
-        guard DownloadsPage.matches(task.request.url) else {
-            task.didFailWithError(URLError(.unsupportedURL)); return
-        }
-        let data = InternalPage.document("downloads")
-        task.didReceive(URLResponse(url: task.request.url!, mimeType: "text/html",
-                                   expectedContentLength: data.count, textEncodingName: "utf-8"))
-        task.didReceive(data); task.didFinish()
-    }
-    func webView(_ webView: WKWebView, stop task: WKURLSchemeTask) {}
 }
 
 @MainActor

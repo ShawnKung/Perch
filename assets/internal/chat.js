@@ -4,6 +4,8 @@
   const scroll = $('scroll'), messages = $('messages'), composer = $('composer');
   let state = null, revision = 0, composing = false, mention = null, mentionIndex = 0, focus = '';
   let followsBottom = true, anchor = null, applying = false, lastUser = '', edit = '', renderID = 0;
+  let restoredLayout = '';
+  const layoutSize = () => [scroll.clientWidth,scroll.clientHeight,messages.scrollHeight].join(':');
   const cards = new Map(), selections = new Map(), fileCards = new Set();
   window.nativeCitationHover = true;
   window.updateChatHover = (x,y) => {
@@ -92,6 +94,8 @@
   window.perchDiagramStyle = css => { style.textContent = css; };
   function capture() {
     if (!state || applying || !cards.size || scroll.clientHeight === 0) return;
+    // Layout-generated scroll events can arrive before ResizeObserver; preserve the previous anchor first.
+    if (layoutSize() !== restoredLayout) { restore(); return; }
     const top = scroll.getBoundingClientRect().top;
     const card = Array.from(messages.children).find(card => card.dataset.id && card.getBoundingClientRect().bottom > top) ||
       Array.from(messages.children).reverse().find(card => card.dataset.id);
@@ -102,6 +106,7 @@
   }
   function restore() {
     if (!state || scroll.clientHeight === 0) return;
+    restoredLayout = layoutSize();
     applying = true;
     if (followsBottom) scroll.scrollTop = scroll.scrollHeight;
     else if (anchor) {

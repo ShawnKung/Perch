@@ -44,20 +44,24 @@ struct HomePageFixture {
         return web.convert(NSPoint(x: x, y: web.isFlipped ? y : web.bounds.height-y), to: nil)
     }
     func mouse(_ type: NSEvent.EventType, at point: NSPoint) {
-        NSApp.sendEvent(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
+        let event = NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
             timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber,
             context: nil, eventNumber: 1, clickCount: type == .mouseMoved ? 0 : 1,
-            pressure: type == .leftMouseDown || type == .leftMouseDragged ? 1 : 0)!)
+            pressure: type == .leftMouseDown || type == .leftMouseDragged ? 1 : 0)!
+        NSApp.sendEvent(event)
     }
-    func click(_ selector: String, web: WKWebView) async throws {
+    func focus() async throws {
         if !NSApp.isActive {
-            NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
+            NSApp.activate(ignoringOtherApps: true)
         }
         if !panel.isKeyWindow { panel.focusWindow() }
         do { try await AISelfCheck.wait { NSApp.isActive && panel.isKeyWindow } }
         catch {
-            throw PerchError("Native click activation timed out: selector=\(selector), active=\(NSApp.isActive), key=\(panel.isKeyWindow), visible=\(panel.isVisible), policy=\(NSApp.activationPolicy().rawValue), frontmost=\(NSWorkspace.shared.frontmostApplication?.bundleURL?.path ?? "nil")")
+            throw PerchError("Native input activation timed out: active=\(NSApp.isActive), key=\(panel.isKeyWindow), visible=\(panel.isVisible), policy=\(NSApp.activationPolicy().rawValue), frontmost=\(NSWorkspace.shared.frontmostApplication?.bundleURL?.path ?? "nil")")
         }
+    }
+    func click(_ selector: String, web: WKWebView) async throws {
+        try await focus()
         _ = try await web.callAsyncJavaScript("""
             document.querySelector(selector)?.scrollIntoView({block:'nearest',inline:'nearest'});
             """, arguments: ["selector": selector], in: nil, contentWorld: .defaultClient)
@@ -65,7 +69,12 @@ struct HomePageFixture {
         let root = panel.contentView!
         let hit = root.hitTest(root.superview?.convert(location, from: nil) ?? location)
         guard hit === web || hit?.isDescendant(of: web) == true else {
-            throw PerchError("Home click missed WebKit: \(selector), point=\(location), hit=\(String(describing: hit))")
+            if let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds) {
+                root.cacheDisplay(in: root.bounds, to: bitmap)
+                try bitmap.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: "/tmp/perch-click-failure.png"))
+            }
+            let viewport = try? await web.evaluateJavaScript("[innerWidth,innerHeight]")
+            throw PerchError("Home click missed WebKit: \(selector), point=\(location), web=\(web.convert(web.bounds, to: nil)), viewport=\(String(describing: viewport)), hit=\(String(describing: hit))")
         }
         mouse(.mouseMoved, at: location)
         try await Task.sleep(nanoseconds: 40_000_000)
@@ -86,6 +95,7 @@ struct HomePageFixture {
         guard value == text else { throw PerchError("Native WebKit insertion differs: \(value ?? "nil")") }
     }
     func key(_ code: UInt16, _ characters: String, flags: NSEvent.ModifierFlags = []) async throws {
+        try await focus()
         for type in [NSEvent.EventType.keyDown, .keyUp] {
             NSApp.sendEvent(NSEvent.keyEvent(with: type, location: .zero, modifierFlags: flags,
                 timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber, context: nil,
@@ -182,7 +192,13 @@ enum HomePageSelfCheck {
                 const input=document.getElementById('search');
                 return document.activeElement===input && input.value==='首页草稿 fixture' && input.selectionStart===2 && input.selectionEnd===3;
                 """, arguments: [:], in: nil, contentWorld: .defaultClient) as? Bool
-            guard returned === web, retained == true else { throw PerchError("Home DOM, focus or selection did not survive tab switching") }
+            guard returned === web, retained == true else {
+                let state = try await returned.evaluateJavaScript("""
+                    JSON.stringify({active:document.activeElement.id,value:document.getElementById('search').value,
+                        start:document.getElementById('search').selectionStart,end:document.getElementById('search').selectionEnd})
+                    """)
+                throw PerchError("Home DOM, focus or selection did not survive tab switching: table=\(throughTable), same=\(returned === web), key=\(panel.isKeyWindow), responder=\(String(describing: panel.firstResponder)), DOM=\(String(describing: state))")
+            }
             let field = fixture.toolbar(); panel.makeFirstResponder(field)
             let editor = field.currentEditor() as! NSTextView
             editor.selectAll(nil); editor.insertText("地址草稿 fixture", replacementRange: NSRange(location: NSNotFound, length: 0))
@@ -258,7 +274,7 @@ enum HomePageSelfCheck {
         let data = try JSONEncoder().encode(store.sites)
         store.defaults.set(data, forKey: "sites")
         let fixture = HomePageFixture(store: store, panel: panel), web = try await fixture.home()
-        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+        NSApp.activate(ignoringOtherApps: true)
         panel.focusWindow()
         try await AISelfCheck.wait { NSApp.isActive && panel.isKeyWindow }
         let ids = store.homeShortcuts.map(\.id)
@@ -281,7 +297,7 @@ enum HomePageSelfCheck {
         try await Task.sleep(nanoseconds: 250_000_000)
         let preview = try await web.evaluateJavaScript("Array.from(document.querySelectorAll('#shortcuts .shortcut')).map(e=>e.dataset.id)") as? [String]
         guard preview == expected.map(\.uuidString), store.homeShortcutOrder.isEmpty else {
-            throw PerchError("HTML drag did not preview across rows without saving: \(String(describing: preview))")
+            throw PerchError("HTML drag did not preview across rows without saving: key=\(panel.isKeyWindow), expected=\(expected), actual=\(String(describing: preview))")
         }
         let ghost = try await web.evaluateJavaScript("""
             getComputedStyle(document.querySelector('.drag-ghost')).opacity==='0.88' &&
@@ -319,7 +335,7 @@ enum HomePageSelfCheck {
         }
         let homeID = store.selected!
         try await fixture.click(".shortcut", web: web)
-        guard store.selected == homeID, store.cachedBrowser(for: homeID) != nil else { throw PerchError("HTML shortcut click did not navigate its home tab") }
+        try await AISelfCheck.wait { store.selected == homeID && store.cachedBrowser(for: homeID) != nil }
         store.newTab()
         print("PASS: actual HTML pointer drag across rows, independent order commit, bookmark preservation, Escape rollback and shortcut click")
     }

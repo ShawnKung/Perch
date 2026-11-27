@@ -148,8 +148,6 @@ final class HomePageController: NSObject, WKScriptMessageHandler, WKNavigationDe
             }
         case "navigate":
             guard let text = body["text"] as? String else { return }
-            store.pendingAddressFocus = nil
-            (web.window as? Panel)?.endAddressEditing()
             store.navigate(text)
         case "chat": store.openChat()
         case "bookmarks": store.openBookmarks(scope: .all)

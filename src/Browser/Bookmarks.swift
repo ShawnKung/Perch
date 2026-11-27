@@ -919,7 +919,7 @@ struct NativeBookmarks: NSViewRepresentable {
 }
 
 enum BookmarkScope: Equatable {
-    case all, root, folder(UUID), imported(String), history, group(UUID)
+    case all, root, folder(UUID), imported(String), group(UUID)
 }
 
 struct BookmarkNode: Identifiable, Codable {
@@ -951,8 +951,6 @@ struct BookmarksPage: View {
     @State private var folderDraft = BookmarkFolder(title: "")
     @State private var renamingFolder = false
     @State private var folderToDelete: BookmarkFolder?
-    @State private var clearHistory = false
-    @State private var deletingHistory = false
 
     init(store: Store) {
         self.store = store
@@ -969,7 +967,6 @@ struct BookmarksPage: View {
         case .root: return "个人书签"
         case .folder(let id): return store.bookmarkFolderPath(id)
         case .imported(let source): return "\(source)/ · 只读"
-        case .history: return "历史记录"
         case .group(let id): return store.tabGroups.first { $0.id == id }?.name ?? "标签组"
         }
     }
@@ -1017,7 +1014,7 @@ struct BookmarksPage: View {
         VStack(spacing: 12) {
             HStack {
                 TextField("搜索名称或网址", text: $search).textFieldStyle(.roundedBorder)
-                if scope != .history && !isGroupScope {
+                if !isGroupScope {
                     Button("添加书签") {
                         editing = nil; adding = true; title = ""; address = ""
                     }.disabled({ if case .imported = scope { return true }; return false }())
@@ -1027,7 +1024,7 @@ struct BookmarksPage: View {
                     }
                 }
             }
-            if scope != .history && !isGroupScope && (adding || editing != nil) {
+            if !isGroupScope && (adding || editing != nil) {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(editing == nil ? "添加书签" : "编辑书签").font(.caption).foregroundStyle(Style.muted)
                     HStack {
@@ -1042,109 +1039,79 @@ struct BookmarksPage: View {
                     }.textFieldStyle(.roundedBorder)
                 }
             }
-            if scope == .history {
-                HStack {
-                    Button("清空全部历史记录…", role: .destructive) { clearHistory = true }
-                        .disabled(store.history.isEmpty)
-                    Toggle("记录历史记录", isOn: Binding(get: { store.settings.historyRecordingEnabled }, set: { enabled in
-                        var settings = store.settings
-                        settings.historyRecordingEnabled = enabled
-                        do { try store.saveSettings(settings) }
-                        catch { store.notice = "尚未生效，保留上次设置：\(error.localizedDescription)" }
-                    }))
-                    .fixedSize()
-                    Spacer()
-                }
-            } else {
-                HStack(spacing: 10) {
-                    Button(search.isEmpty ? "全选" : "全选搜索结果") { selection = rowIDs(rows) }
-                        .disabled(rows.isEmpty)
-                    Button("取消选择") { selection.removeAll() }.disabled(selection.isEmpty)
-                    Spacer()
-                    Text("已选 \(selection.count) 项").font(.caption).foregroundStyle(Style.muted)
-                }
+            HStack(spacing: 10) {
+                Button(search.isEmpty ? "全选" : "全选搜索结果") { selection = rowIDs(rows) }
+                    .disabled(rows.isEmpty)
+                Button("取消选择") { selection.removeAll() }.disabled(selection.isEmpty)
+                Spacer()
+                Text("已选 \(selection.count) 项").font(.caption).foregroundStyle(Style.muted)
             }
             HStack(alignment: .top, spacing: 12) {
                 folderSidebar.frame(width: 170)
-                if scope == .history {
-                    historyRecords
-                } else {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack(spacing: 10) {
-                            if let currentFolder {
-                                Button {
-                                    scope = store.bookmarkFolders.first { $0.id == currentFolder }?.parentID
-                                        .map(BookmarkScope.folder) ?? .root
-                                } label: {
-                                    Label("返回上一级", systemImage: "arrow.left")
-                                }.buttonStyle(.borderless).accessibilityLabel("返回上一级")
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 10) {
+                        if let currentFolder {
+                            Button {
+                                scope = store.bookmarkFolders.first { $0.id == currentFolder }?.parentID
+                                    .map(BookmarkScope.folder) ?? .root
+                            } label: {
+                                Label("返回上一级", systemImage: "arrow.left")
+                            }.buttonStyle(.borderless).accessibilityLabel("返回上一级")
+                        }
+                        Text(scopeTitle).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                    }.padding(.leading, 6)
+                    NativeBookmarks(rows: rows, selection: $selection, expandAll: !search.isEmpty,
+                        edit: edit, toggleHome: { store.toggleBookmarkHome($0.id) },
+                        open: { store.open($0); store.library = nil },
+                        navigate: { scope = isGroupScope ? .group($0) : .folder($0) },
+                        delete: { selection = [$0.id]; deleting = true },
+                        paste: { board in
+                            guard !isGroupScope else { return }
+                            if case .imported = scope {
+                                store.notice = "请选择个人书签目录后再粘贴。"; return
                             }
-                            Text(scopeTitle).font(.system(size: 13, weight: .semibold)).lineLimit(1)
-                        }.padding(.leading, 6)
-                        NativeBookmarks(rows: rows, selection: $selection, expandAll: !search.isEmpty,
-                            edit: edit, toggleHome: { store.toggleBookmarkHome($0.id) },
-                            open: { store.open($0); store.library = nil },
-                            navigate: { scope = isGroupScope ? .group($0) : .folder($0) },
-                            delete: { selection = [$0.id]; deleting = true },
-                            paste: { board in
-                                guard !isGroupScope else { return }
-                                if case .imported = scope {
-                                    store.notice = "请选择个人书签目录后再粘贴。"; return
-                                }
-                                let ids = store.pasteBookmarks(from: board, to: currentFolder)
-                                if !ids.isEmpty { search = ""; selection = ids }
-                            },
-                            copy: { store.copyBookmarkItems($0, to: $1) },
-                            cut: { store.cutBookmarkItems($0, to: $1) },
-                            movable: store.personalBookmarkItemIDs,
-                            move: { ids, folder in
-                                let moved = store.moveBookmarkItems(ids, to: folder ?? currentFolder)
-                                if moved { selection.removeAll() }
-                                return moved
-                            },
-                            reorder: isGroupScope ? nil : { store.reorderBookmarkSites($0) },
-                            folderAction: { id, action in
-                                if isGroupScope {
-                                    groupAction(id, action: action)
-                                    return
-                                }
-                                guard let folder = store.bookmarkFolders.first(where: { $0.id == id }) else { return }
-                                switch action {
-                                case "newFolder":
-                                    scope = .folder(id); folderDraft = BookmarkFolder(title: "", parentID: id)
-                                    renamingFolder = false; folderPrompt = true
-                                case "rename": folderDraft = folder; renamingFolder = true; folderPrompt = true
-                                case "deleteFolder": folderToDelete = folder
-                                default: break
-                                }
-                            },
-                            pasteInto: { board, id in _ = store.pasteBookmarks(from: board, to: id) },
-                            requestDelete: { if !deletable.isEmpty { deleting = true } },
-                            preview: { store.bookmarkPreviewBrowser(for: $0) },
-                            favicon: { store.cachedFavicon($0) })
-                            .padding(.leading, -16)
-                            .overlay(alignment: .topLeading) {
-                                if rows.isEmpty {
-                                    Text(isGroupScope ? (search.isEmpty ? "此处没有标签组或标签" : "没有匹配的标签组或标签") :
-                                        (search.isEmpty ? "此处没有书签" : "没有匹配的书签"))
-                                        .foregroundStyle(Style.muted).padding(16).allowsHitTesting(false)
-                                }
+                            let ids = store.pasteBookmarks(from: board, to: currentFolder)
+                            if !ids.isEmpty { search = ""; selection = ids }
+                        },
+                        copy: { store.copyBookmarkItems($0, to: $1) },
+                        cut: { store.cutBookmarkItems($0, to: $1) },
+                        movable: store.personalBookmarkItemIDs,
+                        move: { ids, folder in
+                            let moved = store.moveBookmarkItems(ids, to: folder ?? currentFolder)
+                            if moved { selection.removeAll() }
+                            return moved
+                        },
+                        reorder: isGroupScope ? nil : { store.reorderBookmarkSites($0) },
+                        folderAction: { id, action in
+                            if isGroupScope {
+                                groupAction(id, action: action)
+                                return
                             }
-                    }
+                            guard let folder = store.bookmarkFolders.first(where: { $0.id == id }) else { return }
+                            switch action {
+                            case "newFolder":
+                                scope = .folder(id); folderDraft = BookmarkFolder(title: "", parentID: id)
+                                renamingFolder = false; folderPrompt = true
+                            case "rename": folderDraft = folder; renamingFolder = true; folderPrompt = true
+                            case "deleteFolder": folderToDelete = folder
+                            default: break
+                            }
+                        },
+                        pasteInto: { board, id in _ = store.pasteBookmarks(from: board, to: id) },
+                        requestDelete: { if !deletable.isEmpty { deleting = true } },
+                        preview: { store.bookmarkPreviewBrowser(for: $0) },
+                        favicon: { store.cachedFavicon($0) })
+                        .padding(.leading, -16)
+                        .overlay(alignment: .topLeading) {
+                            if rows.isEmpty {
+                                Text(isGroupScope ? (search.isEmpty ? "此处没有标签组或标签" : "没有匹配的标签组或标签") :
+                                    (search.isEmpty ? "此处没有书签" : "没有匹配的书签"))
+                                    .foregroundStyle(Style.muted).padding(16).allowsHitTesting(false)
+                            }
+                        }
                 }
             }
-            if scope == .history {
-                HStack {
-                    Button("打开所选") {
-                        let visits = store.history.filter { selection.contains($0.id) }
-                        for visit in visits { store.newTab(address: visit.address, title: visit.title) }
-                        store.library = nil
-                    }.disabled(selection.isEmpty)
-                    Button("删除所选…", role: .destructive) { deletingHistory = true }
-                        .disabled(selection.isEmpty)
-                    Spacer()
-                }
-            } else if isGroupScope {
+            if isGroupScope {
                 HStack {
                     if case .group(let id) = scope, let group = store.tabGroups.first(where: { $0.id == id }) {
                         Button("打开分组") { groupAction(id, action: "openGroup") }
@@ -1179,18 +1146,7 @@ struct BookmarksPage: View {
                 selection.removeAll(); editing = nil; adding = false; search = ""
                 store.libraryBookmarkScope = value
             }
-            .onChange(of: store.bookmarkItemIDs) { ids in if scope != .history { selection.formIntersection(ids) } }
-            .onChange(of: store.history.map(\.id)) { ids in if scope == .history { selection.formIntersection(ids) } }
-            .alert("清空全部历史记录？", isPresented: $clearHistory) {
-                Button("取消", role: .cancel) {}
-                Button("清空", role: .destructive) { store.deleteHistory() }
-            } message: { Text("此操作不可撤销。书签和 Cookie 不受影响。") }
-            .alert("删除所选历史记录？", isPresented: $deletingHistory) {
-                Button("取消", role: .cancel) {}
-                Button("删除", role: .destructive) {
-                    store.deleteHistory(ids: selection); selection.removeAll()
-                }
-            } message: { Text("此操作不可撤销。") }
+            .onChange(of: store.bookmarkItemIDs) { ids in selection.formIntersection(ids) }
             .alert("删除 \(deletable.count) 个所选项目？", isPresented: $deleting) {
                 Button("取消", role: .cancel) {}
                 Button("删除", role: .destructive) {
@@ -1281,9 +1237,6 @@ struct BookmarksPage: View {
                     }
                 }
             }
-            Section("历史记录") {
-                scopeButton("全部记录", icon: "clock", target: .history)
-            }
         }.listStyle(.sidebar)
             .scrollContentBackground(.hidden)
             .background(Style.sidebar, in: RoundedRectangle(cornerRadius: 12))
@@ -1336,39 +1289,6 @@ struct BookmarksPage: View {
     }
     private func edit(_ site: Site) {
         editing = site; adding = false; title = site.title; address = site.address
-    }
-    private var historyRecords: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(scopeTitle).font(.system(size: 13, weight: .semibold)).lineLimit(1).padding(.leading, 6)
-            List(selection: $selection) {
-                ForEach(store.history.filter { matches($0.title, $0.address) }) { visit in
-                        HStack {
-                            Image(systemName: "clock").foregroundStyle(Style.accent).frame(width: 24)
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(visit.title.isEmpty ? visit.address : visit.title)
-                                    .font(.system(size: 13, weight: .medium)).lineLimit(1)
-                                Text(visit.address).font(.caption).foregroundStyle(Style.muted).lineLimit(1)
-                            }
-                            Spacer()
-                            Text(visit.date.formatted(date: .abbreviated, time: .shortened))
-                                .font(.caption).foregroundStyle(Style.muted)
-                        }.padding(.vertical, 5).contentShape(Rectangle())
-                    .tag(visit.id)
-                    .onTapGesture(count: 2) {
-                        store.newTab(address: visit.address, title: visit.title)
-                        store.library = nil
-                    }.contextMenu {
-                        Button("在新标签页中打开") {
-                            store.newTab(address: visit.address, title: visit.title)
-                            store.library = nil
-                        }
-                        Button("加入书签") { _ = store.add(title: visit.title, address: visit.address) }
-                        Button("复制网址") { copyAddress(visit.address) }
-                        Button("从历史记录中移除", role: .destructive) { store.deleteHistory(visit.id) }
-                    }
-                }
-            }.listStyle(.plain).scrollContentBackground(.hidden).background(Style.paper)
-        }
     }
     private func matches(_ title: String, _ address: String) -> Bool {
         search.isEmpty || title.localizedCaseInsensitiveContains(search) || address.localizedCaseInsensitiveContains(search)

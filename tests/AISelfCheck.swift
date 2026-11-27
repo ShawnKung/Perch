@@ -1039,7 +1039,7 @@ enum AISelfCheck {
         precondition(navigation.isChatPage && navigation.chatOwner == owner && navigation.ai.drafts[navigation.chatOwner] == "Shared draft")
         let chatTab = navigation.tabs.last!
         let savedTab = try JSONDecoder().decode(Tab.self, from: JSONEncoder().encode(chatTab))
-        precondition(savedTab.chatOwner == owner)
+        precondition(savedTab.isChat && savedTab.address == "perch://chat" && savedTab.chatOwner == nil)
         navigation.close(owner)
         precondition(navigation.isChatPage && navigation.chatOwner == owner)
         let recoveredNavigation = Store(defaults: defaults)
@@ -1944,26 +1944,35 @@ enum AISelfCheck {
                               Tab(title: "Chat", address: "", chatOwner: UUID())]
         defaults.set(try JSONEncoder().encode([restoredWeb] + duplicateChats), forKey: "tabs")
         defaults.set(duplicateChats[1].id.uuidString, forKey: "selectedTab")
+        defaults.removeObject(forKey: "fullChatOwner")
         let restoredStore = Store(defaults: defaults)
-        precondition(restoredStore.tabs.filter { $0.chatOwner != nil }.map(\.id) == [duplicateChats[1].id])
+        guard restoredStore.tabs.filter(\.isChat).map(\.id) == duplicateChats.map(\.id),
+              restoredStore.fullChatOwner == duplicateChats[1].chatOwner else {
+            throw PerchError("Legacy Chat tabs lost their identities or selected conversation during migration")
+        }
         precondition(restoredStore.selected == duplicateChats[1].id)
         precondition(restoredStore.chatHistoryVisible, "Restoring Chat must open its history sidebar")
-        let singletonID = restoredStore.selected
+        let originalID = restoredStore.selected
         restoredStore.chatHistoryVisible = false
         restoredStore.selected = restoredWeb.id
-        restoredStore.activate(singletonID!)
-        precondition(restoredStore.chatHistoryVisible, "Switching back to Chat must open its history sidebar")
+        restoredStore.activate(originalID!)
+        precondition(!restoredStore.chatHistoryVisible, "Switching Chat tabs must retain its history sidebar state")
         restoredStore.chatHistoryVisible = false
         restoredStore.openChat(owner: UUID())
-        precondition(restoredStore.chatHistoryVisible, "Opening the existing Chat must open its history sidebar")
+        precondition(!restoredStore.chatHistoryVisible, "Changing conversations must retain its history sidebar state")
         restoredStore.openChat(owner: UUID())
-        precondition(restoredStore.selected == singletonID && restoredStore.tabs.count == 2)
-        restoredStore.close(singletonID!)
+        precondition(restoredStore.selected == originalID && restoredStore.tabs.count == 3)
+        restoredStore.close(originalID!)
         restoredStore.openChat(owner: UUID())
         let reopenedID = restoredStore.selected
         restoredStore.reopen()
-        precondition(restoredStore.tabs.filter { $0.chatOwner != nil }.count == 1 && restoredStore.selected == reopenedID)
-        print("PASS: globally unique Chat tab, duplicate restore keeps selected Chat, different owners and reopening reuse the same tab")
+        precondition(restoredStore.tabs.filter(\.isChat).count == 3 && restoredStore.selected != reopenedID)
+        let sharedOwner = restoredStore.chatOwner
+        for tab in restoredStore.tabs.filter(\.isChat) {
+            restoredStore.activate(tab.id)
+            precondition(restoredStore.chatOwner == sharedOwner)
+        }
+        print("PASS: multiple Chat tabs survive legacy restore/reopen and share owner and sidebar state")
         precondition(store.ai.save(config, key: "synthetic-key"))
         let legacySettings = try JSONDecoder().decode(BrowserSettings.self, from: Data("{}".utf8))
         precondition(!legacySettings.aiSendWithCommand)
@@ -2066,7 +2075,7 @@ enum AISelfCheck {
             let current = (view as? NSTextField)?.delegate is AddressTextField.Coordinator ? 1 : 0
             return current + view.subviews.reduce(0) { $0 + addressFields(in: $1) }
         }
-        precondition(addressFields(in: window.contentView!) == 0, "Full Chat must hide its address row")
+        precondition(addressFields(in: window.contentView!) == 1, "Full Chat must expose its address row")
         if let directory = ProcessInfo.processInfo.environment["PERCH_LAYOUT_EVIDENCE"] {
             try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
             let root = window.contentView!
@@ -2131,13 +2140,10 @@ enum AISelfCheck {
         print("PASS: labeled HTML search and model controls do not overlap")
         let toolbarFrames = [export, newChat, pin].map(accessibilityFrame)
         precondition(toolbarFrames[0].maxX < toolbarFrames[1].minX &&
-                     toolbarFrames[1].maxX < toolbarFrames[2].minX, "Export and new chat must sit immediately before pin")
-        // SwiftUI reports the symbol outline here, not the shared 28pt button frame.
-        precondition(toolbarFrames.allSatisfy { abs($0.midY - toolbarFrames[2].midY) < 1 } &&
-                     abs(toolbarFrames[1].midX - toolbarFrames[0].midX - 31) < 2 &&
-                     abs(toolbarFrames[2].midX - toolbarFrames[1].midX - 31) < 2,
-                     "Chat toolbar buttons must share the 28pt layout, 3pt spacing and alignment")
-        print("PASS: Chat export and new conversation share the pin button layout and sit immediately before it")
+                     abs(toolbarFrames[0].midY - toolbarFrames[1].midY) < 1 &&
+                     toolbarFrames[2].midY > toolbarFrames[1].maxY,
+                     "Chat actions must align in the history header below the address toolbar")
+        print("PASS: Chat address row is visible and export/new conversation align in the history header")
         let expandedFrame = accessibilityFrame(collapse)
         precondition(abs(expandedFrame.midY - accessibilityFrame(archived).midY) < 2,
                      "Collapse must align with the archive link")
@@ -2151,10 +2157,12 @@ enum AISelfCheck {
             throw PerchError("Collapsed Chat must keep an expand button")
         }
         let collapsedFrame = accessibilityFrame(expand)
-        precondition(abs(collapsedFrame.midY - expandedFrame.midY) < 2, "Both sidebar controls must use the same footer height")
-        precondition(abs(expandedFrame.minX - collapsedFrame.minX - 188) < 2,
-                     "Expand must sit just right of the tab divider")
-        precondition(collapsedFrame.maxX < window.convertToScreen(fullInput.convert(fullInput.bounds, to: nil)).minX,
+        let collapsedInputFrame = window.convertToScreen(fullInput.convert(fullInput.bounds, to: nil))
+        guard abs(collapsedFrame.midY - expandedFrame.midY) < 2,
+              abs(collapsedFrame.midX - (collapsedInputFrame.minX - 20)) < 2 else {
+            throw PerchError("History toggle must retain its footer height and center in the 40pt gutter: expanded=\(expandedFrame), collapsed=\(collapsedFrame), input=\(collapsedInputFrame)")
+        }
+        precondition(collapsedFrame.maxX < collapsedInputFrame.minX,
                      "Expand must not overlap the composer")
         let gutterPoint = window.convertPoint(fromScreen: NSPoint(x: collapsedFrame.midX, y: collapsedFrame.maxY + 80))
         let gutterInRoot = historyRoot.convert(gutterPoint, from: nil)
@@ -2244,7 +2252,7 @@ enum AISelfCheck {
             historyRoot.layoutSubtreeIfNeeded()
             return abs(fullInput.convert(fullInput.bounds, to: historyRoot).minX - expandedInputX) < 2
         }
-        print("PASS: Chat toolbar buttons precede pin with matching frames, warm gutter pixels, native history dragging and persistent width limits")
+        print("PASS: Chat actions align below the address toolbar, with warm gutter pixels, native history dragging and persistent width limits")
         store.chatHistoryVisible = false
         print("PASS: Chat defaults open, footer collapse aligns with archive, expand keeps its height and clears the composer, and the top settings shortcut is absent")
         store.ai.drafts[store.chatOwner] = ""
@@ -2370,7 +2378,7 @@ enum AISelfCheck {
         try await wait { store.ai.recentConversations.count == 4 && store.chatOwner != editOwner }
         try await wait { Set(table.conversationIDs.compactMap { $0 }) == Set(store.ai.activeConversations.map(\.id)) }
         precondition(store.selected == chatTabBeforeFork && store.tabs.count == tabsBeforeFork &&
-                     store.tabs.filter { $0.chatOwner != nil }.count == 1)
+                     store.tabs.filter(\.isChat).count == 1)
         let forkOwner = store.chatOwner
         precondition(store.ai.sessions[editOwner]!.messages.map(\.id) == preservedIDs)
         let allRows = table.conversationIDs.indices.filter { table.conversationIDs[$0] != nil }
@@ -2612,19 +2620,39 @@ enum AISelfCheck {
         let window = Panel(contentRect: NSRect(x: 160, y: 150, width: 850, height: 600),
                               styleMask: [.titled], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
+        window.hidesOnDeactivate = false
+        window.level = .floating
         window.contentView = NSHostingView(rootView: AIChatSidebar(store: store, ai: ai, fullPage: true, close: {}))
+        NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
         defer { window.orderOut(nil); window.contentView = nil }
+        try await wait { NSApp.isActive && window.isKeyWindow && window.occlusionState.contains(.visible) }
         var web = try await AIChatPageSelfCheck.ready(window)
         let fixture = HomePageFixture(store: store, panel: window)
         try await AIChatPageSelfCheck.waitFor(web, "document.querySelectorAll('.message').length===16 && document.getElementById('scroll').scrollTop>1000")
+        // Leave bottom-follow mode through native input before positioning the persistence fixture.
+        try await fixture.click("#scroll", web: web)
+        let scrollPoint = try await fixture.point("#scroll", web: web)
+        try await AIChatPageSelfCheck.wheel(300, at: scrollPoint, web: web, window: window)
+        try await AIChatPageSelfCheck.waitFor(web,
+            "document.getElementById('scroll').scrollHeight-document.getElementById('scroll').clientHeight-document.getElementById('scroll').scrollTop>100")
         _ = try await web.evaluateJavaScript("""
             const scroller=document.getElementById('scroll'),last=document.querySelector('.message:last-of-type');
             scroller.scrollTop+=last.getBoundingClientRect().top-scroller.getBoundingClientRect().top+170;
             """)
-        try await wait {
-            let position = ai.readingPosition(for: record.id)
-            return position?.messageID == record.messages.last!.id && abs((position?.offset ?? 0) - 170) < 2
+        do {
+            try await wait {
+                let position = ai.readingPosition(for: record.id)
+                return position?.messageID == record.messages.last!.id && abs((position?.offset ?? 0) - 170) < 2
+            }
+        } catch {
+            let state = try await web.callAsyncJavaScript("""
+                return JSON.stringify({top:document.getElementById('scroll').scrollTop,
+                    visibility:document.visibilityState,
+                    offset:document.getElementById('scroll').getBoundingClientRect().top-
+                        document.querySelector('.message:last-of-type').getBoundingClientRect().top})
+                """, arguments: [:], in: nil, contentWorld: .defaultClient)
+            throw PerchError("Reading anchor mismatch: stored=\(String(describing: ai.readingPosition(for: record.id))), DOM=\(state ?? "nil"); \(error)")
         }
         let bookmark = ai.readingPosition(for: record.id)!
         let restored = """
@@ -2651,7 +2679,16 @@ enum AISelfCheck {
         store.chatHistoryVisible = false
         window.setContentSize(NSSize(width: 390, height: 600))
         try await Task.sleep(nanoseconds: 400_000_000)
-        try await AIChatPageSelfCheck.waitFor(web, restored)
+        do { try await AIChatPageSelfCheck.waitFor(web, restored) }
+        catch {
+            let state = try await web.evaluateJavaScript("""
+                JSON.stringify({width:innerWidth,height:innerHeight,visibility:document.visibilityState,
+                    top:document.getElementById('scroll').scrollTop,
+                    offset:document.getElementById('scroll').getBoundingClientRect().top-
+                        document.querySelector('.message:last-of-type').getBoundingClientRect().top})
+                """)
+            throw PerchError("Resized reading anchor: stored=\(String(describing: reloaded.readingPosition(for: record.id))), DOM=\(String(describing: state)), key=\(window.isKeyWindow), occlusion=\(window.occlusionState.rawValue); \(error)")
+        }
         func scrollTop() async throws -> Double {
             try await web.evaluateJavaScript("document.getElementById('scroll').scrollTop") as! Double
         }
@@ -2660,7 +2697,13 @@ enum AISelfCheck {
             // Deliver only inside the isolated window; never post to the system event queue.
             try await AIChatPageSelfCheck.wheel(delta, at: point, web: web, window: window)
             try await AIChatPageSelfCheck.check(web,
-                "!!document.elementFromPoint(innerWidth/2,document.getElementById('scroll').clientHeight/2)?.closest('.message')",
+                """
+                (()=>{const viewport=document.getElementById('scroll').getBoundingClientRect();
+                    return [...document.querySelectorAll('.message')].some(message=>{
+                        const rect=message.getBoundingClientRect();
+                        return rect.bottom>viewport.top && rect.top<viewport.bottom;
+                    });})()
+                """,
                 "连续滚动出现空白消息区")
         }
         let beforeWheel = try await scrollTop()

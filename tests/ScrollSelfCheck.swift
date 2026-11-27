@@ -250,7 +250,7 @@ enum ScrollSelfCheck {
         guard hit === page || hit?.isDescendant(of: page) == true else {
             throw PerchError("The selected webpage must receive events directly")
         }
-        store.activate(store.tabs.first { $0.chatOwner != nil }!.id)
+        store.activate(store.tabs.first(where: \.isChat)!.id)
         func visibleTextPoint() -> (AIChatWebView, NSPoint)? {
             for renderer in renderers(host) {
                 for point in textPoints(renderer) {

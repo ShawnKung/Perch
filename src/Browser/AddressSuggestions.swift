@@ -285,9 +285,6 @@ struct AddressEntry: View {
     }
     private func navigate(_ address: String) {
         dismissSuggestions()
-        store.pendingAddressFocus = nil
-        if let panel = NSApp.keyWindow as? Panel { panel.endAddressEditing() }
-        else { NSApp.keyWindow?.makeFirstResponder(nil) }
         store.navigate(address)
     }
 }
