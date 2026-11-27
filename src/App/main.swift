@@ -2232,6 +2232,24 @@ struct WindowTools: View {
     private let pinned: Bool
     private let hasBrowser: Bool
     private let canClearCookies: Bool
+    private static let menuIconSize = NSSize(width: 18, height: 18)
+    private static let emptyMenuIcon = NSImage(size: menuIconSize, flipped: false) { _ in true }
+    private static let menuIcons: [String: NSImage] = {
+        var icons: [String: NSImage] = [:]
+        for name in ["bookmark", "clock.arrow.circlepath", "arrow.down.to.line", "key", "house"] {
+            guard let symbol = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 13, weight: .regular)) else { continue }
+            let icon = NSImage(size: menuIconSize, flipped: false) { bounds in
+                symbol.draw(at: NSPoint(x: bounds.midX - symbol.size.width / 2,
+                                        y: bounds.midY - symbol.size.height / 2),
+                            from: .zero, operation: .sourceOver, fraction: 1)
+                return true
+            }
+            icon.isTemplate = true
+            icons[name] = icon
+        }
+        return icons
+    }()
     @State private var cookieTarget: (host: String, store: WKHTTPCookieStore)?
     @State private var confirmingCookies = false
     init(store: Store) {
@@ -2239,6 +2257,16 @@ struct WindowTools: View {
         chatPage = store.isChatPage; aiVisible = store.aiVisible; pinned = store.pinned
         hasBrowser = store.selected.flatMap { store.cachedBrowser(for: $0) } != nil
         canClearCookies = store.browser?.webView.url?.host != nil && !store.isChatPage
+    }
+    private func menuButton(_ title: String, icon: String? = nil, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label {
+                Text(title)
+            } icon: {
+                Image(nsImage: icon.flatMap { Self.menuIcons[$0] } ?? Self.emptyMenuIcon)
+            }
+            .labelStyle(.titleAndIcon)
+        }
     }
     var body: some View {
         HStack(spacing: 3) {
@@ -2252,28 +2280,29 @@ struct WindowTools: View {
             }
             DownloadToolbarButton(downloads: store.downloads) { store.openDownloads() }
             Menu {
-                Button("书签管理") { store.openBookmarks() }
-                Button { store.openHistory() } label: { Label("历史记录", systemImage: "clock.arrow.circlepath") }
-                Button("下载记录") { store.openDownloads() }
-                Button("密码管理") { store.library = .passwords }
+                menuButton("书签管理", icon: "bookmark") { store.openBookmarks() }
+                menuButton("历史记录", icon: "clock.arrow.circlepath") { store.openHistory() }
+                menuButton("下载记录", icon: "arrow.down.to.line") { store.openDownloads() }
+                menuButton("密码管理", icon: "key") { store.library = .passwords }
                 Divider()
-                Button("在新标签页打开") {
+                menuButton("在新标签页打开") {
                     if let id = store.selected, let address = store.tabs.first(where: { $0.id == id })?.address,
                        let url = URLInput.parseNavigation(address, search: false) { store.newTab(address: url.absoluteString) }
                 }.disabled(!hasBrowser)
                 Divider()
-                Button("回到首页") { store.selected = nil }
-                Button("添加网站") { store.adding = true }
-                Button("从浏览器导入…") { store.library = .importer }
-                Button("清除当前网站的 Cookie…") {
+                menuButton("回到首页", icon: "house") { store.selected = nil }
+                menuButton("添加网站") { store.adding = true }
+                menuButton("从浏览器导入…") { store.library = .importer }
+                menuButton("清除当前网站的 Cookie…") {
                     guard let browser = store.browser, let url = browser.webView.url,
                           ["http", "https"].contains(url.scheme?.lowercased() ?? ""), let host = url.host else { return }
                     cookieTarget = (host, browser.webView.configuration.websiteDataStore.httpCookieStore)
                     confirmingCookies = true
                 }.disabled(!canClearCookies)
                 Divider()
-                Text("Perch \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")")
-                Button("退出 Perch") { NSApp.terminate(nil) }.keyboardShortcut("q")
+                menuButton("Perch \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")") {}
+                    .disabled(true)
+                menuButton("退出 Perch") { NSApp.terminate(nil) }.keyboardShortcut("q")
             } label: { Image(systemName: "ellipsis").frame(width: 28, height: 28) }
                 .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
                 .help("更多").accessibilityLabel("更多")
