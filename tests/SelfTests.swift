@@ -1326,6 +1326,10 @@ final class LayoutSelfCheck {
                 if CommandLine.arguments.contains("--verify-tab-drag") {
                     await verifyTabDrag()
                 }
+                if CommandLine.arguments.contains("--verify-tab-rename") {
+                    do { try await verifyTabRename() }
+                    catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
+                }
                 if CommandLine.arguments.contains("--verify-bookmark-drag") {
                     await verifyBookmarkDrag()
                 }
@@ -1877,6 +1881,58 @@ final class LayoutSelfCheck {
         print("PASS: bookmark icon/title/address native press path, translucent floating row, live outline moves, selection and metadata retention, cancel/exit, local drop/restart, independent home order, multiple rows, rejected save, folder move and read-only boundary; drag source capture and destination use synthetic local fixtures")
         fflush(stdout)
     }
+    func verifyTabRename() async throws {
+        let target = store.tabs[0].id, selected = store.selected
+        let list = table()
+        func openEditor() async throws -> (NSWindow, NSTextField) {
+            guard let row = list.ids.firstIndex(of: target) else { throw PerchError("Missing rename tab") }
+            let rect = list.rect(ofRow: row)
+            let event = NSEvent.mouseEvent(with: .rightMouseDown,
+                location: list.convert(NSPoint(x: rect.midX, y: rect.midY), to: nil),
+                modifierFlags: [], timestamp: 0, windowNumber: panel.windowNumber,
+                context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!
+            guard let menu = list.menu(for: event), let index = menu.items.firstIndex(where: { $0.title == "重命名…" }) else {
+                throw PerchError("Right-click did not offer Rename")
+            }
+            menu.performActionForItem(at: index)
+            try await AISelfCheck.wait { self.panel.attachedSheet != nil }
+            let sheet = panel.attachedSheet!
+            func field(_ view: NSView) -> NSTextField? {
+                if let field = view as? NSTextField, field.isEditable { return field }
+                return view.subviews.lazy.compactMap(field).first
+            }
+            guard let field = sheet.contentView.flatMap(field) else { throw PerchError("Rename sheet has no editor") }
+            return (sheet, field)
+        }
+        func submit(_ text: String, button: String) async throws {
+            let (sheet, field) = try await openEditor()
+            guard field.stringValue == store.tabs.first(where: { $0.id == target })?.displayTitle else {
+                throw PerchError("Rename editor did not use the visible title")
+            }
+            field.stringValue = text
+            if let editor = field.currentEditor() as? NSTextView { editor.string = text }
+            func find(_ view: NSView) -> NSButton? {
+                if let buttonView = view as? NSButton, buttonView.title == button { return buttonView }
+                return view.subviews.lazy.compactMap(find).first
+            }
+            guard let action = sheet.contentView.flatMap(find) else { throw PerchError("Missing rename action \(button)") }
+            action.performClick(nil)
+            try await AISelfCheck.wait { self.panel.attachedSheet == nil }
+        }
+        try await submit("  我的标签  ", button: "保存")
+        let index = store.tabs.firstIndex(where: { $0.id == target })!
+        store.tabs[index].title = "更新的自动标题"
+        try await submit("不保存", button: "取消")
+        let restored = Store(defaults: defaults)
+        guard store.selected == selected, store.tabs[index].displayTitle == "我的标签",
+              restored.tabs.first(where: { $0.id == target })?.displayTitle == "我的标签" else {
+            throw PerchError("Rename changed selection or did not survive title updates and restore")
+        }
+        try await submit(" ", button: "保存")
+        guard store.tabs[index].displayTitle == "更新的自动标题" else { throw PerchError("Blank rename did not restore automatic title") }
+        print("PASS: native tab menu opens rename sheet; save, cancel, persistence and automatic title reset")
+    }
+
     func verifyTabDrag() async {
         func check(_ value: @autoclosure () -> Bool, _ message: String, line: UInt = #line) {
             guard value() else { fputs("FAIL: tab drag \(line): \(message)\n", stderr); exit(1) }

@@ -987,8 +987,8 @@ struct BookmarksPage: View {
     }
     private var rows: [BookmarkListItem] {
         if case .group(let id) = scope {
-            return store.tabs(inGroup: id).filter { matches($0.title, $0.address) }.map {
-                BookmarkListItem(key: "group/\(id)/\($0.id)", site: Site(id: $0.id, title: $0.title, address: $0.address),
+            return store.tabs(inGroup: id).filter { matches($0.displayTitle, $0.address) }.map {
+                BookmarkListItem(key: "group/\(id)/\($0.id)", site: Site(id: $0.id, title: $0.displayTitle, address: $0.address),
                     groupID: id)
             }
         }

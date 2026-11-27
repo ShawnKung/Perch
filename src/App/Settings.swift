@@ -112,12 +112,14 @@ struct Tab: Identifiable, Codable, Equatable {
     var id = UUID()
     var title: String
     var address: String
+    var customTitle: String?
     var pinned = false
     var chatOwner: UUID?
     var aiOwner: UUID?
     var aiSidebarOpen: Bool?
     var groupID: UUID?
     var isChat: Bool { ChatPage.matches(URL(string: address)) || chatOwner != nil }
+    var displayTitle: String { customTitle ?? title }
     mutating func migrateChat() {
         guard chatOwner != nil else { return }
         address = ChatPage.url.absoluteString; title = "AI 聊天"; chatOwner = nil

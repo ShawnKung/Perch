@@ -993,8 +993,10 @@ final class Store: ObservableObject {
         if select { selected = id }
     }
 
-    func newTab(address: String = "", title: String = "新标签页", after: UUID? = nil, select: Bool = true) {
-        var tab = Tab(title: title == "新标签页" ? URL(string: address)?.host ?? title : title, address: address)
+    func newTab(address: String = "", title: String = "新标签页", after: UUID? = nil, select: Bool = true,
+                customTitle: String? = nil) {
+        var tab = Tab(title: title == "新标签页" ? URL(string: address)?.host ?? title : title,
+                      address: address, customTitle: customTitle)
         let url = URL(string: address)
         if select, hasWindowedTabList?() == true, DownloadsPage.matches(url) || HistoryPage.matches(url) {
             pendingInternalPageLoads.insert(tab.id)
@@ -1014,6 +1016,15 @@ final class Store: ObservableObject {
         // Publish the arrival of the content controller without changing the selected tab.
         objectWillChange.send()
         activate(id, select: false)
+    }
+
+    func renameTab(_ id: UUID, to title: String) {
+        guard !protectedKeys.contains("tabs"), let index = tabs.firstIndex(where: { $0.id == id }) else { return }
+        let name = String(title.trimmingCharacters(in: .whitespacesAndNewlines).prefix(80))
+        let customTitle = name.isEmpty ? nil : name
+        guard tabs[index].customTitle != customTitle else { return }
+        tabs[index].customTitle = customTitle
+        persistTabs()
     }
 
     func openDownloads() {
