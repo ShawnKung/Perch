@@ -49,8 +49,23 @@ rm -rf "$APP/Contents/Resources/markdown"
 cp -R "$ROOT/assets/markdown" "$APP/Contents/Resources/"
 rm -rf "$APP/Contents/Resources/internal"
 cp -R "$ROOT/assets/internal" "$APP/Contents/Resources/"
-swift -e 'import Foundation; let root = URL(fileURLWithPath: CommandLine.arguments[1]); for name in ["mermaid.js", "marked.js", "purify.js", "diagram.js", "diagram.css", "tables.js", "chat.js"] { let source = root.appendingPathComponent(name); let data = try Data(contentsOf: source); let packed = try (data as NSData).compressed(using: .lzma); let restored = try packed.decompressed(using: .lzma) as Data; precondition(restored == data); let output = name == "mermaid.js" ? "mermaid.lzma" : name + ".lzma"; try (packed as Data).write(to: root.appendingPathComponent(output)); try FileManager.default.removeItem(at: source) }' \
-  "$APP/Contents/Resources/markdown"
+swift -e '
+import Foundation
+for directory in CommandLine.arguments.dropFirst() {
+    let root = URL(fileURLWithPath: directory)
+    for source in try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+        where ["html", "js", "css"].contains(source.pathExtension) {
+        let data = try Data(contentsOf: source)
+        let packed = try (data as NSData).compressed(using: .lzma)
+        let restored = try packed.decompressed(using: .lzma) as Data
+        precondition(restored == data)
+        let output = source.lastPathComponent == "mermaid.js" ?
+            root.appendingPathComponent("mermaid.lzma") : source.appendingPathExtension("lzma")
+        try (packed as Data).write(to: output)
+        try FileManager.default.removeItem(at: source)
+    }
+}
+' "$APP/Contents/Resources/markdown" "$APP/Contents/Resources/internal"
 bash "$ROOT/scripts/sign-app.sh" "$APP"
 printf '[%s] [完成] %s\n' "$(date '+%H:%M:%S')" "$APP"
 if [[ "${1:-}" == "--run" ]]; then open "$APP"; fi
