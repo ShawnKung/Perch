@@ -28,10 +28,10 @@ enum InternalPage {
         }
         return contents
     }()
-    static func document(_ name: String) -> Data {
+    static func document(_ name: String, style: String = "") -> Data {
         let html = assets["\(name).html"] ?? ""
         guard !html.isEmpty else { return Data("<p>页面组件缺失，请重新安装 Perch。</p>".utf8) }
-        return Data(html.replacingOccurrences(of: "/* internal.css */", with: assets["internal.css"] ?? "").utf8)
+        return Data(html.replacingOccurrences(of: "/* internal.css */", with: (assets["internal.css"] ?? "") + style).utf8)
     }
     static func install(_ name: String, handler: WKScriptMessageHandler, in configuration: WKWebViewConfiguration,
                         bridge: String = "perchInternal") {
@@ -62,14 +62,22 @@ enum ChatPage {
 }
 
 final class InternalPageSchemeHandler: NSObject, WKURLSchemeHandler {
+    weak var settingsPage: SettingsPageBridge?
+
+    init(settingsPage: SettingsPageBridge) { self.settingsPage = settingsPage }
+
     func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
         let name: String
         if DownloadsPage.matches(task.request.url) { name = "downloads" }
         else if HistoryPage.matches(task.request.url) { name = "history" }
+        else if SettingsRoute(task.request.url) != nil { name = "settings" }
         else if ChatPage.matches(task.request.url) { name = "chat" }
         else { task.didFailWithError(URLError(.unsupportedURL)); return }
         // Chat's shared renderer lives above this navigation document.
-        let data = name == "chat" ? Data("<!doctype html><title>AI 聊天</title>".utf8) : InternalPage.document(name)
+        // The outgoing Appearance page may still be previewing a different theme.
+        let theme = name == "settings" ? (settingsPage?.store?.settings.theme ?? PerchTheme.shared.selection).webColors : [:]
+        let style = theme.isEmpty ? "" : "\n:root{\(theme.map { "--perch-\($0.key):\($0.value)" }.joined(separator: ";"))}\n"
+        let data = name == "chat" ? Data("<!doctype html><title>AI 聊天</title>".utf8) : InternalPage.document(name, style: style)
         task.didReceive(URLResponse(url: task.request.url!, mimeType: "text/html",
                                    expectedContentLength: data.count, textEncodingName: "utf-8"))
         task.didReceive(data); task.didFinish()

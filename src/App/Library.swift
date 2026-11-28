@@ -151,7 +151,7 @@ struct TabSidebar: View, Animatable {
                         .padding(.horizontal, compact ? 0 : 8)
                 }
                 Color(palette.line).frame(height: 1)
-                Button { store.library = .settings } label: {
+                Button { store.openSettings() } label: {
                     HStack(spacing: 8) {
                         Image(systemName: "gearshape").font(.system(size: 15))
                         if !compact { Text("设置").font(.system(size: 12)) }
@@ -170,37 +170,5 @@ struct TabSidebar: View, Animatable {
                         SidebarChromeShape(width: width, top: topBarHeight, filled: false).stroke(Color(palette.line), lineWidth: 1)
                     }.allowsHitTesting(false)
             }
-    }
-}
-
-struct LibraryView: View {
-    @ObservedObject private var theme = PerchTheme.shared
-    @ObservedObject var store: Store
-    @State var page: LibraryPage
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Spacer()
-                Button("完成") { store.library = nil }.keyboardShortcut(.cancelAction).disabled(store.importing)
-            }.padding(20)
-            Picker("", selection: $page) {
-                ForEach(LibraryPage.allCases) { page in Text(page.rawValue).tag(page) }
-            }.labelsHidden().pickerStyle(.segmented).padding(.horizontal, 20).padding(.bottom, 14).disabled(store.importing)
-            Divider()
-            switch page {
-            case .ai: AISettingsPage(store: store, ai: store.ai) {
-                store.aiVisible = true; store.library = nil
-            }
-            case .settings: SettingsPage(store: store, openPasswords: { page = .passwords })
-            case .importer: ImportPage(store: store)
-            case .passwords: PasswordsPage(store: store)
-            case .bookmarks: BookmarksPage(store: store)
-            }
-        }.frame(width: 780, height: 580)
-            .background(Style.paper).interactiveDismissDisabled(store.importing)
-            .foregroundStyle(Style.ink).tint(Style.accent).preferredColorScheme(.light)
-            .alert("提示", isPresented: Binding(get: { store.notice != nil }, set: { if !$0 { store.notice = nil } })) {
-                Button("知道了") { store.notice = nil }
-            } message: { Text(store.notice ?? "") }
     }
 }

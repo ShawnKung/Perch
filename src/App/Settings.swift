@@ -3,6 +3,221 @@ import SwiftUI
 import Carbon
 import ServiceManagement
 import WebKit
+import Combine
+
+enum SettingsRoute: String, CaseIterable {
+    case general, appearance, ai, bookmarks, passwords, importer, about
+
+    var url: URL {
+        URL(string: "perch://settings" + (self == .general ? "" : "/\(rawValue)"))!
+    }
+
+    init?(_ url: URL?) {
+        guard let url, url.scheme?.lowercased() == "perch", url.host?.lowercased() == "settings",
+              url.user == nil, url.password == nil, url.port == nil,
+              url.query == nil, url.fragment == nil else { return nil }
+        guard let path = URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedPath else { return nil }
+        if path.isEmpty || path == "/" { self = .general }
+        else if let route = Self.allCases.first(where: { path == "/\($0.rawValue)" }) { self = route }
+        else { return nil }
+    }
+}
+
+@MainActor
+final class SettingsPageBridge: NSObject, WKScriptMessageHandler {
+    weak var web: WKWebView?
+    weak var store: Store?
+    private var subscriptions = Set<AnyCancellable>()
+    var onRouteChanged: ((URL) -> Void)?
+    private var activeURL: URL?
+    var errors: [SettingsRoute: String] = [:]
+    var error: String {
+        get { SettingsRoute(web?.url).flatMap { errors[$0] } ?? "" }
+        set { if let route = SettingsRoute(web?.url) { errors[route] = newValue } }
+    }
+    let recorder = KeyRecorder()
+    lazy var imports = SettingsImportController()
+    var discoveredModels: [String] = []
+    var discoveryID = ""
+    var modelTask: Task<Void, Never>?
+    var passwordLoaded = false
+    private var revealSheet: NSWindow?
+    private var previewingTheme = false
+
+    func revealPassword(_ password: String, origin: String, in window: NSWindow) {
+        guard window.attachedSheet == nil else { return }
+        let alert = NSAlert()
+        alert.messageText = origin
+        let value = NSTextField(labelWithString: password)
+        value.isSelectable = true
+        value.frame = NSRect(x: 0, y: 0, width: 320, height: 28)
+        alert.accessoryView = value
+        alert.addButton(withTitle: "完成")
+        revealSheet = alert.window
+        alert.beginSheetModal(for: window) { [weak self] _ in
+            value.stringValue = ""
+            self?.revealSheet = nil
+        }
+    }
+
+    func deactivate(clearSecrets: Bool = true) {
+        recorder.stop()
+        endThemePreview()
+        if clearSecrets, let web, [.ai, .passwords].contains(SettingsRoute(web.url)) {
+            web.callAsyncJavaScript("window.perchClearSettingsSecrets?.()", arguments: [:], in: nil,
+                                    in: .defaultClient, completionHandler: nil)
+        }
+        if let sheet = revealSheet, let window = sheet.sheetParent { window.endSheet(sheet) }
+    }
+
+    private func endThemePreview() {
+        guard previewingTheme else { return }
+        previewingTheme = false
+        if let store { PerchTheme.shared.selection = store.settings.theme }
+    }
+
+    func stop() {
+        deactivate()
+        modelTask?.cancel(); modelTask = nil
+        discoveredModels = []; discoveryID = ""
+        subscriptions.removeAll(); errors.removeAll(); passwordLoaded = false; activeURL = nil
+    }
+    func start() {
+        guard let store else { return }
+        guard let web, let url = web.url, let route = SettingsRoute(url) else { return }
+        if let activeURL, activeURL != url {
+            deactivate(clearSecrets: false)
+            onRouteChanged?(url)
+        }
+        activeURL = url
+        if !passwordLoaded, route == .passwords, store.browser?.webView === web {
+            passwordLoaded = true
+            do { try store.passwords.load() } catch { self.error = error.localizedDescription }
+        }
+        if subscriptions.isEmpty {
+            NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)
+                .sink { [weak self] _ in self?.deactivate() }.store(in: &subscriptions)
+            // Read the committed values after the publisher's will-change notification.
+            for publisher in [store.$settings.map { _ in () }.eraseToAnyPublisher(),
+                              store.$checkingUpdate.map { _ in () }.eraseToAnyPublisher(),
+                              store.$availableUpdate.map { _ in () }.eraseToAnyPublisher(),
+                              store.$sites.map { _ in () }.eraseToAnyPublisher(),
+                              store.$tabGroups.map { _ in () }.eraseToAnyPublisher(),
+                              store.$bookmarkFolders.map { _ in () }.eraseToAnyPublisher(),
+                              store.$importedBookmarks.map { _ in () }.eraseToAnyPublisher(),
+                              store.passwords.objectWillChange.eraseToAnyPublisher(),
+                              store.ai.$keyedProviders.map { _ in () }.eraseToAnyPublisher(),
+                              store.ai.$searchHasKey.map { _ in () }.eraseToAnyPublisher(),
+                              store.ai.$providers.map { _ in () }.eraseToAnyPublisher(),
+                              store.ai.$searchConfiguration.map { _ in () }.eraseToAnyPublisher()] {
+                publisher.sink { [weak self] in
+                    DispatchQueue.main.async { self?.update() }
+                }.store(in: &subscriptions)
+            }
+        }
+        update()
+    }
+
+    func update(receipt: Int? = nil) {
+        guard let store, let web, let route = SettingsRoute(web.url) else { return }
+        let settings = store.settings
+        let login = SMAppService.mainApp.status
+        PerchTheme.shared.update(web)
+        var state: [String: Any] = [
+            "route": route.rawValue, "error": error, "values": [
+                "showWindowOnLaunch": settings.showWindowOnLaunch, "followMouseOnShow": settings.followMouseOnShow,
+                "login": login == .enabled || login == .requiresApproval, "savePasswords": settings.savePasswords,
+                "linkPreviewEnabled": settings.linkPreviewEnabled, "linkPreviewDelay": settings.linkPreviewDelay,
+                "searchEngine": settings.searchEngine, "customSearchURL": settings.customSearchURL,
+                "uaMode": settings.uaMode, "customUA": settings.customUA, "theme": settings.theme.rawValue,
+                "chatFontSize": settings.chatFontSize, "aiSendWithCommand": settings.aiSendWithCommand
+            ] as [String: Any],
+            "themes": ThemeColor.allCases.map { ["id": $0.rawValue, "name": $0.name, "color": $0.webColors["line"]!] },
+            "loginNote": login == .requiresApproval ? "等待系统批准，请在登录项设置中允许 Perch。" : "",
+            "userAgent": settings.userAgent ?? "使用 macOS WebKit 的默认 UA",
+            "shortcuts": ["open": settings.openKey?.label ?? "", "close": settings.closeKey?.label ?? "",
+                          "toggle": settings.toggleKey?.label ?? "", "preview": settings.linkPreviewKey.singleKeyLabel],
+            "recording": recorder.target ?? "",
+            "version": UpdateCheck.currentVersion, "checking": store.checkingUpdate,
+            "update": store.availableUpdate ?? "", "updateMessage": store.updateCheckMessage ?? ""
+        ]
+        if let receipt { state["receipt"] = receipt }
+        switch route {
+        case .ai: state["ai"] = aiState(store.ai)
+        case .bookmarks: state["library"] = bookmarkState(store)
+        case .passwords:
+            state["passwords"] = store.passwords.entries.map {
+                ["id": $0.id.uuidString, "origin": $0.origin, "username": $0.username]
+            }
+        case .importer:
+            state["imports"] = imports.state
+            state["importing"] = store.importing
+        default: break
+        }
+        InternalPage.update(state, web: web)
+    }
+
+    func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard let web, let route = SettingsRoute(web.url),
+              InternalPage.accepts(message, web: web, matches: { SettingsRoute($0) == route }),
+              let store, let body = message.body as? [String: Any],
+              let action = body["action"] as? String else { return }
+        if action == "ready" { start(); return }
+        guard let window = web.window, window.attachedSheet == nil, store.browser?.webView === web, !store.adding else { return }
+        error = ""
+        do {
+            switch (route, action) {
+            case (.general, "loginItems"): SMAppService.openSystemSettingsLoginItems()
+            case (.ai, "chat"): store.openChat()
+            case (.about, "check"): store.checkForUpdates(manual: true)
+            case (.about, "source"): NSWorkspace.shared.open(UpdateCheck.repositoryURL)
+            case (.about, "release"):
+                if store.availableUpdate != nil { NSWorkspace.shared.open(UpdateCheck.releaseURL) }
+            case (.appearance, "previewTheme"):
+                if let raw = body["theme"] as? String, let color = ThemeColor(rawValue: raw) {
+                    previewingTheme = true
+                    PerchTheme.shared.selection = color
+                } else { endThemePreview() }
+            case (_, "change"):
+                guard let key = body["key"] as? String else { return }
+                let value = body["value"]
+                var next = store.settings
+                switch (route, key, value) {
+                case (.general, "showWindowOnLaunch", let v as Bool): next.showWindowOnLaunch = v
+                case (.general, "followMouseOnShow", let v as Bool): next.followMouseOnShow = v
+                case (.general, "login", let v as Bool): try LaunchAtLogin.set(v); update(); return
+                case (.general, "linkPreviewEnabled", let v as Bool): next.linkPreviewEnabled = v
+                case (.general, "linkPreviewDelay", let v as Double): next.linkPreviewDelay = v
+                case (.general, "searchEngine", let v as String): next.searchEngine = v
+                case (.general, "customSearchURL", let v as String) where v.count <= 2048: next.customSearchURL = v
+                case (.general, "uaMode", let v as String) where ["safari", "chrome", "system", "custom"].contains(v):
+                    next.uaMode = v
+                    if v == "custom", next.customUA.isEmpty {
+                        next.customUA = store.settings.userAgent ?? BrowserSettings().userAgent ?? ""
+                    }
+                case (.general, "customUA", let v as String) where v.count <= 1024: next.customUA = v
+                case (.appearance, "theme", let v as String):
+                    guard let theme = ThemeColor(rawValue: v) else { return }
+                    endThemePreview()
+                    next.theme = theme
+                case (.appearance, "chatFontSize", let v as Double): next.chatFontSize = v
+                case (.ai, "aiSendWithCommand", let v as Bool): next.aiSendWithCommand = v
+                case (.passwords, "savePasswords", let v as Bool): next.savePasswords = v
+                default: return
+                }
+                if next != store.settings { try store.saveSettings(next) }
+            case (.general, "record"), (.general, "clearShortcut"):
+                try shortcut(action, body: body, store: store)
+            case (.ai, _): try aiAction(action, body: body, store: store)
+            case (.bookmarks, _): try bookmarkAction(action, body: body, store: store)
+            case (.passwords, _): try passwordAction(action, body: body, store: store)
+            case (.importer, _): imports.handle(action, body: body, store: store, update: { [weak self] in self?.update() })
+            default: return
+            }
+        } catch { self.error = error.localizedDescription }
+        update(receipt: body["request"] as? Int)
+    }
+}
 
 enum ThemeColor: String, Codable, CaseIterable {
     case red, orange, yellow, green, cyan, blue, purple, pink, white
@@ -218,11 +433,6 @@ struct Visit: Identifiable, Codable {
     var title: String
     var address: String
     var date: Date
-}
-
-enum LibraryPage: String, Identifiable, CaseIterable {
-    case settings = "常规", ai = "AI", bookmarks = "书签与分组", passwords = "密码", importer = "导入导出"
-    var id: String { rawValue }
 }
 
 struct PerchError: LocalizedError {
@@ -506,232 +716,4 @@ final class KeyRecorder: ObservableObject {
         }
     }
     deinit { if let monitor { NSEvent.removeMonitor(monitor) } }
-}
-
-struct ShortcutRecorder: View {
-    @ObservedObject private var theme = PerchTheme.shared
-    @Binding var shortcut: Shortcut?
-    @ObservedObject var recorder: KeyRecorder
-    let target: String
-    var body: some View {
-        HStack {
-            Button(recorder.target == target ? "请按组合键 · Esc 取消" : shortcut?.label ?? "点击录制") {
-                recorder.start(target) { shortcut = $0 }
-            }.frame(minWidth: 150)
-            Button("清除") { recorder.stop(); shortcut = nil }.disabled(shortcut == nil)
-        }
-    }
-}
-
-struct SettingsFocusDismissal: NSViewRepresentable {
-    func makeNSView(context: Context) -> DismissView { DismissView() }
-    func updateNSView(_ view: DismissView, context: Context) {}
-    final class DismissView: NSView {
-        private var monitor: Any?
-        override var acceptsFirstResponder: Bool { true }
-        override func hitTest(_ point: NSPoint) -> NSView? { nil }
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            if let monitor { NSEvent.removeMonitor(monitor); self.monitor = nil }
-            guard let window else { return }
-            window.initialFirstResponder = self
-            window.makeFirstResponder(self)
-            monitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
-                guard let self, let window = self.window, event.window === window,
-                      self.bounds.contains(self.convert(event.locationInWindow, from: nil)),
-                      let editor = window.firstResponder as? NSTextView, editor.isFieldEditor,
-                      !editor.visibleRect.contains(editor.convert(event.locationInWindow, from: nil)) else { return event }
-                window.makeFirstResponder(nil)
-                return event
-            }
-        }
-        deinit { if let monitor { NSEvent.removeMonitor(monitor) } }
-    }
-}
-
-struct SettingsPage: View {
-    @ObservedObject private var theme = PerchTheme.shared
-    @ObservedObject var store: Store
-    var openPasswords: () -> Void = {}
-    @State private var draft = BrowserSettings()
-    @State private var message = ""
-    @State private var login = false
-    @State private var loginStatus = ""
-    @State private var pendingSave: Task<Void, Never>?
-    @State private var themePreview: Task<Void, Never>?
-    @State private var hoveredTheme: ThemeColor?
-    @StateObject private var recorder = KeyRecorder()
-    var body: some View {
-        Form {
-            Section("启动") {
-                Toggle("登录 Mac 时启动 Perch", isOn: Binding(get: { login }, set: { enabled in
-                    do {
-                        try LaunchAtLogin.set(enabled)
-                    } catch { message = error.localizedDescription }
-                    refreshLogin()
-                }))
-                Toggle("启动 Perch 时打开主窗口", isOn: $draft.showWindowOnLaunch)
-                if !loginStatus.isEmpty {
-                    Text(loginStatus).font(.caption).foregroundStyle(.secondary)
-                }
-                Button("打开系统登录项设置") { SMAppService.openSystemSettingsLoginItems() }
-            }
-            Section("窗口") {
-                Toggle("主窗口跟随鼠标显示", isOn: $draft.followMouseOnShow)
-                    .accessibilityLabel("主窗口跟随鼠标显示")
-                    .help("每次唤出主窗口时显示在鼠标附近，并保持在屏幕可用区域内。")
-            }
-            Section("外观") {
-                HStack {
-                    Text("主题色")
-                    Spacer()
-                    ForEach(ThemeColor.allCases, id: \.self) { color in
-                        Button { draft.theme = color } label: {
-                            Circle().fill(Color(color.sample))
-                                .overlay(Circle().stroke(Color(color.line), lineWidth: 1))
-                                .overlay {
-                                    if draft.theme == color {
-                                        Image(systemName: "checkmark").font(.system(size: 10, weight: .semibold))
-                                            .foregroundStyle(Color(color.accent))
-                                    }
-                                }.frame(width: 28, height: 28).padding(.vertical, 2)
-                        }.buttonStyle(.plain).accessibilityLabel("\(color.name)色主题")
-                            .accessibilityValue(draft.theme == color ? "已选择" : "未选择")
-                            .onHover { preview(color, entered: $0) }
-                    }
-                }
-                chatFontSetting
-            }
-            Section("搜索引擎") {
-                Picker("默认搜索", selection: $draft.searchEngine) {
-                    Text("Google").tag("google")
-                    Text("Bing").tag("bing")
-                    Text("DuckDuckGo").tag("duckduckgo")
-                    Text("自定义").tag("custom")
-                }
-                if draft.searchEngine == "custom" {
-                    TextField("https://example.com/search?q={query}", text: $draft.customSearchURL)
-                        .textFieldStyle(.roundedBorder)
-                    Text("用 {query} 代表搜索关键词。").font(.caption).foregroundStyle(.secondary)
-                }
-            }
-            Section("密码") {
-                Toggle("询问是否保存网站密码", isOn: $draft.savePasswords)
-                Button("管理已保存的密码", action: openPasswords)
-            }
-            Section("链接临时预览") {
-                HStack(spacing: 6) {
-                    HStack(spacing: 6) {
-                        Text("由")
-                        Button {
-                            recorder.startHoldKey { draft.linkPreviewKey = $0 }
-                        } label: {
-                            Text(recorder.target == "linkPreview" ? "…" : draft.linkPreviewKey.singleKeyLabel)
-                                .frame(minWidth: 28)
-                        }
-                        .help("点击设置触发键，Esc 取消").accessibilityLabel("设置触发键")
-                        Text("键在")
-                        TextField("等待时间", value: $draft.linkPreviewDelay, format: .number)
-                            .labelsHidden().textFieldStyle(.plain)
-                            .multilineTextAlignment(.center).monospacedDigit()
-                            .foregroundStyle(Style.accent).frame(width: 56).padding(.vertical, 4)
-                            .background(Style.accent.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
-                            .accessibilityLabel("等待秒数")
-                        Text("秒触发")
-                    }.disabled(!draft.linkPreviewEnabled)
-                    Spacer()
-                    Toggle("链接预览", isOn: $draft.linkPreviewEnabled).labelsHidden()
-                        .accessibilityLabel("启用链接预览")
-                }
-            }
-            Section("浏览器标识 · User-Agent") {
-                Picker("使用标识", selection: $draft.uaMode) {
-                    Text("Safari \(BrowserSettings.safariVersion)（推荐）").tag("safari")
-                    Text("Chrome \(BrowserSettings.chromeVersion) 兼容标识").tag("chrome")
-                    Text("系统 WebKit").tag("system")
-                    Text("自定义").tag("custom")
-                }
-                if draft.uaMode == "custom" { TextField("User-Agent", text: $draft.customUA).textFieldStyle(.roundedBorder) }
-                Text(draft.userAgent ?? "使用 macOS WebKit 的默认 UA").font(.caption.monospaced()).textSelection(.enabled)
-            }
-            Section("全局快捷键") {
-                HStack { Text("打开窗口"); Spacer(); ShortcutRecorder(shortcut: $draft.openKey, recorder: recorder, target: "open") }
-                HStack { Text("收起窗口"); Spacer(); ShortcutRecorder(shortcut: $draft.closeKey, recorder: recorder, target: "close") }
-                HStack { Text("隐藏 / 展示窗口"); Spacer(); ShortcutRecorder(shortcut: $draft.toggleKey, recorder: recorder, target: "toggle") }
-            }
-            if !message.isEmpty {
-                Text(message).font(.caption).foregroundStyle(Style.muted)
-            }
-            AboutSettingsGroup(store: store) { store.checkForUpdates(manual: true) }
-        }.formStyle(.grouped).scrollContentBackground(.hidden)
-            .background(Style.paper).background(SettingsFocusDismissal()).onAppear {
-            draft = store.settings; refreshLogin(); recorder.recordingChanged = store.shortcutRecording
-        }.onChange(of: draft) { value in
-            pendingSave?.cancel()
-            if (value.uaMode == "custom" && value.customUA != store.settings.customUA) ||
-                (value.searchEngine == "custom" && value.customSearchURL != store.settings.customSearchURL) {
-                pendingSave = Task { @MainActor in
-                    try? await Task.sleep(nanoseconds: 400_000_000)
-                    guard !Task.isCancelled else { return }
-                    apply(value)
-                }
-            } else { apply(value) }
-        }.onDisappear {
-            pendingSave?.cancel()
-            themePreview?.cancel()
-            theme.selection = store.settings.theme
-            recorder.stop()
-            apply(draft)
-        }
-    }
-
-    private var chatFontSetting: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 12) {
-                Text("Chat字号")
-                Slider(value: $draft.chatFontSize, in: BrowserSettings.chatFontSizeRange, step: 1)
-                    .accessibilityLabel("Chat字号")
-                    .accessibilityValue("\(Int(draft.chatFontSize)) pt")
-                Text("\(Int(draft.chatFontSize)) pt").monospacedDigit().frame(width: 42, alignment: .trailing)
-                Button("恢复默认") { draft.chatFontSize = BrowserSettings.defaultChatFontSize }
-                    .disabled(draft.chatFontSize == BrowserSettings.defaultChatFontSize)
-            }
-        }
-    }
-
-    private func apply(_ value: BrowserSettings) {
-        guard value != store.settings else { message = ""; return }
-        do { try store.saveSettings(value); message = "" }
-        catch { message = "尚未生效，保留上次设置：\(error.localizedDescription)" }
-    }
-
-    private func preview(_ color: ThemeColor, entered: Bool) {
-        themePreview?.cancel()
-        if entered {
-            hoveredTheme = color
-            themePreview = Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 500_000_000)
-                guard !Task.isCancelled, hoveredTheme == color else { return }
-                theme.selection = color
-            }
-        } else if hoveredTheme == color {
-            hoveredTheme = nil
-            themePreview = Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 500_000_000)
-                guard !Task.isCancelled, hoveredTheme == nil else { return }
-                theme.selection = draft.theme
-            }
-        }
-    }
-
-    private func refreshLogin() {
-        let status = SMAppService.mainApp.status
-        login = status == .enabled || status == .requiresApproval
-        switch status {
-        case .enabled: loginStatus = ""
-        case .requiresApproval: loginStatus = "等待系统批准，请到登录项设置中允许 Perch。"
-        case .notFound: loginStatus = "系统未找到此应用。请把 Perch.app 放到固定位置后重试。"
-        default: loginStatus = "未启用；建议先将应用移到 /Applications，避免移动后失效。"
-        }
-    }
 }

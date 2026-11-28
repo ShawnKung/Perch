@@ -454,7 +454,7 @@ struct PasswordFillButton: View {
                             }
                         }
                         Divider()
-                        Button("管理密码") { showing = false; store.library = .passwords }
+                        Button("管理密码") { showing = false; store.openSettings(.passwords) }
                     }.padding(16).frame(minWidth: 220)
                 }
             }
@@ -462,107 +462,5 @@ struct PasswordFillButton: View {
         .task { try? vault.load() }
         .onChange(of: browser.address) { _ in showing = false }
         .onChange(of: choices) { _ in showing = false }
-    }
-}
-
-struct PasswordsPage: View {
-    @ObservedObject private var theme = PerchTheme.shared
-    @ObservedObject var store: Store
-    @ObservedObject var vault: PasswordVault
-    @State private var search = ""
-    @State private var message = ""
-    @State private var editID: UUID?
-    @State private var editing = false
-    @State private var origin = ""
-    @State private var username = ""
-    @State private var secret = ""
-    @State private var revealed: UUID?
-    @State private var deleting: SavedPassword?
-    init(store: Store) { self.store = store; self.vault = store.passwords }
-    var body: some View {
-        VStack(spacing: 12) {
-            HStack {
-                TextField("搜索网站或用户名", text: $search).textFieldStyle(.roundedBorder)
-                Button("添加密码") { editID = nil; origin = ""; username = ""; secret = ""; editing = true }
-            }
-            if editing {
-                VStack {
-                    TextField("https://example.com", text: $origin).disabled(editID != nil)
-                    TextField("用户名", text: $username).disabled(editID != nil)
-                    SecureField("密码", text: $secret)
-                    HStack {
-                        Button("保存") {
-                            do {
-                                _ = try vault.save([SavedPassword(id: editID ?? UUID(), origin: origin, username: username, password: secret)])
-                                editing = false; secret = ""; revealed = nil
-                            } catch { message = error.localizedDescription }
-                        }.disabled(secret.isEmpty)
-                        Button("取消") { editing = false; secret = "" }
-                    }
-                }.textFieldStyle(.roundedBorder)
-            }
-            List {
-                ForEach(vault.entries.filter {
-                    search.isEmpty || $0.origin.localizedCaseInsensitiveContains(search) || $0.username.localizedCaseInsensitiveContains(search)
-                }) { item in
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(item.origin).font(.system(size: 13, weight: .semibold))
-                        Text(item.username.isEmpty ? "无用户名" : item.username).font(.caption)
-                        HStack {
-                            Text(revealed == item.id ? item.password : "••••••••").font(.caption.monospaced())
-                            Spacer()
-                            Button(revealed == item.id ? "隐藏" : "查看") {
-                                if revealed == item.id { revealed = nil }
-                                else { authenticate { revealed = item.id } }
-                            }
-                            Button("复制") { authenticate {
-                                copyAddress(item.password)
-                                let change = NSPasteboard.general.changeCount
-                                Task { @MainActor in
-                                    try? await Task.sleep(nanoseconds: 30_000_000_000)
-                                    if NSPasteboard.general.changeCount == change { NSPasteboard.general.clearContents() }
-                                }
-                            } }
-                            Button("修改") { authenticate {
-                                editID = item.id; origin = item.origin; username = item.username; secret = ""; editing = true
-                            } }
-                            Button("删除", role: .destructive) { deleting = item }
-                        }
-                    }.padding(.vertical, 5)
-                }
-            }.listStyle(.plain).scrollContentBackground(.hidden).background(Style.paper)
-            if !message.isEmpty {
-                HStack {
-                    Text(message).font(.caption).foregroundStyle(Style.muted)
-                    Button("授权读取") {
-                        do { try vault.load(allowInteraction: true); message = "" }
-                        catch { message = error.localizedDescription }
-                    }
-                    Button("启用新密码库") {
-                        do { try vault.initializeWithoutLegacyAuthorization(); message = "" }
-                        catch { message = error.localizedDescription }
-                    }
-                }
-            }
-            Text("\(vault.entries.count) 个账号")
-                .font(.caption).foregroundStyle(Style.muted).frame(maxWidth: .infinity, alignment: .leading)
-        }.padding(20).onAppear { do { try vault.load() } catch { message = error.localizedDescription } }
-            .onDisappear { secret = ""; revealed = nil }
-            .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didDeactivateApplicationNotification)) { _ in
-                revealed = nil; secret = ""
-            }
-            .alert("删除这个保存的密码？", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } })) {
-                Button("取消", role: .cancel) { deleting = nil }
-                Button("删除", role: .destructive) {
-                    if let item = deleting { do { try vault.delete(item.id) } catch { message = error.localizedDescription } }
-                    deleting = nil
-                }
-            }
-    }
-    private func authenticate(_ action: @escaping () -> Void) {
-        Task { @MainActor in
-            do { try await PasswordVault.authenticate(); action() }
-            catch { message = error.localizedDescription }
-        }
     }
 }

@@ -269,7 +269,7 @@ enum HomePageSelfCheck {
         print("PASS: native WebKit composition Return guard, committed drafts, shared bookmark suggestions and arrow/Escape event paths")
     }
     static func drag(store: Store, panel: Panel) async throws {
-        store.library = nil; store.newTab()
+        store.newTab()
         store.sites = (0..<6).map { Site(title: "Home fixture \($0)", address: "http://127.0.0.1:9/home-\($0)") }
         let data = try JSONEncoder().encode(store.sites)
         store.defaults.set(data, forKey: "sites")

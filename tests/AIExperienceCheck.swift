@@ -502,37 +502,12 @@ extension AISelfCheck {
             host.cacheDisplay(in: host.bounds, to: bitmap)
             try bitmap.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path).appendingPathComponent(name + ".png"))
         }
-        let settingsHost = NSHostingView(rootView: SettingsPage(store: store).defaultAppStorage(defaults))
-        window.contentView = settingsHost; window.makeKeyAndOrderFront(nil)
-        try await wait { window.isKeyWindow }
-        try await wait { element(settingsHost, "主窗口跟随鼠标显示") != nil }
-        let follow = try frame(settingsHost, "主窗口跟随鼠标显示")
-        try snapshot(settingsHost, "settings-window")
-        click(NSPoint(x: follow.maxX - 12, y: follow.midY))
-        try await wait { store.settings.followMouseOnShow }
-        let followSettings = try JSONDecoder().decode(BrowserSettings.self, from: defaults.data(forKey: "settings")!)
-        precondition(followSettings.followMouseOnShow)
-        click(NSPoint(x: follow.maxX - 12, y: follow.midY))
-        try await wait { !store.settings.followMouseOnShow }
-        print("PASS: native mouse-follow toggle enables/disables and persists settings")
-        try await wait { element(settingsHost, "Chat字号") != nil }
-        try snapshot(settingsHost, "settings-font-default")
-        let slider = try frame(settingsHost, "Chat字号")
-        click(NSPoint(x: slider.maxX - 8, y: slider.midY))
-        try await wait { store.settings.chatFontSize > 13 }
-        try await Task.sleep(nanoseconds: 150_000_000)
-        let saved = try JSONDecoder().decode(BrowserSettings.self, from: defaults.data(forKey: "settings")!)
-        precondition(saved.chatFontSize == store.settings.chatFontSize)
-        try snapshot(settingsHost, "settings-font-size")
-        let reset = try frame(settingsHost, "恢复默认")
-        click(NSPoint(x: reset.midX, y: reset.midY))
-        try await wait { store.settings.chatFontSize == 13 && PerchTheme.shared.chatFontSize == 13 }
         let legacy = try JSONDecoder().decode(BrowserSettings.self, from: Data("{}".utf8))
         precondition(legacy.chatFontSize == 13 && !legacy.followMouseOnShow)
         for invalid in [0, 23] {
             precondition((try? JSONDecoder().decode(BrowserSettings.self, from: Data("{\"chatFontSize\":\(invalid)}".utf8))) == nil)
         }
-        print("PASS: native slider click persists Chat font size, reset restores 13 pt, legacy and invalid settings are handled")
+        print("PASS: legacy and invalid Chat font settings are handled")
         for fullPage in [true, false] {
             let host = NSHostingView(rootView: AIChatSidebar(store: store, ai: ai, fullPage: fullPage, owner: AIController.homeID, close: {}).defaultAppStorage(defaults))
             window.contentView = host

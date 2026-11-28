@@ -104,10 +104,10 @@ final class HomePageController: NSObject, WKScriptMessageHandler, WKNavigationDe
                              "sites": sites, "revision": store.suggestionRevision, "chatIcon": Self.chatIcon,
                              "date": Date().formatted(.dateTime.month(.wide).day().weekday(.wide))], web: web)
         if let request = store.bookmarkEditRequest, sites.contains(where: { $0["id"] as? String == request.ownerID.uuidString }),
-           anchor.window != nil, store.library == nil, !store.adding {
+           anchor.window != nil, !store.adding {
             DispatchQueue.main.async { [weak self, weak store] in
                 guard let self, let store, self.anchor.window != nil,
-                      store.bookmarkEditRequest?.id == request.id, store.library == nil, !store.adding else { return }
+                      store.bookmarkEditRequest?.id == request.id, !store.adding else { return }
                 store.bookmarkEditRequest = nil
                 store.bookmarkEditor.show(request, store: store, anchor: self.anchor)
             }

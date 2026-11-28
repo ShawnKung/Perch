@@ -135,6 +135,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     let downloads: DownloadController?
     let downloadsPage = DownloadsPageBridge()
     let historyPage = HistoryPageBridge()
+    let settingsPage = SettingsPageBridge()
     @Published var address = ""
     @Published var title = ""
     @Published var loading = false
@@ -212,9 +213,10 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         let bridge = PasswordBridge()
         passwordBridge = bridge
         let configuration = WKWebViewConfiguration()
-        configuration.setURLSchemeHandler(InternalPageSchemeHandler(), forURLScheme: "perch")
+        configuration.setURLSchemeHandler(InternalPageSchemeHandler(settingsPage: settingsPage), forURLScheme: "perch")
         InternalPage.install("downloads", handler: downloadsPage, in: configuration)
         InternalPage.install("history", handler: historyPage, in: configuration, bridge: "perchHistory")
+        InternalPage.install("settings", handler: settingsPage, in: configuration, bridge: "perchSettings")
         if startsAtHome { configuration.setURLSchemeHandler(HomeHistoryPage(), forURLScheme: "perch-home") }
         configuration.websiteDataStore = dataStore ?? .default()
         configuration.userContentController.add(selectionTracker, contentWorld: .defaultClient, name: "perchSelection")
@@ -234,7 +236,15 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         downloadsPage.web = webView
         downloadsPage.downloads = downloads
         historyPage.web = webView
+        settingsPage.web = webView
         super.init()
+        settingsPage.onRouteChanged = { [weak self] url in
+            guard let self else { return }
+            if self.pendingHistoryItem === self.webView.backForwardList.currentItem { self.pendingHistoryItem = nil }
+            self.address = self.displayAddress(url)
+            self.syncNavigationState()
+            self.onVisit?(url.absoluteString, self.title)
+        }
         webView.extendMenu = { [weak self] menu in self?.extendContextMenu(menu) }
         webView.navigationDelegate = self
         webView.uiDelegate = self
@@ -418,7 +428,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         }
     }
 
-    func load(_ url: URL) {
+    func load(_ url: URL, reuseSettings: Bool = true) {
         if firstHomeDestination != nil && webView.backForwardList.currentItem == nil {
             firstHomeDestination = url
             return
@@ -428,6 +438,17 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         httpAlternative = nil
         address = url.absoluteString
         provisionalFailure = false; pendingHistoryItem = nil
+        if reuseSettings, let destination = SettingsRoute(url), let source = webView.url,
+           SettingsRoute(source) != nil, source != url, !webView.isLoading {
+            webView.callAsyncJavaScript("return window.perchNavigateSettings?.(route, url) === true",
+                                        arguments: ["route": destination.rawValue, "url": url.absoluteString],
+                                        in: nil, in: .defaultClient) { [weak self] result in
+                guard let self, (try? result.get()) as? Bool != true,
+                      self.webView.url == source, self.address == url.absoluteString else { return }
+                self.load(url, reuseSettings: false)
+            }
+            return
+        }
         activeNavigation = webView.load(URLRequest(url: url))
         syncNavigationState()
     }
@@ -500,6 +521,8 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         else { downloadsPage.stop() }
         if HistoryPage.matches(webView.url) { historyPage.start() }
         else { historyPage.stop() }
+        settingsPage.stop()
+        if SettingsRoute(webView.url) != nil { settingsPage.start() }
         address = displayAddress(webView.url)
         if startsAtHome && firstHomeDestination == nil { onHomeChanged?(isHome) }
         syncNavigationState()
@@ -553,6 +576,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
                 (downloads != nil && ["blob", "data"].contains(url.scheme?.lowercased() ?? "")) ||
                 DownloadsPage.matches(url) ||
                 HistoryPage.matches(url) ||
+                SettingsRoute(url) != nil ||
                 ChatPage.matches(url) ||
                 (startsAtHome && url == HomeHistoryPage.url && navigationAction.targetFrame?.isMainFrame == true) else {
             error = "此链接使用其他应用的专用协议，Perch 暂不支持打开。"
@@ -648,6 +672,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         downloadsPage.stop()
         historyPage.stop()
+        settingsPage.stop()
         error = "网页进程已退出，点击重新加载即可恢复。"
     }
 }
@@ -727,6 +752,7 @@ final class Store: ObservableObject {
         }
     }
     @Published var selected: UUID? { didSet {
+        if oldValue != selected, let oldValue { browsers[oldValue]?.settingsPage.deactivate() }
         if oldValue != selected {
             if bookmarkEditRequest != nil { bookmarkEditRequest = nil }
             bookmarkEditor.close()
@@ -748,12 +774,6 @@ final class Store: ObservableObject {
     @Published private(set) var checkingUpdate = false
     @Published private(set) var updateCheckMessage: String?
     private var updateTask: Task<Void, Never>?
-    @Published var libraryBookmarkScope = BookmarkScope.root
-    @Published var library: LibraryPage? { didSet {
-        if library != nil { bookmarkEditor.close() }
-        if library != nil { browser?.passwordBridge.dismiss() }
-        if library != .bookmarks { libraryBookmarkScope = .root }
-    } }
     @Published var importing = false
     @Published var recentlyClosed: [Tab] = []
     @Published var settings: BrowserSettings
@@ -794,9 +814,17 @@ final class Store: ObservableObject {
     }
     func cachedFavicon(_ address: String) -> NSImage? { FaviconCache.image(for: address, defaults: defaults) }
     func openBookmarks(scope: BookmarkScope = .root) {
-        libraryBookmarkScope = scope
-        library = .bookmarks
+        switch scope {
+        case .all: settingsBookmarkScope = "all"
+        case .root: settingsBookmarkScope = "root"
+        case .folder(let id): settingsBookmarkScope = "folder:" + id.uuidString
+        case .group(let id): settingsBookmarkScope = "group:" + id.uuidString
+        case .imported(let name): settingsBookmarkScope = "imported:" + name
+        }
+        openSettings(.bookmarks)
+        browser?.settingsPage.update()
     }
+    var settingsBookmarkScope = "all"
     private var protectedKeys = Set<String>()
     var changeWindow: (() -> Void)?
     var restoreWindowPlacement: (() -> Void)?
@@ -914,6 +942,7 @@ final class Store: ObservableObject {
                                dataStore: defaults === UserDefaults.standard ? .default() : .nonPersistent(),
                                trackHoverLinks: true, previewDefaults: defaults, startsAtHome: startsAtHome, downloads: downloads)
             view.historyPage.store = self
+            view.settingsPage.store = self
             view.onHomeChanged = { [weak self, weak view] home in
                 guard let self, let view, let index = self.tabs.firstIndex(where: { $0.id == id }) else { return }
                 self.tabs[index].address = home ? "" : view.address
@@ -953,13 +982,13 @@ final class Store: ObservableObject {
                 return self.bookmark(for: view.address) != nil
             }
             view.passwordBridge.requested = { [weak self, weak view] origin, rect, token in
-                guard let self, let view, self.selected == id, self.library == nil, !self.adding,
+                guard let self, let view, self.selected == id, !self.adding,
                       self.pendingPassword == nil else { return }
                 do {
                     try self.passwords.load()
                     view.passwordBridge.show(self.passwords.entries.filter { $0.origin == origin },
                         at: rect, token: token, in: view.webView,
-                        manage: { [weak self] in self?.library = .passwords },
+                        manage: { [weak self] in self?.openSettings(.passwords) },
                         failed: { [weak self] error in self?.notice = error })
                 } catch {
                     // Automatic field focus must not interrupt typing; management shows any vault error.
@@ -967,7 +996,7 @@ final class Store: ObservableObject {
                 }
             }
             view.passwordBridge.detected = { [weak self] candidate in
-                guard let self, self.settings.savePasswords, self.library == nil, !self.adding,
+                guard let self, self.settings.savePasswords, !self.adding,
                       self.pendingPassword == nil, self.selected == id else { return }
                 do {
                     try self.passwords.load()
@@ -991,6 +1020,7 @@ final class Store: ObservableObject {
             browsers[id] = view
         }
         if select { selected = id }
+        if let browser = browsers[id], SettingsRoute(browser.webView.url) != nil { browser.settingsPage.start() }
     }
 
     func newTab(address: String = "", title: String = "新标签页", after: UUID? = nil, select: Bool = true,
@@ -998,7 +1028,8 @@ final class Store: ObservableObject {
         var tab = Tab(title: title == "新标签页" ? URL(string: address)?.host ?? title : title,
                       address: address, customTitle: customTitle)
         let url = URL(string: address)
-        if select, hasWindowedTabList?() == true, DownloadsPage.matches(url) || HistoryPage.matches(url) {
+        if select, hasWindowedTabList?() == true,
+           DownloadsPage.matches(url) || HistoryPage.matches(url) || SettingsRoute(url) != nil {
             pendingInternalPageLoads.insert(tab.id)
         }
         let source = after ?? tabs.first(where: { $0.id == selected && $0.groupID != nil })?.id
@@ -1035,6 +1066,18 @@ final class Store: ObservableObject {
     func openHistory() {
         if let tab = tabs.first(where: { HistoryPage.matches(URL(string: $0.address)) }) { activate(tab.id) }
         else { newTab(address: HistoryPage.url.absoluteString, title: "历史记录") }
+    }
+
+    func openSettings(_ route: SettingsRoute? = nil) {
+        bookmarkEditor.close()
+        if let tab = tabs.first(where: { SettingsRoute(URL(string: $0.address)) != nil }) {
+            if selected != tab.id { pendingAddressFocus = nil; prepareNavigation?(); activate(tab.id) }
+            if let route, SettingsRoute(URL(string: tab.address)) != route { navigate(route.url.absoluteString) }
+        } else {
+            pendingAddressFocus = nil
+            prepareNavigation?()
+            newTab(address: (route ?? .general).url.absoluteString, title: "设置")
+        }
     }
 
     @Published var chatHistoryVisible = true
@@ -1422,7 +1465,10 @@ final class Store: ObservableObject {
         linkPreview.settingsChanged()
         persist(value, key: "settings")
         if changed {
-            for browser in browsers.values { browser.webView.customUserAgent = value.userAgent; browser.webView.reload() }
+            for browser in browsers.values {
+                browser.webView.customUserAgent = value.userAgent
+                if SettingsRoute(browser.webView.url) == nil { browser.webView.reload() }
+            }
         }
     }
 
@@ -2283,7 +2329,7 @@ struct WindowTools: View {
                 menuButton("书签管理", icon: "bookmark") { store.openBookmarks() }
                 menuButton("历史记录", icon: "clock.arrow.circlepath") { store.openHistory() }
                 menuButton("下载记录", icon: "arrow.down.to.line") { store.openDownloads() }
-                menuButton("密码管理", icon: "key") { store.library = .passwords }
+                menuButton("密码管理", icon: "key") { store.openSettings(.passwords) }
                 Divider()
                 menuButton("在新标签页打开") {
                     if let id = store.selected, let address = store.tabs.first(where: { $0.id == id })?.address,
@@ -2292,7 +2338,7 @@ struct WindowTools: View {
                 Divider()
                 menuButton("回到首页", icon: "house") { store.selected = nil }
                 menuButton("添加网站") { store.adding = true }
-                menuButton("从浏览器导入…") { store.library = .importer }
+                menuButton("从浏览器导入…") { store.openSettings(.importer) }
                 menuButton("清除当前网站的 Cookie…") {
                     guard let browser = store.browser, let url = browser.webView.url,
                           ["http", "https"].contains(url.scheme?.lowercased() ?? ""), let host = url.host else { return }
@@ -2509,9 +2555,8 @@ struct RootView: View {
         .foregroundStyle(Style.ink).tint(Style.accent).preferredColorScheme(.light)
         .ignoresSafeArea(.container, edges: .top)
         .sheet(isPresented: $store.adding) { AddSite(store: store) }
-        .sheet(item: $store.library) { page in LibraryView(store: store, page: page) }
         .sheet(item: $store.pendingPassword) { candidate in PasswordPrompt(store: store, candidate: candidate) }
-        .alert("提示", isPresented: Binding(get: { store.notice != nil && !store.adding && store.library == nil },
+        .alert("提示", isPresented: Binding(get: { store.notice != nil && !store.adding },
                                           set: { if !$0 { store.notice = nil } })) {
             Button("知道了") { store.notice = nil }
         } message: { Text(store.notice ?? "") }
@@ -2955,25 +3000,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSApp.mainMenu = main
     }
 
-    @objc func newTab() { guard store.library == nil && !store.adding else { return }; store.newTab() }
+    @objc func newTab() { guard !store.adding else { return }; store.newTab() }
     @objc func closeTab() {
         guard let window = NSApp.keyWindow else { return }
-        if store.library != nil && (window === panel || window === panel?.attachedSheet) {
-            if !store.importing { store.library = nil }
-            return
-        }
         if window !== panel { window.performClose(nil); return }
-        guard store.library == nil && !store.adding else { return }
+        guard !store.adding else { return }
         if let id = store.selected { store.close(id) }
     }
-    @objc func reopenTab() { guard store.library == nil && !store.adding else { return }; store.reopen() }
-    @objc func settings() { store.library = .settings }
+    @objc func reopenTab() { guard !store.adding else { return }; store.reopen() }
+    @objc func settings() { if !store.adding { store.openSettings() } }
     @objc func focusAddress() { NotificationCenter.default.post(name: .focusAddress, object: nil) }
-    private var activeBrowser: Browser? { panel?.attachedSheet == nil && store.library == nil && !store.adding ? store.browser : nil }
+    private var activeBrowser: Browser? { panel?.attachedSheet == nil && !store.adding ? store.browser : nil }
     @objc func reloadPage() { activeBrowser?.webView.reload() }
     @objc func reloadFromOrigin() { activeBrowser?.webView.reloadFromOrigin() }
     private var navigationBrowser: Browser? {
-        guard panel?.attachedSheet == nil, store.library == nil, !store.adding,
+        guard panel?.attachedSheet == nil, !store.adding,
               let id = store.selected else { return nil }
         return store.cachedBrowser(for: id)
     }
@@ -2993,12 +3034,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc func nextTab() { switchTab(by: 1) }
     @objc func previousTab() { switchTab(by: -1) }
     private func switchTab(by offset: Int) {
-        guard store.library == nil, !store.adding, panel?.attachedSheet == nil,
+        guard !store.adding, panel?.attachedSheet == nil,
               let index = store.tabs.firstIndex(where: { $0.id == store.selected }), !store.tabs.isEmpty else { return }
         store.activate(store.tabs[(index + offset + store.tabs.count) % store.tabs.count].id)
     }
     @objc func numberedTab(_ sender: NSMenuItem) {
-        guard store.library == nil, !store.adding, panel?.attachedSheet == nil, !store.tabs.isEmpty else { return }
+        guard !store.adding, panel?.attachedSheet == nil, !store.tabs.isEmpty else { return }
         let index = sender.tag == 9 ? store.tabs.count - 1 : sender.tag - 1
         if store.tabs.indices.contains(index) { store.activate(store.tabs[index].id) }
     }
@@ -3180,6 +3221,15 @@ if CommandLine.arguments.contains("--update-self-test") {
     Task { @MainActor in
         setbuf(stdout, nil)
         do { try await HomePageSelfCheck.state(); exit(0) }
+        catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
+    }
+    app.run()
+} else if CommandLine.arguments.contains("--settings-page-self-test") {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.regular)
+    Task { @MainActor in
+        setbuf(stdout, nil)
+        do { try await SettingsPageSelfCheck.ui(); exit(0) }
         catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
     }
     app.run()

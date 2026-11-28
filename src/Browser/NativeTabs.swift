@@ -630,6 +630,7 @@ final class TabCell: NSTableCellView {
         let historyPage = HistoryPage.matches(URL(string: tab.address))
         let symbol: String? = tab.isChat ? "bubble.left.and.bubble.right.fill" :
             historyPage ? "clock.arrow.circlepath" : downloadsPage ? "arrow.down.to.line" :
+            SettingsRoute(URL(string: tab.address)) != nil ? "gearshape" :
             tab.address.isEmpty ? "house" : nil
         label.font = .systemFont(ofSize: 12, weight: symbol != nil ? .semibold : .regular)
         icon.imageScaling = .scaleProportionallyUpOrDown

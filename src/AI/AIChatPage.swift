@@ -351,7 +351,7 @@ final class AIChatPageController: NSObject, ObservableObject, WKScriptMessageHan
         case "searchEnabled": ai.setSearchEnabled(!ai.searchEnabled(for: owner), tab: owner)
         case "searchSource":
             if let raw = body["source"] as? String, let source = AISearchChoice(rawValue: raw) { ai.setSearchSource(source, tab: owner) }
-        case "settings": ai.select(ai.provider(for: owner).id); store.library = .ai
+        case "settings": ai.select(ai.provider(for: owner).id); store.openSettings(.ai)
         case "open":
             if let raw = body["url"] as? String, let url = URLInput.parse(raw, search: false) { store.openReferencedPage(url) }
         case "file": fileAction(body)
