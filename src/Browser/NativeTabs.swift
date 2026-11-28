@@ -395,6 +395,8 @@ final class TabListContainer: NSView {
     private(set) var railViews: [UUID: TabGroupRailView] = [:]
     private var boundsObserver: NSObjectProtocol?
     private let bottomFade = CAGradientLayer()
+    var insertionToReveal: UUID?
+    var insertingRows = false
     override var isFlipped: Bool { true }
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -415,7 +417,26 @@ final class TabListContainer: NSView {
         // Keep the viewport origin fixed while SwiftUI animates the sidebar width.
         let gutter = Self.railGutter
         scroll.frame = NSRect(x: gutter, y: 0, width: max(0, bounds.width - gutter), height: bounds.height)
+        revealInsertion()
         layoutRails()
+    }
+    func revealInsertion() {
+        guard let id = insertionToReveal, let table = scroll.documentView as? TabTable,
+              let row = table.ids.firstIndex(of: id), row < table.numberOfRows else { return }
+        let clip = scroll.contentView
+        let viewport = clip.bounds
+        guard viewport.height > 0 else { return }
+        let rect = table.convert(table.rect(ofRow: row), to: clip)
+        // Leave the selected row above the fade, or scroll to the end where the fade is removed.
+        let bottom = min(rect.maxY + Self.bottomFadeHeight, table.convert(table.bounds, to: clip).maxY)
+        var target = viewport
+        if rect.minY < viewport.minY { target.origin.y = rect.minY }
+        else if bottom > viewport.maxY { target.origin.y += bottom - viewport.maxY }
+        if target.origin != viewport.origin {
+            clip.scroll(to: clip.constrainBoundsRect(target).origin)
+            scroll.reflectScrolledClipView(clip)
+        }
+        if !insertingRows { insertionToReveal = nil }
     }
     private func layoutRails() {
         guard let table = scroll.documentView as? TabTable else { return }
@@ -948,6 +969,13 @@ struct NativeTabList: NSViewRepresentable {
                 }
             }
             let incomingIDs = store.tabs.map(\.id)
+            if let container = table.enclosingScrollView?.superview as? TabListContainer {
+                if let selected = store.selected, selected != lastSelection, !storeIDs.contains(selected) {
+                    container.insertionToReveal = selected
+                } else if container.insertionToReveal != store.selected {
+                    container.insertionToReveal = nil
+                }
+            }
             var startingWipes: [TabRowWipe] = []
             if !storeIDs.isEmpty, table.window != nil, table.dragID == nil,
                !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
@@ -1203,6 +1231,9 @@ struct NativeTabList: NSViewRepresentable {
                     }
                 }
             }
+            // The selected insertion and neighboring rows can still grow after selection.
+            container?.insertingRows = !rowWipes.isEmpty
+            container?.revealInsertion()
             container?.updateRailOrigins()
             if groupsWereAnimating && !table.animatingGroups { table.refreshHover() }
         }
