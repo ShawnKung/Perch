@@ -27,6 +27,7 @@ enum SettingsRoute: String, CaseIterable {
 final class SettingsPageBridge: NSObject, WKScriptMessageHandler {
     weak var web: WKWebView?
     weak var store: Store?
+    var openRelease: (URL) -> Bool = { NSWorkspace.shared.open($0) }
     private var subscriptions = Set<AnyCancellable>()
     var onRouteChanged: ((URL) -> Void)?
     private var activeURL: URL?
@@ -139,10 +140,11 @@ final class SettingsPageBridge: NSObject, WKScriptMessageHandler {
                           "toggle": settings.toggleKey?.label ?? "", "preview": settings.linkPreviewKey.singleKeyLabel],
             "recording": recorder.target ?? "",
             "version": UpdateCheck.currentVersion, "checking": store.checkingUpdate,
-            "update": store.availableUpdate ?? "", "updateMessage": store.updateCheckMessage ?? ""
+            "update": store.availableUpdate?.version ?? "", "updateMessage": store.updateCheckMessage ?? ""
         ]
         if let receipt { state["receipt"] = receipt }
         switch route {
+        case .about: state["releaseNotes"] = store.availableUpdate?.notesHTML ?? ""
         case .ai: state["ai"] = aiState(store.ai)
         case .bookmarks: state["library"] = bookmarkState(store)
         case .passwords:
@@ -172,7 +174,9 @@ final class SettingsPageBridge: NSObject, WKScriptMessageHandler {
             case (.about, "check"): store.checkForUpdates(manual: true)
             case (.about, "source"): NSWorkspace.shared.open(UpdateCheck.repositoryURL)
             case (.about, "release"):
-                if store.availableUpdate != nil { NSWorkspace.shared.open(UpdateCheck.releaseURL) }
+                if let release = store.availableUpdate, !openRelease(release.url) {
+                    throw PerchError("无法打开更新页面")
+                }
             case (.appearance, "previewTheme"):
                 if let raw = body["theme"] as? String, let color = ThemeColor(rawValue: raw) {
                     previewingTheme = true

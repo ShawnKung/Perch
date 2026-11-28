@@ -143,6 +143,26 @@
       previous = key; container.replaceChildren(...render(data));
     });
   }
+  function releaseNotes(html) {
+    const template = make('template');
+    template.innerHTML = html;
+    // Rebuild formatted text without carrying over remote attributes, links or resources.
+    const tags = new Set('h1 h2 h3 h4 h5 h6 p br ul ol li strong b em i del blockquote pre code hr a div span table thead tbody tr th td'.split(' '));
+    function copy(parent, source) {
+      for (const child of source.childNodes) {
+        if (child.nodeType === Node.TEXT_NODE) parent.append(document.createTextNode(child.data));
+        else if (tags.has(child.localName)) {
+          const tag = child.localName;
+          const node = tag === 'a' ? parent : make(tag);
+          copy(node, child);
+          if (node !== parent) parent.append(node);
+        }
+      }
+    }
+    const body = make('div', '', 'release-notes');
+    copy(body, template.content);
+    return body.textContent.trim() ? [body] : [];
+  }
   function credentialField(hasKey) {
     const key = field('password');
     key.placeholder = hasKey ? '已保存，留空保持不变' : '输入 API 密钥';
@@ -822,16 +842,26 @@
     case 'importer': buildImports(); break;
     case 'about': {
       const check = button('检查更新','check');
-      const release = button('查看发布说明','release'), controls = group(check, release);
+      const release = button('下载更新','release');
+      const version = make('span', '', 'about-value'), status = make('span', '', 'about-value');
+      const controls = group(status, check, release);
+      controls.classList.add('about-controls');
       check.id='check-update'; release.id='view-release';
       bind(() => {
+        version.textContent = `版本 ${state.version}`;
+        status.textContent = state.update ? `发现新版本 ${state.update}` : state.updateMessage;
         check.hidden=Boolean(state.update); release.hidden=!state.update;
         check.disabled = state.checking; check.textContent = state.checking ? '正在检查…' : '检查更新';
       });
       const about = section('关于');
-      about('Perch', null, s => `版本 ${s.version}`);
+      about('Perch', version);
       about('开源仓库', button('在 GitHub 打开','source'));
-      about('软件更新', controls, s => s.update ? `发现新版本 ${s.update}` : s.updateMessage);
+      about('软件更新', controls);
+      const notes = make('div');
+      replaceIfChanged(notes, () => state.releaseNotes || '', releaseNotes);
+      const changes = section('发布说明');
+      changes('', notes, null, () => Boolean(notes.firstChild));
+      notes.parentElement.classList.add('release-notes-row');
       break;
     }
     }

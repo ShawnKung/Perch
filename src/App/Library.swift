@@ -144,8 +144,8 @@ struct TabSidebar: View, Animatable {
                 }
                 .buttonStyle(.plain).help("新建标签页 ⌘T").accessibilityLabel("新建标签页")
                 Spacer(minLength: 0)
-                if let version = store.availableUpdate {
-                    UpdateIndicator(version: version, compact: compact)
+                if let release = store.availableUpdate {
+                    UpdateIndicator(release: release, compact: compact)
                         .frame(maxWidth: .infinity)
                         .frame(height: 36)
                         .padding(.horizontal, compact ? 0 : 8)

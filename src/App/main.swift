@@ -784,7 +784,7 @@ final class Store: ObservableObject {
     @Published var pinned = false
     @Published var adding = false
     @Published var notice: String?
-    @Published private(set) var availableUpdate: String?
+    @Published var availableUpdate: UpdateCheck.Release?
     @Published private(set) var checkingUpdate = false
     @Published private(set) var updateCheckMessage: String?
     private var updateTask: Task<Void, Never>?
@@ -797,22 +797,19 @@ final class Store: ObservableObject {
     var hasWindowedTabList: (() -> Bool)?
     private var activationHistory: [UUID] = []
     let defaults: UserDefaults
-    func receiveUpdate(_ version: String?) {
-        availableUpdate = version
-    }
     func checkForUpdates(manual: Bool = false, current: String = UpdateCheck.currentVersion,
                          session: URLSession = .shared) {
         guard !checkingUpdate else { return }
         checkingUpdate = true
         updateCheckMessage = nil
         updateTask = Task { @MainActor [weak self] in
-            let result: Result<String?, Error>
-            do { result = .success(try await UpdateCheck.latestVersion(current: current, session: session)) }
+            let result: Result<UpdateCheck.Release?, Error>
+            do { result = .success(try await UpdateCheck.latestRelease(current: current, session: session)) }
             catch { result = .failure(error) }
             guard !Task.isCancelled, let self else { return }
             switch result {
             case .success(let latest):
-                self.receiveUpdate(latest)
+                self.availableUpdate = latest
                 if manual && latest == nil { self.updateCheckMessage = "当前已是最新版本" }
             case .failure(let error):
                 if manual { self.updateCheckMessage = "无法检查更新：\(error.localizedDescription)" }

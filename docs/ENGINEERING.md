@@ -4,7 +4,7 @@
 
 ## 更新检查
 
-- 自动与手动检查共用 Store 的请求状态，优先读取 GitHub Releases API。仅在 API 返回 403 且 `X-RateLimit-Remaining: 0` 时，对公开 `releases/latest` 地址发起 HEAD 请求，从最终跳转的本仓库 HTTPS `releases/tag/<版本>` 地址比较三段数字版本；兜底不下载页面正文，也不需要内置凭据。其他 HTTP/网络失败、无效数据及无效跳转均按检查失败处理，不能误报「当前已是最新版本」。手动检查结果与按钮同排，位于按钮左侧，长消息省略并提供完整悬停说明。`--update-self-test` 验证 API 优先、限流兜底边界、失败保留已有提示、取消与重试；`--update-ui-self-test` 验证结果位置和原生按钮动作。
+- 自动与手动检查共用 Store 的请求状态，优先从 GitHub Releases API 读取版本和格式化的发布说明。仅在 API 返回 403 且 `X-RateLimit-Remaining: 0` 时，对公开 `releases/latest` 发起 HEAD，从最终跳转的本仓库 HTTPS 地址确认正式版本；确有新版才从公开 Atom 源按完整版本 URL 匹配说明。说明缺失或 Atom 请求失败时仍显示更新入口。设置页只重建说明中允许的排版元素，不加载其中的链接或资源；侧栏和「下载更新」均打开检测到的版本页。其他版本检查失败不会误报「当前已是最新版本」。`--update-self-test` 覆盖 API、限流兜底及失败处理；`--update-ui-self-test` 覆盖说明显示与原生点击。
 
 ## 网页、标签与窗口
 

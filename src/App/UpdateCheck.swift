@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 struct UpdateIndicator: NSViewRepresentable {
-    let version: String
+    let release: UpdateCheck.Release
     let compact: Bool
     var alignment: NSTextAlignment = .left
     var openRelease: (URL) -> Bool = { NSWorkspace.shared.open($0) }
@@ -26,7 +26,7 @@ struct UpdateIndicator: NSViewRepresentable {
         button.imagePosition = compact ? .imageOnly : .imageLeading
         button.alignment = compact ? .center : alignment
         button.contentTintColor = NSColor(Style.accent)
-        button.toolTip = "检测到新 \(version) 版，点击更新"
+        button.toolTip = "检测到新 \(release.version) 版，点击更新"
         button.setAccessibilityLabel("更新 Perch")
         button.setAccessibilityHelp(button.toolTip)
     }
@@ -35,8 +35,8 @@ struct UpdateIndicator: NSViewRepresentable {
         var indicator: UpdateIndicator
         init(_ indicator: UpdateIndicator) { self.indicator = indicator }
         @MainActor @objc func clicked(_ sender: NSButton) {
-            if !indicator.openRelease(UpdateCheck.releaseURL) {
-                sender.toolTip = "无法打开更新页面：\(UpdateCheck.releaseURL.absoluteString)"
+            if !indicator.openRelease(indicator.release.url) {
+                sender.toolTip = "无法打开更新页面：\(indicator.release.url.absoluteString)"
             }
         }
     }
@@ -49,11 +49,20 @@ enum UpdateCheck {
     static let repositoryURL = URL(string: "https://github.com/ShawnKung/Perch")!
     static let apiURL = URL(string: "https://api.github.com/repos/ShawnKung/Perch/releases/latest")!
     static let releaseURL = URL(string: "https://github.com/ShawnKung/Perch/releases/latest")!
+    static let feedURL = URL(string: "https://github.com/ShawnKung/Perch/releases.atom")!
 
-    private struct Release: Decodable {
+    struct Release {
+        let tag: String
+        let version: String
+        var notesHTML: String? = nil
+        var url: URL { UpdateCheck.repositoryURL.appendingPathComponent("releases/tag").appendingPathComponent(tag) }
+    }
+
+    private struct APIRelease: Decodable {
         let tag_name: String
         let draft: Bool
         let prerelease: Bool
+        let body_html: String?
     }
 
     private static func version(_ text: String) -> [Int]? {
@@ -76,36 +85,43 @@ enum UpdateCheck {
         return String(tag.drop(while: { $0 == "v" }))
     }
 
-    static func newerVersion(in data: Data, than current: String) throws -> String? {
-        let release = try JSONDecoder().decode(Release.self, from: data)
+    static func newerRelease(in data: Data, than current: String) throws -> Release? {
+        let release = try JSONDecoder().decode(APIRelease.self, from: data)
         guard !release.draft, !release.prerelease else { return nil }
-        return try newerVersion(release.tag_name, than: current)
+        guard let version = try newerVersion(release.tag_name, than: current) else { return nil }
+        return Release(tag: release.tag_name, version: version, notesHTML: release.body_html)
     }
 
-    static func newerVersion(at url: URL, than current: String) throws -> String? {
+    static func newerRelease(at url: URL, than current: String) throws -> Release? {
         guard url.scheme == "https", url.host == repositoryURL.host,
               url.pathComponents.dropLast().elementsEqual(repositoryURL.appendingPathComponent("releases/tag").pathComponents),
               let tag = url.pathComponents.last else {
             throw PerchError("更新页面未返回有效版本")
         }
-        return try newerVersion(tag, than: current)
+        guard repositoryURL.appendingPathComponent("releases/tag").appendingPathComponent(tag) == url else {
+            throw PerchError("更新页面未返回有效版本")
+        }
+        guard let version = try newerVersion(tag, than: current) else { return nil }
+        return Release(tag: tag, version: version)
     }
 
-    static func latestVersion(current: String, session: URLSession = .shared) async throws -> String? {
+    static func latestRelease(current: String, session: URLSession = .shared) async throws -> Release? {
         var request = URLRequest(url: apiURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
-        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.setValue("application/vnd.github.html+json", forHTTPHeaderField: "Accept")
         request.setValue("Perch/\(current)", forHTTPHeaderField: "User-Agent")
         let (data, response) = try await session.data(for: request)
         guard let response = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
         // Only an exhausted API quota warrants falling back to the public release redirect.
         if response.statusCode == 403, response.value(forHTTPHeaderField: "X-RateLimit-Remaining") == "0" {
-            return try await latestReleaseVersion(current: current, session: session)
+            guard var release = try await latestReleaseRedirect(current: current, session: session) else { return nil }
+            release.notesHTML = try? await releaseNotes(for: release, current: current, session: session)
+            return release
         }
         guard response.statusCode == 200 else { throw PerchError("检查更新失败（HTTP \(response.statusCode)）") }
-        return try newerVersion(in: data, than: current)
+        return try newerRelease(in: data, than: current)
     }
 
-    private static func latestReleaseVersion(current: String, session: URLSession) async throws -> String? {
+    private static func latestReleaseRedirect(current: String, session: URLSession) async throws -> Release? {
         var request = URLRequest(url: releaseURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
         request.httpMethod = "HEAD"
         request.setValue("Perch/\(current)", forHTTPHeaderField: "User-Agent")
@@ -114,7 +130,49 @@ enum UpdateCheck {
             throw URLError(.badServerResponse)
         }
         guard response.statusCode == 200 else { throw PerchError("检查更新失败（HTTP \(response.statusCode)）") }
-        return try newerVersion(at: url, than: current)
+        return try newerRelease(at: url, than: current)
     }
 
+    private static func releaseNotes(for release: Release, current: String, session: URLSession) async throws -> String? {
+        var request = URLRequest(url: feedURL, timeoutInterval: 5)
+        request.setValue("Perch/\(current)", forHTTPHeaderField: "User-Agent")
+        let (data, response) = try await session.data(for: request)
+        guard let response = response as? HTTPURLResponse, response.statusCode == 200, response.url == feedURL else { return nil }
+        let feed = ReleaseFeed(releaseURL: release.url)
+        let parser = XMLParser(data: data)
+        parser.shouldResolveExternalEntities = false
+        parser.delegate = feed
+        return parser.parse() ? feed.notes : nil
+    }
+
+    private final class ReleaseFeed: NSObject, XMLParserDelegate {
+        let releaseURL: URL
+        var notes: String?
+        private var path: [String] = []
+        private var matches = false
+        private var content: String?
+
+        init(releaseURL: URL) { self.releaseURL = releaseURL }
+
+        func parser(_ parser: XMLParser, didStartElement element: String, namespaceURI: String?,
+                    qualifiedName: String?, attributes: [String: String]) {
+            path.append(element)
+            switch path {
+            case ["feed", "entry"]: matches = false; content = nil
+            case ["feed", "entry", "link"]:
+                if attributes["rel"] == "alternate", attributes["href"] == releaseURL.absoluteString { matches = true }
+            case ["feed", "entry", "content"] where attributes["type"] == "html": content = ""
+            default: break
+            }
+        }
+
+        func parser(_ parser: XMLParser, foundCharacters string: String) {
+            if path == ["feed", "entry", "content"] { content?.append(string) }
+        }
+
+        func parser(_ parser: XMLParser, didEndElement element: String, namespaceURI: String?, qualifiedName: String?) {
+            if path == ["feed", "entry"], matches, notes == nil { notes = content }
+            path.removeLast()
+        }
+    }
 }
