@@ -42,12 +42,13 @@ details{margin:6px 0}summary{display:flex;align-items:center;gap:8px;list-style:
 summary::-webkit-details-marker{display:none}
 summary::before{content:"";width:6px;height:6px;border-top:1.5px solid currentColor;border-right:1.5px solid currentColor;transform:rotate(45deg);transition:transform .22s ease-in-out;flex:none}
 details[open]>summary::before{transform:rotate(135deg)}
-.reasoning-text{max-height:220px;overflow:auto;white-space:pre-wrap;color:var(--muted);font-size:calc(1em * 11 / 13);overscroll-behavior:auto}
+.reasoning-text{position:relative;max-height:220px;overflow:auto;white-space:pre-wrap;color:var(--muted);font-size:calc(1em * 11 / 13);overscroll-behavior:auto}
 .spinner{display:inline-block;width:12px;height:12px;border:1.5px solid var(--perch-line);border-top-color:var(--perch-accent);border-radius:50%;animation:spin 1s linear infinite;margin-left:8px}
 @keyframes spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
 .sources{max-height:220px;overflow:auto;overscroll-behavior:auto}
 .sources a{display:block;color:var(--muted);font-size:calc(1em * 11 / 13);margin:6px 0}
 .markdown>:first-child{margin-top:0}.markdown>:last-child{margin-bottom:0}
+@media(prefers-reduced-motion:reduce){.chat-reveal-glyph{opacity:1!important}}
 .markdown h1,.markdown h2,.markdown h3{font-size:1.3em;line-height:1.4;margin:14px 0 8px}
 .markdown p,.markdown ul,.markdown ol{margin:8px 0}.markdown ul,.markdown ol{padding-left:22px}
 .markdown a{color:var(--perch-accent)}.markdown blockquote{padding:2px 12px;border-left:3px solid var(--perch-line)}

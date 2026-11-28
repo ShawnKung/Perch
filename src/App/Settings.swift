@@ -131,7 +131,8 @@ final class SettingsPageBridge: NSObject, WKScriptMessageHandler {
                 "linkPreviewEnabled": settings.linkPreviewEnabled, "linkPreviewDelay": settings.linkPreviewDelay,
                 "searchEngine": settings.searchEngine, "customSearchURL": settings.customSearchURL,
                 "uaMode": settings.uaMode, "customUA": settings.customUA, "theme": settings.theme.rawValue,
-                "chatFontSize": settings.chatFontSize, "aiSendWithCommand": settings.aiSendWithCommand
+                "chatFontSize": settings.chatFontSize, "aiSendWithCommand": settings.aiSendWithCommand,
+                "aiRevealDuration": settings.aiRevealDuration, "aiRevealWidth": settings.aiRevealWidth
             ] as [String: Any],
             "themes": ThemeColor.allCases.map { ["id": $0.rawValue, "name": $0.name, "color": $0.webColors["line"]!] },
             "loginNote": login == .requiresApproval ? "等待系统批准，请在登录项设置中允许 Perch。" : "",
@@ -206,6 +207,8 @@ final class SettingsPageBridge: NSObject, WKScriptMessageHandler {
                     next.theme = theme
                 case (.appearance, "chatFontSize", let v as Double): next.chatFontSize = v
                 case (.ai, "aiSendWithCommand", let v as Bool): next.aiSendWithCommand = v
+                case (.ai, "aiRevealDuration", let v as Int): next.aiRevealDuration = v
+                case (.ai, "aiRevealWidth", let v as Int): next.aiRevealWidth = v
                 case (.passwords, "savePasswords", let v as Bool): next.savePasswords = v
                 default: return
                 }
@@ -477,6 +480,10 @@ struct BrowserSettings: Codable, Equatable {
     var linkPreviewKey = Shortcut(code: 58, modifiers: 0, label: "⌥ Alt")
     var linkPreviewDelay = 1.0
     var aiSendWithCommand = false
+    static let aiRevealDurationRange = 0...1000
+    static let aiRevealWidthRange = 0...1000
+    var aiRevealDuration = 400
+    var aiRevealWidth = 600
     var theme: ThemeColor = .blue
     var showWindowOnLaunch = false
     var followMouseOnShow = false
@@ -488,6 +495,7 @@ struct BrowserSettings: Codable, Equatable {
         case uaMode, customUA, openKey, closeKey, toggleKey, searchEngine, customSearchURL, savePasswords
         case linkPreviewEnabled, linkPreviewKey, linkPreviewDelay, aiSendWithCommand, theme, showWindowOnLaunch
         case historyRecordingEnabled, shortcutDefaultsVersion, chatFontSize, followMouseOnShow
+        case aiRevealDuration, aiRevealWidth
     }
     init(from decoder: Decoder) throws {
         self.init()
@@ -511,6 +519,14 @@ struct BrowserSettings: Codable, Equatable {
         linkPreviewKey = try c.decodeIfPresent(Shortcut.self, forKey: .linkPreviewKey) ?? linkPreviewKey
         linkPreviewDelay = try c.decodeIfPresent(Double.self, forKey: .linkPreviewDelay) ?? 1
         aiSendWithCommand = try c.decodeIfPresent(Bool.self, forKey: .aiSendWithCommand) ?? false
+        aiRevealDuration = try c.decodeIfPresent(Int.self, forKey: .aiRevealDuration) ?? aiRevealDuration
+        aiRevealWidth = try c.decodeIfPresent(Int.self, forKey: .aiRevealWidth) ?? aiRevealWidth
+        guard Self.aiRevealDurationRange.contains(aiRevealDuration) else {
+            throw DecodingError.dataCorruptedError(forKey: .aiRevealDuration, in: c, debugDescription: "Invalid AI reveal duration.")
+        }
+        guard Self.aiRevealWidthRange.contains(aiRevealWidth) else {
+            throw DecodingError.dataCorruptedError(forKey: .aiRevealWidth, in: c, debugDescription: "Invalid AI reveal width.")
+        }
         theme = try c.decodeIfPresent(ThemeColor.self, forKey: .theme) ?? .green
         showWindowOnLaunch = try c.decodeIfPresent(Bool.self, forKey: .showWindowOnLaunch) ?? false
         followMouseOnShow = try c.decodeIfPresent(Bool.self, forKey: .followMouseOnShow) ?? false
@@ -554,6 +570,9 @@ struct BrowserSettings: Codable, Equatable {
     }
 
     func validate() throws {
+        guard Self.aiRevealDurationRange.contains(aiRevealDuration), Self.aiRevealWidthRange.contains(aiRevealWidth) else {
+            throw PerchError("流式动画时长需在 0–1000 ms 之间，柔边宽度需在 0–1000 px 之间。")
+        }
         guard chatFontSize.isFinite, Self.chatFontSizeRange.contains(chatFontSize) else {
             throw PerchError("Chat 字体大小需在 11–22 pt 之间。")
         }

@@ -45,6 +45,9 @@ input[type=number]{width:68px} input[type=text]{width:min(54%,310px)}
 .action{cursor:pointer;color:var(--perch-accent,#345a97)}
 .action:disabled{opacity:.6;cursor:default}
 .controls{min-width:0;display:flex;align-items:center;flex-wrap:wrap;gap:7px}
+.settings-slider{flex-wrap:nowrap;justify-content:flex-end}
+.settings-slider input{width:clamp(72px,18vw,180px);padding:0;border:0;accent-color:var(--perch-accent,#345a97)}
+.settings-slider output{min-width:7ch;text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
 .about-controls{flex-wrap:nowrap;justify-content:flex-end}
 .about-controls .action{flex:none;white-space:nowrap}
 .about-value{color:#5c6268;font-size:12px;text-align:right;overflow-wrap:anywhere}

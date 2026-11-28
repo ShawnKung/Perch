@@ -75,6 +75,24 @@
     if (max !== undefined) control.max = max;
     return control;
   }
+  function slider(key, label, max, unit) {
+    const control = make('input'), value = make('output'), wrapper = group(control,value);
+    wrapper.classList.add('settings-slider');
+    Object.assign(control,{type:'range',id:key,min:0,max});
+    control.setAttribute('aria-label',label);
+    value.setAttribute('for',key);
+    const readout = () => {
+      value.textContent = `${control.value} ${unit}`;
+      control.setAttribute('aria-valuetext',value.textContent);
+    };
+    control.addEventListener('input',readout);
+    control.addEventListener('change',()=>send('change',{key,value:control.valueAsNumber}));
+    bind(() => {
+      if (control.valueAsNumber !== state.values[key]) control.value = state.values[key];
+      readout();
+    });
+    return wrapper;
+  }
   function button(title, action) {
     const node = make('button', title, 'action');
     node.addEventListener('click', () => send(action)); return node;
@@ -233,6 +251,9 @@
     sender.setAttribute('aria-label','发送消息按键');
     const general=make('div','','ai-panel');
     general.append(make('strong','发送消息按键'),sender); block('常规').append(general);
+    block('流式动画').append(
+      panel('动画时长','设为 0 时立即显示新内容。',slider('aiRevealDuration','动画时长',1000,'ms')),
+      panel('柔边宽度','设为 0 时保留平滑出字，不显示柔边。',slider('aiRevealWidth','柔边宽度',1000,'px')));
 
     function openEditor(p) {
       if(pending)return;
