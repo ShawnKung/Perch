@@ -332,95 +332,33 @@ enum UpdateSelfCheck {
         UpdateFixtureProtocol.remaining = nil
         UpdateFixtureProtocol.failure = nil
         UpdateFixtureProtocol.body = releaseData("v0.2.9")
-        let root = NSHostingView(rootView: Form {
-            AboutSettingsGroup(store: store) {
-                store.checkForUpdates(manual: true, current: "0.2.9", session: session)
-            }
-        }.formStyle(.grouped).scrollContentBackground(.hidden).background(Style.paper))
-        let window = NSWindow(contentRect: NSRect(x: 150, y: 150, width: 660, height: 240),
-                              styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.contentView = root
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-        defer { window.close() }
-        SelfTests.prepareAccessibility()
-        func settle() async {
-            try? await Task.sleep(nanoseconds: 250_000_000)
-            root.layoutSubtreeIfNeeded()
-        }
-        func find(_ label: String, in node: NSObject) -> NSObject? {
-            if node.responds(to: NSSelectorFromString("accessibilityLabel")),
-               node.value(forKey: "accessibilityLabel") as? String == label { return node }
-            var children: [NSObject] = (node as? NSView)?.subviews ?? []
-            if node.responds(to: NSSelectorFromString("accessibilityChildren")),
-               let accessible = node.value(forKey: "accessibilityChildren") as? [NSObject] { children += accessible }
-            return children.lazy.compactMap { find(label, in: $0) }.first
-        }
-        func expect(_ condition: Bool, _ message: String) {
-            if !condition { fputs("FAIL: About settings: \(message)\n", stderr); exit(1) }
-        }
-        await settle()
-        expect(find("Perch 当前版本", in: root) != nil && find("Perch 开源仓库", in: root) != nil,
-               "Current version and repository link must be visible")
-        guard let check = find("检查更新", in: root) else {
-            expect(false, "Check for updates must be visible before detection"); return
-        }
-        _ = check.perform(NSSelectorFromString("accessibilityPerformPress"))
-        try? await AISelfCheck.wait { store.updateCheckMessage != nil }
-        await settle()
-        expect(store.updateCheckMessage == "当前已是最新版本" && find("更新检查结果", in: root) != nil,
-               "A manual check must show its result inline")
-        func expectResultBesideButton() {
-            guard let result = find("更新检查结果", in: root), let check = find("检查更新", in: root) else {
-                expect(false, "Result and check button must remain visible"); return
-            }
-            let resultFrame = (result.value(forKey: "accessibilityFrame") as! NSValue).rectValue
-            let checkFrame = (check.value(forKey: "accessibilityFrame") as! NSValue).rectValue
-            expect(resultFrame.maxX <= checkFrame.minX + 1 && abs(resultFrame.midY - checkFrame.midY) < 3,
-                   "Result must be left of the button on the same row: \(resultFrame), \(checkFrame)")
-        }
-        expectResultBesideButton()
-        let initial = snapshot(root, rect: root.bounds)
-        UpdateFixtureProtocol.status = 403
-        _ = find("检查更新", in: root)?.perform(NSSelectorFromString("accessibilityPerformPress"))
-        try? await AISelfCheck.wait { !store.checkingUpdate }
-        await settle()
-        expect(store.updateCheckMessage?.contains("403") == true, "Manual failure must remain visible")
-        expectResultBesideButton()
-        window.setContentSize(NSSize(width: 400, height: 240))
-        await settle()
-        expectResultBesideButton()
-        window.setContentSize(NSSize(width: 660, height: 240))
-        await settle()
-        UpdateFixtureProtocol.status = 200
-        UpdateFixtureProtocol.body = releaseData("v0.2.10")
-        _ = find("检查更新", in: root)?.perform(NSSelectorFromString("accessibilityPerformPress"))
-        try? await AISelfCheck.wait { store.availableUpdate != nil }
-        await settle()
-        expect(find("检查更新", in: root) == nil, "Detection must replace the check button")
-        guard let button = find("更新 Perch", in: root) as? NSButton else {
-            expect(false, "Detection must display the native new-version indicator"); return
-        }
-        var opened: [URL] = []
-        (button.target as! UpdateIndicator.Coordinator).indicator.openRelease = { opened.append($0); return true }
-        _ = button.accessibilityPerformPress()
-        await settle()
-        expect(opened == [UpdateCheck.releaseURL] && NSApp.modalWindow == nil && window.attachedSheet == nil,
-               "The About update indicator must open the latest release directly")
-        if let index = CommandLine.arguments.firstIndex(of: "--about-preview"),
-           CommandLine.arguments.count > index + 1 {
-            let updated = snapshot(root, rect: root.bounds)
-            let image = NSImage(size: NSSize(width: root.bounds.width, height: root.bounds.height * 2))
-            image.lockFocus()
-            initial.draw(in: NSRect(x: 0, y: root.bounds.height, width: root.bounds.width, height: root.bounds.height))
-            updated.draw(in: NSRect(origin: .zero, size: root.bounds.size))
-            image.unlockFocus()
-            let data = NSBitmapImageRep(data: image.tiffRepresentation!)!.representation(using: .png, properties: [:])!
-            do { try data.write(to: URL(fileURLWithPath: CommandLine.arguments[index + 1])) }
-            catch { expect(false, "Cannot save About preview: \(error)") }
-        }
-        print("PASS: native About actions, current/error results left of check button at normal/narrow widths, new-version replacement without dialogs")
+        let panel = Panel(contentRect: NSRect(x: 150, y: 150, width: 990, height: 650),
+                          styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+        panel.isReleasedWhenClosed = false
+        store.openSettings(.about)
+        let web = store.browser!.webView
+        panel.contentView = RootHostingView(rootView: RootView(store: store).defaultAppStorage(defaults))
+        panel.bindTabFocus(to: store)
+        panel.makeKeyAndOrderFront(nil)
+        defer { panel.close() }
+        do {
+            try await AISelfCheck.wait { web.url == SettingsRoute.about.url && !web.isLoading }
+            try await AIChatPageSelfCheck.waitFor(web, "document.body.innerText.includes('开源仓库')")
+            store.checkForUpdates(manual: true, current: "0.2.9", session: session)
+            try await AIChatPageSelfCheck.waitFor(web, "document.body.innerText.includes('当前已是最新版本')")
+            UpdateFixtureProtocol.status = 403
+            store.checkForUpdates(manual: true, current: "0.2.9", session: session)
+            try await AIChatPageSelfCheck.waitFor(web, "document.body.innerText.includes('403')")
+            UpdateFixtureProtocol.status = 200
+            UpdateFixtureProtocol.body = releaseData("v0.2.10")
+            store.checkForUpdates(manual: true, current: "0.2.9", session: session)
+            try await AIChatPageSelfCheck.waitFor(web, """
+                document.querySelector('#check-update')?.hidden &&
+                    !document.querySelector('#view-release')?.hidden &&
+                    document.body.innerText.includes('0.2.10')
+                """)
+            print("PASS: HTML About shows current, error and update states inline")
+} catch { fputs("FAIL: HTML About: \(error.localizedDescription)\n", stderr); exit(1) }
     }
 
     @MainActor private static func snapshot(_ view: NSView, rect: NSRect) -> NSImage {

@@ -1,160 +1,78 @@
-import SwiftUI
 import AppKit
 import WebKit
 import UniformTypeIdentifiers
 import ServiceManagement
 
-struct ImportPage: View {
-    @ObservedObject private var theme = PerchTheme.shared
-    @ObservedObject var store: Store
-    @State private var source: ImportSource = .chrome
-    @State private var directory = ImportSource.chrome.defaultDirectory
-    @State private var cookieFile: URL?
-    @State private var cookies = true
-    @State private var bookmarks = true
-    @State private var history = true
-    @State private var passwords = true
-    @State private var passwordFile: URL?
-    @State private var status = ""
-    @State private var profiles: [URL] = []
-    @State private var accessDirectory: URL?
-    @State private var requiresFileAccess = false
-    @State private var backupStatus = ""
-    @State private var backupScope = Set(BackupScope.allCases)
-    @State private var includeAIKeys = false
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                Text("Perch 备份").font(.headline)
-                HStack(spacing: 16) {
-                    ForEach(BackupScope.allCases, id: \.self) { scope in
-                        Toggle(scope.title, isOn: Binding(get: { backupScope.contains(scope) }, set: {
-                            if $0 { backupScope.insert(scope) } else { backupScope.remove(scope) }
-                        }))
-                    }
-                }
-                Toggle("包含 AI 密钥（模型与搜索）", isOn: $includeAIKeys)
-                    .disabled(!backupScope.contains(.ai))
-                Text(includeAIKeys && backupScope.contains(.ai)
-                     ? "ZIP 包含明文 AI 密钥，请妥善保管。密码、Cookie、历史记录及会话不包含在备份中。"
-                     : "AI 密钥默认不导出。密码、Cookie、历史记录及会话不包含在备份中。")
-                    .font(.callout).foregroundStyle(Style.muted)
-                HStack {
-                    Button("导出 ZIP…") { exportBackup() }
-                        .disabled(backupScope.isEmpty)
-                    Button("导入 ZIP…") { importBackup() }
-                    if store.importing { ProgressView().controlSize(.small) }
-                    Spacer()
-                }
-                if !backupStatus.isEmpty {
-                    Text(backupStatus).font(.callout).textSelection(.enabled).lineSpacing(5)
-                }
-                Divider()
-                Text("从其他浏览器导入").font(.headline)
-                HStack(spacing: 12) {
-                    Text("来源浏览器").frame(width: 76, alignment: .leading)
-                    Picker("来源浏览器", selection: $source) {
-                        ForEach(ImportSource.allCases) { source in Text(source.rawValue).tag(source) }
-                    }.labelsHidden().pickerStyle(.segmented).frame(width: 216).onChange(of: source) { value in
-                        directory = value.defaultDirectory; cookieFile = nil; status = ""
-                        passwordFile = nil
-                        accessDirectory = nil; requiresFileAccess = false; refreshProfiles()
-                    }
-                    Spacer()
-                    if !profiles.isEmpty {
-                        Text("资料配置")
-                        Picker("资料配置", selection: $directory) {
-                            ForEach(profiles, id: \.self) { profile in Text(profile.lastPathComponent).tag(profile) }
-                        }.labelsHidden().frame(width: 120)
-                    }
-                }
-                HStack(spacing: 12) {
-                    Text("资料目录").frame(width: 76, alignment: .leading)
-                    Text(directory.path).font(.caption).foregroundStyle(Style.muted).textSelection(.enabled)
-                        .lineLimit(1).truncationMode(.middle).help(directory.path)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(8).background(Style.sidebar, in: RoundedRectangle(cornerRadius: 6))
-                    Button("选择目录…") { chooseDirectory() }.fixedSize()
-                }
-                HStack(spacing: 12) {
-                    Text("导入内容").frame(width: 76, alignment: .leading)
-                    Toggle("Cookie / 登录态", isOn: $cookies)
-                    Toggle("书签", isOn: $bookmarks)
-                    Toggle("历史记录", isOn: $history)
-                    Toggle("密码", isOn: $passwords)
-                }
-                if passwords || cookies {
-                    HStack(spacing: 12) {
-                        Text("文件").frame(width: 76, alignment: .leading)
-                        if passwords {
-                            Button("选择密码 CSV…") {
-                                let panel = NSOpenPanel()
-                                panel.message = "选择从 Chrome、Firefox 或 Safari 导出的密码 CSV。文件包含明文密码，导入后请妥善处理。"
-                                if panel.runModal() == .OK { passwordFile = panel.url }
-                            }.fixedSize()
-                            if let passwordFile {
-                                Text(passwordFile.lastPathComponent).font(.caption).lineLimit(1)
-                                    .truncationMode(.middle).help(passwordFile.path)
-                                Button("清除") { self.passwordFile = nil }.fixedSize()
-                            }
-                        }
-                        if cookies {
-                            Button("选择 Cookie 文件…") {
-                                let panel = NSOpenPanel()
-                                panel.message = "支持 Safari .binarycookies、JSON Cookie 数组和 Netscape cookies.txt。"
-                                if panel.runModal() == .OK { cookieFile = panel.url }
-                            }.fixedSize()
-                            if let cookieFile {
-                                Text(cookieFile.lastPathComponent).font(.caption).lineLimit(1)
-                                    .truncationMode(.middle).help(cookieFile.path).textSelection(.enabled)
-                                Button("使用浏览器数据") { self.cookieFile = nil }.fixedSize()
-                            }
-                        }
-                        Spacer(minLength: 0)
-                    }
-                }
-                Divider()
-                HStack {
-                    if store.importing {
-                        ProgressView().controlSize(.small)
-                        Text("正在导入…").font(.caption).foregroundStyle(Style.muted)
-                    }
-                    Spacer()
-                    Button("开始导入") { start() }.buttonStyle(.borderedProminent)
-                        .disabled(store.importing || (!cookies && !bookmarks && !history && !passwords))
-                }
-                if !status.isEmpty { Text(status).font(.callout).textSelection(.enabled).lineSpacing(5) }
-                if requiresFileAccess {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Label("需要允许 Perch 读取浏览器资料", systemImage: "lock.shield").font(.callout.bold())
-                        Text("1. 点击「重新选择资料目录」，在系统选择框中选中上方目录并确认。\n2. 若仍提示没有权限，打开「完全磁盘访问权限」，用 + 添加下方这个 Perch.app 并开启；随后退出并重新打开 Perch，再导入。此权限允许应用读取更广泛的受保护文件，请按需开启。")
-                            .font(.caption).fixedSize(horizontal: false, vertical: true)
-                        Text(Bundle.main.bundleURL.path).font(.caption).textSelection(.enabled)
-                        HStack {
-                            Button("重新选择资料目录…") { chooseDirectory() }
-                            Button("完全磁盘访问权限…") {
-                                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")!)
-                            }
-                            Button("在 Finder 显示 Perch") {
-                                NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
-                            }
-                        }
-                        Text("文件访问权限与 Chrome Safe Storage 钥匙串授权是两件事；本应用不会自动修改系统权限。")
-                            .font(.caption).foregroundStyle(Style.muted)
-                    }.padding(14).background(Style.mint, in: RoundedRectangle(cornerRadius: 12))
-                }
-            }.padding(20).disabled(store.importing)
-        }.background(Style.paper).onAppear { refreshProfiles() }
+@MainActor
+final class SettingsImportController {
+    private var source = ImportSource.chrome
+    private var directory = ImportSource.chrome.defaultDirectory
+    private var cookieFile: URL?
+    private var passwordFile: URL?
+    private var cookies = true, bookmarks = true, history = true, passwords = true
+    private var status = "", backupStatus = ""
+    private var profiles: [URL] = []
+    private var accessDirectory: URL?
+    private var requiresFileAccess = false
+    private var backupScope = Set(BackupScope.allCases)
+    private var includeAIKeys = false
+
+    init() { refreshProfiles() }
+
+    var state: [String: Any] {
+        ["sources": ImportSource.allCases.map(\.rawValue), "source": source.rawValue,
+         "directory": directory.path, "profiles": profiles.map { $0.lastPathComponent },
+         "cookieFile": cookieFile?.lastPathComponent ?? "", "passwordFile": passwordFile?.lastPathComponent ?? "",
+         "status": status, "backupStatus": backupStatus, "needsAccess": requiresFileAccess,
+         "scopes": BackupScope.allCases.map { ["id": $0.rawValue, "title": $0.title] }]
     }
 
-    private func exportBackup() {
+    func handle(_ action: String, body: [String: Any], store: Store, update: @escaping () -> Void) {
+        guard !store.importing else { return }
+        switch action {
+        case "source":
+            guard let raw = body["source"] as? String, let value = ImportSource(rawValue: raw) else { return }
+            source = value; directory = value.defaultDirectory; cookieFile = nil; passwordFile = nil
+            accessDirectory = nil; requiresFileAccess = false; status = ""; refreshProfiles()
+        case "profile":
+            guard let index = body["index"] as? Int, profiles.indices.contains(index) else { return }
+            directory = profiles[index]
+        case "directory": chooseDirectory()
+        case "cookieFile", "passwordFile":
+            let panel = NSOpenPanel()
+            panel.message = action == "cookieFile" ? "选择 Safari、JSON 或 Netscape Cookie 文件。" :
+                "选择浏览器导出的密码 CSV。此文件包含明文密码，请妥善处理。"
+            if panel.runModal() == .OK {
+                if action == "cookieFile" { cookieFile = panel.url }
+                else { passwordFile = panel.url }
+            }
+        case "clearCookies": cookieFile = nil
+        case "clearPasswords": passwordFile = nil
+        case "diskAccess":
+            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")!)
+        case "finder": NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
+        case "start":
+            cookies = body["cookies"] as? Bool == true; bookmarks = body["bookmarks"] as? Bool == true
+            history = body["history"] as? Bool == true; passwords = body["passwords"] as? Bool == true
+            if cookies || bookmarks || history || passwords { start(store: store, update: update) }
+        case "export":
+            backupScope = Set((body["scopes"] as? [String] ?? []).compactMap(BackupScope.init(rawValue:)))
+            guard !backupScope.isEmpty else { return }
+            includeAIKeys = backupScope.contains(.ai) && body["keys"] as? Bool == true
+            exportBackup(store: store, update: update)
+        case "import": importBackup(store: store, update: update)
+        default: return
+        }
+    }
+
+    private func exportBackup(store: Store, update: @escaping () -> Void) {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.zip]
         panel.nameFieldStringValue = "Perch-\(DateFormatter.localizedString(from: Date(), dateStyle: .short, timeStyle: .none).replacingOccurrences(of: "/", with: "-")).zip"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         store.importing = true; backupStatus = "正在导出…"
         Task { @MainActor in
-            defer { store.importing = false }
+            defer { store.importing = false; update() }
             let scoped = url.startAccessingSecurityScopedResource()
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
             do {
@@ -166,14 +84,14 @@ struct ImportPage: View {
         }
     }
 
-    private func importBackup() {
+    private func importBackup(store: Store, update: @escaping () -> Void) {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.zip]
         panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
         store.importing = true; backupStatus = "正在检查备份…"
         Task { @MainActor in
-            defer { store.importing = false }
+            defer { store.importing = false; update() }
             let scoped = url.startAccessingSecurityScopedResource()
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
             do {
@@ -228,7 +146,7 @@ struct ImportPage: View {
         else if !profiles.isEmpty { profiles.append(directory) }
     }
 
-    private func start() {
+    private func start(store: Store, update: @escaping () -> Void) {
         let options = ImportOptions(source: source, directory: directory, cookieFile: cookieFile,
                                     cookies: cookies, bookmarks: bookmarks, history: history, accessDirectory: accessDirectory,
                                     passwords: passwords, passwordFile: passwordFile)
@@ -246,7 +164,7 @@ struct ImportPage: View {
                 do { passwordCount = try store.passwords.save(result.passwords) }
                 catch { passwordError = "密码保存失败：\(error.localizedDescription)" }
             }
-            let cookieStore = WKWebsiteDataStore.default().httpCookieStore
+            let cookieStore = (store.browser?.webView.configuration.websiteDataStore ?? .default()).httpCookieStore
             // Deduplicate before writes so the final verification is deterministic.
             var unique: [String: HTTPCookie] = [:]
             func identity(_ cookie: HTTPCookie) -> String { cookie.domain + "\n" + cookie.path + "\n" + cookie.name }
@@ -276,7 +194,7 @@ struct ImportPage: View {
             lines += result.messages
             if verified > 0 { lines.append("请刷新对应网页以使用导入的登录态。") }
             status = lines.joined(separator: "\n")
-            store.importing = false
+            store.importing = false; update()
         }
     }
 }

@@ -406,24 +406,6 @@ enum AISelfCheck {
         precondition(ai.save(model, key: "synthetic-key") && ai.saveSearch(search, key: "synthetic-search-key"))
         let stored = String(data: defaults.data(forKey: "aiSearchProvider")!, encoding: .utf8)!
         precondition(!stored.contains("synthetic-search-key") && model.account != search.account)
-        let searchWindow = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 780, height: 580),
-                                    styleMask: [.titled], backing: .buffered, defer: false)
-        let searchHost = NSHostingView(rootView: AISearchProviderEditor(ai: ai, back: {}).background(Style.paper))
-        searchWindow.contentView = searchHost; searchWindow.orderFront(nil)
-        func secureField(_ view: NSView) -> NSSecureTextField? {
-            if let field = view as? NSSecureTextField { return field }
-            return view.subviews.compactMap(secureField).first
-        }
-        try await wait { secureField(searchHost)?.stringValue == "••••••••••••" }
-        try await Task.sleep(nanoseconds: 150_000_000)
-        if let path = ProcessInfo.processInfo.environment["PERCH_LAYOUT_EVIDENCE"] {
-            searchHost.layoutSubtreeIfNeeded()
-            if let bitmap = searchHost.bitmapImageRepForCachingDisplay(in: searchHost.bounds) {
-                searchHost.cacheDisplay(in: searchHost.bounds, to: bitmap)
-                try bitmap.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path).appendingPathComponent("search-settings.png"))
-            }
-        }
-        searchWindow.orderOut(nil); searchWindow.contentView = nil
         for args in ["not-json", "[]", "{}", "{\"query\":\"\"}", "{\"query\":\"q\",\"count\":true}", "{\"query\":\"q\",\"count\":1.2}", "{\"query\":\"q\",\"count\":11}", "{\"query\":\"q\",\"url\":\"https://example.com\"}",
                      "{\"query\":\"q\",\"num\":true}", "{\"query\":\"q\",\"num\":1.2}", "{\"query\":\"q\",\"num\":11}",
                      "{\"query\":\"q\",\"count\":3,\"num\":6}"] {
@@ -1486,18 +1468,12 @@ enum AISelfCheck {
         print("PASS: vertical scrolling over Markdown text reaches the conversation, horizontal wheels and outside regions remain untouched")
     }
     static func keyDisplay(ai: AIController, config: AIConfiguration) async throws {
-        let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 780, height: 580), styleMask: [.titled], backing: .buffered, defer: false)
-        let host = NSHostingView(rootView: AIProviderEditor(ai: ai, openChat: {}, back: {}))
-        window.contentView = host; window.orderFront(nil)
-        func secureField(_ view: NSView) -> NSSecureTextField? {
-            if let field = view as? NSSecureTextField { return field }
-            return view.subviews.compactMap(secureField).first
-        }
-        defer { window.orderOut(nil); window.contentView = nil }
-        try await wait { secureField(host)?.stringValue == "••••••••••••" }
+        let state = SettingsPageBridge().aiState(ai)
+        let serialized = try JSONSerialization.data(withJSONObject: state)
+        precondition(!String(decoding: serialized, as: UTF8.self).contains("synthetic-key"))
         let models = try await ai.models(for: config, key: "")
         precondition(models == ["fixture", "alternate"])
-        print("PASS: saved API key displays dots in native secure field without overwriting the credential")
+        print("PASS: HTML settings state excludes saved API keys and model discovery still uses Keychain")
     }
 
     static func preview() -> NSWindow {
@@ -1517,7 +1493,8 @@ enum AISelfCheck {
         window.title = "Perch AI · 隔离预览"
         if CommandLine.arguments.contains("--ai-settings-preview") {
             window.setContentSize(NSSize(width: 780, height: 580))
-            window.contentView = NSHostingView(rootView: LibraryView(store: store, page: .ai).defaultAppStorage(defaults))
+            store.openSettings(.ai)
+            window.contentView = NSHostingView(rootView: RootView(store: store).defaultAppStorage(defaults))
         } else {
             store.aiVisible = true
             window.setContentSize(NSSize(width: 360, height: 720))
@@ -1921,17 +1898,6 @@ enum AISelfCheck {
         }
         config.nativeSearch = .standard
         precondition(store.ai.save(config))
-        let settings = NSHostingView(rootView: AIProviderEditor(ai: store.ai, openChat: {}, back: {}))
-        window.contentView = settings
-        window.setContentSize(NSSize(width: 780, height: 580))
-        try await wait { element(in: settings, label: "联网搜索") != nil }
-        try await Task.sleep(nanoseconds: 150_000_000)
-        settings.layoutSubtreeIfNeeded()
-        if let path = ProcessInfo.processInfo.environment["PERCH_LAYOUT_EVIDENCE"],
-           let bitmap = settings.bitmapImageRepForCachingDisplay(in: settings.bounds) {
-            settings.cacheDisplay(in: settings.bounds, to: bitmap)
-            try bitmap.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path).appendingPathComponent("model-settings.png"))
-        }
     }
 
     static func chatUI(config: AIConfiguration) async throws {
@@ -2598,17 +2564,6 @@ enum AISelfCheck {
         try await wait { store.ai.queuedMessages[queueOwner]?.isEmpty != false }
         print("PASS: busy native composer remains editable; Return queues the message and clears the draft")
         try await readingUI(config: config)
-        if let directory = ProcessInfo.processInfo.environment["PERCH_LAYOUT_EVIDENCE"] {
-            let settingsAI = AIController(defaults: defaults, conversationDirectory: URL(fileURLWithPath: "/tmp/Perch/Conversations"))
-            window.contentView = NSHostingView(rootView: AISettingsPage(store: store, ai: settingsAI, openChat: {}))
-            try await Task.sleep(nanoseconds: 150_000_000)
-            let root = window.contentView!
-            root.layoutSubtreeIfNeeded()
-            if let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds) {
-                root.cacheDisplay(in: root.bounds, to: bitmap)
-                try bitmap.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: directory).appendingPathComponent("settings.png"))
-            }
-        }
     }
     static func readingUI(config: AIConfiguration) async throws {
         let suite = "dev.perch.ai.reading-ui.\(UUID())"

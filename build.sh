@@ -25,7 +25,7 @@ fi
 cp "$VAULT_CACHE/PerchAIKeys" "$APP/Contents/MacOS/PerchAIKeys"
 swiftc -swift-version 5 -parse-as-library -Osize -whole-module-optimization -lto=llvm-full -target "$(uname -m)-apple-macosx13.0" \
   -Xlinker -mllvm -Xlinker -machine-outliner-reruns=1 \
-  "$ROOT/src/Browser/URLInput.swift" "$ROOT/src/Browser/InternalPage.swift" "$ROOT/src/Browser/Downloads.swift" "$ROOT/src/Browser/HistoryPage.swift" "$ROOT/src/App/Settings.swift" "$ROOT/src/App/Backup.swift" "$ROOT/src/Browser/BrowserImport.swift" \
+  "$ROOT/src/Browser/URLInput.swift" "$ROOT/src/Browser/InternalPage.swift" "$ROOT/src/Browser/Downloads.swift" "$ROOT/src/Browser/HistoryPage.swift" "$ROOT/src/App/Settings.swift" "$ROOT/src/App/SettingsActions.swift" "$ROOT/src/App/Backup.swift" "$ROOT/src/Browser/BrowserImport.swift" \
   "$ROOT/src/AI/AIChat.swift" "$ROOT/src/AI/AISearch.swift" "$ROOT/src/AI/AIGeneratedFile.swift" \
   "$ROOT/src/AI/AIFilePreview.swift" "$ROOT/src/AI/AIInteraction.swift" "$ROOT/src/AI/AITable.swift" \
   "$ROOT/src/AI/AIAttachment.swift" "$ROOT/src/AI/AIMarkdown.swift" "$ROOT/src/AI/AIDiagram.swift" \
@@ -33,7 +33,7 @@ swiftc -swift-version 5 -parse-as-library -Osize -whole-module-optimization -lto
   "$ROOT/src/App/Library.swift" "$ROOT/src/App/UpdateCheck.swift" "$ROOT/src/Browser/Bookmarks.swift" "$ROOT/src/Browser/LinkPreview.swift" \
   "$ROOT/src/Browser/Passwords.swift" "$ROOT/src/Browser/ScrollRouting.swift" "$ROOT/src/Browser/AddressSuggestions.swift" \
   "$ROOT/src/Browser/NativeTabs.swift" "$ROOT/src/Browser/DragPreview.swift" "$ROOT/src/Browser/HomePage.swift" "$ROOT/src/Browser/TabContents.swift" "$ROOT/src/Browser/Favicon.swift" "$ROOT/src/Browser/ImportView.swift" \
-  "$ROOT/tests/SelfTests.swift" "$ROOT/tests/HistoryPageSelfCheck.swift" "$ROOT/tests/AIChatPageSelfCheck.swift" "$ROOT/tests/HomePageSelfCheck.swift" "$ROOT/tests/DownloadSelfCheck.swift" "$ROOT/tests/UpdateSelfCheck.swift" "$ROOT/tests/BackupSelfCheck.swift" "$ROOT/tests/ScrollSelfCheck.swift" "$ROOT/tests/AISelfCheck.swift" "$ROOT/tests/AIExperienceCheck.swift" \
+  "$ROOT/tests/SelfTests.swift" "$ROOT/tests/HistoryPageSelfCheck.swift" "$ROOT/tests/SettingsPageSelfCheck.swift" "$ROOT/tests/AIChatPageSelfCheck.swift" "$ROOT/tests/HomePageSelfCheck.swift" "$ROOT/tests/DownloadSelfCheck.swift" "$ROOT/tests/UpdateSelfCheck.swift" "$ROOT/tests/BackupSelfCheck.swift" "$ROOT/tests/ScrollSelfCheck.swift" "$ROOT/tests/AISelfCheck.swift" "$ROOT/tests/AIExperienceCheck.swift" \
   "$ROOT/src/App/main.swift" \
   -framework AppKit -framework SwiftUI -framework WebKit -framework PDFKit -framework Carbon -framework ServiceManagement -framework Security -lsqlite3 \
   -o "$APP/Contents/MacOS/Perch"
@@ -49,8 +49,23 @@ rm -rf "$APP/Contents/Resources/markdown"
 cp -R "$ROOT/assets/markdown" "$APP/Contents/Resources/"
 rm -rf "$APP/Contents/Resources/internal"
 cp -R "$ROOT/assets/internal" "$APP/Contents/Resources/"
-swift -e 'import Foundation; let root = URL(fileURLWithPath: CommandLine.arguments[1]); for name in ["mermaid.js", "marked.js", "purify.js", "diagram.js", "diagram.css", "tables.js", "chat.js"] { let source = root.appendingPathComponent(name); let data = try Data(contentsOf: source); let packed = try (data as NSData).compressed(using: .lzma); let restored = try packed.decompressed(using: .lzma) as Data; precondition(restored == data); let output = name == "mermaid.js" ? "mermaid.lzma" : name + ".lzma"; try (packed as Data).write(to: root.appendingPathComponent(output)); try FileManager.default.removeItem(at: source) }' \
-  "$APP/Contents/Resources/markdown"
+swift -e '
+import Foundation
+for directory in CommandLine.arguments.dropFirst() {
+    let root = URL(fileURLWithPath: directory)
+    for source in try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+        where ["html", "js", "css"].contains(source.pathExtension) {
+        let data = try Data(contentsOf: source)
+        let packed = try (data as NSData).compressed(using: .lzma)
+        let restored = try packed.decompressed(using: .lzma) as Data
+        precondition(restored == data)
+        let output = source.lastPathComponent == "mermaid.js" ?
+            root.appendingPathComponent("mermaid.lzma") : source.appendingPathExtension("lzma")
+        try (packed as Data).write(to: output)
+        try FileManager.default.removeItem(at: source)
+    }
+}
+' "$APP/Contents/Resources/markdown" "$APP/Contents/Resources/internal"
 bash "$ROOT/scripts/sign-app.sh" "$APP"
 printf '[%s] [完成] %s\n' "$(date '+%H:%M:%S')" "$APP"
 if [[ "${1:-}" == "--run" ]]; then open "$APP"; fi

@@ -3,6 +3,7 @@ import Foundation
 enum URLInput {
     static func parseNavigation(_ raw: String, search: Bool = true,
                                 searchTemplate: String = "https://www.google.com/search?q={query}") -> URL? {
+        if let route = SettingsRoute(URL(string: raw.trimmingCharacters(in: .whitespacesAndNewlines))) { return route.url }
         if ChatPage.matches(URL(string: raw.trimmingCharacters(in: .whitespacesAndNewlines))) {
             return ChatPage.url
         }

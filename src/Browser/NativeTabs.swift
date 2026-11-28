@@ -624,28 +624,30 @@ final class TabCell: NSTableCellView {
                 details.forEach { $0.isHidden = compact; $0.alphaValue = compact ? 0 : 1 }
             }
         }
-        label.stringValue = tab.title
+        let title = tab.displayTitle
+        label.stringValue = title
         let downloadsPage = DownloadsPage.matches(URL(string: tab.address))
         let historyPage = HistoryPage.matches(URL(string: tab.address))
         let symbol: String? = tab.isChat ? "bubble.left.and.bubble.right.fill" :
             historyPage ? "clock.arrow.circlepath" : downloadsPage ? "arrow.down.to.line" :
+            SettingsRoute(URL(string: tab.address)) != nil ? "gearshape" :
             tab.address.isEmpty ? "house" : nil
         label.font = .systemFont(ofSize: 12, weight: symbol != nil ? .semibold : .regular)
         icon.imageScaling = .scaleProportionallyUpOrDown
         if let symbol {
-            icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: tab.title)?
+            icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)?
                 .withSymbolConfiguration(.init(pointSize: 16, weight: .medium)
                     .applying(.init(paletteColors: [.labelColor])))
         } else {
             icon.image = image ?? NSImage(systemSymbolName: "globe", accessibilityDescription: "网站")
         }
-        icon.setAccessibilityLabel(tab.title)
+        icon.setAccessibilityLabel(title)
         pin.image = tab.pinned ? NSImage(systemSymbolName: "pin.fill", accessibilityDescription: "已固定") : nil
         pinWidth.constant = tab.pinned ? 9 : 0
         closeButton.identifier = NSUserInterfaceItemIdentifier(tab.id.uuidString)
-        closeButton.toolTip = "关闭 \(tab.title)"
+        closeButton.toolTip = "关闭 \(title)"
         setHovered(identityChanged ? false : hovered, animated: false, force: compactChanged)
-        toolTip = tab.title + "\n" + tab.address
+        toolTip = title + "\n" + tab.address
     }
     func setGroupExpansion(_ expansion: CGFloat) {
         let inset = 9 + 10 * expansion
@@ -1504,6 +1506,7 @@ struct NativeTabList: NSViewRepresentable {
             }
             menu.addItem(.separator())
             add("重新加载", "reload", enabled: !tab.address.isEmpty)
+            add("重命名…", "rename")
             add("复制", "duplicate")
             add(tab.pinned ? "取消固定" : "固定", "pin")
             menu.addItem(.separator())
@@ -1523,9 +1526,10 @@ struct NativeTabList: NSViewRepresentable {
             switch args[1] {
             case "new": store.newTab(after: id)
             case "reload": store.reload(id)
-            case "duplicate": store.newTab(address: tab.address, title: tab.title, after: id)
+            case "rename": rename(tab)
+            case "duplicate": store.newTab(address: tab.address, title: tab.title, after: id, customTitle: tab.customTitle)
             case "pin": store.pin(id)
-            case "bookmark": _ = store.add(title: tab.title, address: tab.address)
+            case "bookmark": _ = store.add(title: tab.displayTitle, address: tab.address)
             case "copy": copyAddress(tab.address)
             case "close": store.close(id)
             case "others": store.closeOthers(id)
@@ -1546,6 +1550,23 @@ struct NativeTabList: NSViewRepresentable {
                     store.moveTab(id, to: last + 1, groupID: groupID)
                 }
             }
+        }
+
+        private func rename(_ tab: Tab) {
+            guard let window = table?.window, window.attachedSheet == nil else { return }
+            let alert = NSAlert()
+            alert.messageText = "重命名标签页"
+            alert.informativeText = "留空可恢复自动标题。"
+            alert.addButton(withTitle: "保存"); alert.addButton(withTitle: "取消")
+            let field = NSTextField(string: tab.displayTitle)
+            field.frame = NSRect(x: 0, y: 0, width: 300, height: 24)
+            field.setAccessibilityLabel("标签页名称")
+            alert.accessoryView = field
+            alert.window.initialFirstResponder = field
+            alert.beginSheetModal(for: window) { [weak store] response in
+                if response == .alertFirstButtonReturn { store?.renameTab(tab.id, to: field.stringValue) }
+            }
+            field.selectText(nil)
         }
     }
 }

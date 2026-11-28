@@ -146,6 +146,7 @@ enum SelfTests {
     static func run() throws {
         try DownloadSelfCheck.data()
         try HistoryPageSelfCheck.data()
+        SettingsPageSelfCheck.routes()
         try BackupSelfCheck.run()
         try savedTabGroups()
         tabGroupCreation()
@@ -1326,12 +1327,9 @@ final class LayoutSelfCheck {
                 if CommandLine.arguments.contains("--verify-tab-drag") {
                     await verifyTabDrag()
                 }
-                if CommandLine.arguments.contains("--verify-bookmark-drag") {
-                    await verifyBookmarkDrag()
-                }
-                if CommandLine.arguments.contains("--verify-bookmark-folders") ||
-                    CommandLine.arguments.contains("--verify-home-bookmarks") {
-                    await verifyBookmarkFolders()
+                if CommandLine.arguments.contains("--verify-tab-rename") {
+                    do { try await verifyTabRename() }
+                    catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
                 }
                 if let index = CommandLine.arguments.firstIndex(of: "--verify-home-navigation"),
                    CommandLine.arguments.count > index + 1 {
@@ -1458,9 +1456,8 @@ final class LayoutSelfCheck {
                     store.hideTabGroup(group)
                     let open = store.createTabGroup(store.tabs[0].id)!
                     store.editTabGroup(open, name: "打开工作", color: .blue)
-                    store.library = .bookmarks
+                    store.openBookmarks(scope: .all)
                     await settle()
-                    if CommandLine.arguments.contains("--verify-preview") { await verifySavedGroupManager(group) }
                 } else if CommandLine.arguments.contains("--preview-groups") {
                     let group = store.createTabGroup(store.tabs[0].id)!
                     store.editTabGroup(group, name: "CICD")
@@ -1475,9 +1472,8 @@ final class LayoutSelfCheck {
                     _ = store.saveBookmarkFolder(child)
                     _ = store.moveBookmarks(Set(store.sites.filter { $0.title == "GitHub" }.map(\.id)), to: folder.id)
                     _ = store.moveBookmarks(Set(store.sites.filter { $0.title == "ChatGPT" }.map(\.id)), to: child.id)
-                    store.library = .bookmarks
+                    store.openBookmarks(scope: .all)
                     await settle()
-                    if CommandLine.arguments.contains("--verify-preview") { await verifyBookmarks() }
                     if let view = panel.sheets.first?.contentView ?? panel.contentView,
                        let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
                         view.cacheDisplay(in: view.bounds, to: bitmap)
@@ -1488,30 +1484,13 @@ final class LayoutSelfCheck {
                     print("PASS: isolated bookmark folder editor renders with legacy sites, nested folders and imported tree")
                     fflush(stdout)
                 } else if CommandLine.arguments.contains("--preview-settings") || CommandLine.arguments.contains("--preview-import") {
-                    let page: LibraryPage = CommandLine.arguments.contains("--preview-import") ? .importer : .settings
-                    var settings = store.settings
-                    settings.linkPreviewDelay = 0
-                    try? store.saveSettings(settings)
-                    store.library = page
+                    let page: SettingsRoute = CommandLine.arguments.contains("--preview-import") ? .importer : .general
+                    store.openSettings(page)
                     await settle()
-                    if CommandLine.arguments.contains("--verify-preview") && page == .settings {
-                        await verifySettingsFocus()
-                        store.library = page
-                        await settle()
-                    }
-                    if let view = panel.sheets.first?.contentView ?? panel.contentView,
-                       let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
-                        view.cacheDisplay(in: view.bounds, to: bitmap)
-                        if let png = bitmap.representation(using: .png, properties: [:]) {
-                            try? png.write(to: FileManager.default.temporaryDirectory.appendingPathComponent(
-                                page == .importer ? "perch-import-layout.png" : "perch-settings-layout.png"))
-                        }
-                    }
-                    print("PASS: isolated \(page.rawValue) page renders at the shared manager size")
-                    fflush(stdout)
+                    print("PASS: isolated settings preview at \(page.url)")
                 } else if CommandLine.arguments.contains("--preview-passwords") {
                     _ = try? store.passwords.save([SavedPassword(origin: "https://example.com", username: "synthetic-user", password: "synthetic-secret")])
-                    store.library = .passwords
+                    store.openSettings(.passwords)
                 } else if CommandLine.arguments.contains("--preview-suggestions") {
                     _ = store.add(title: "示例书签", address: "http://127.0.0.1:9/fixture")
                     editAddress("示例")
@@ -1538,352 +1517,64 @@ final class LayoutSelfCheck {
         return find(panel.contentView!)!
     }
     func settle() async { try? await Task.sleep(nanoseconds: 350_000_000) }
-    func verifyBookmarkFolders() async {
-        SelfTests.prepareAccessibility()
-        func check(_ value: @autoclosure () -> Bool, _ message: String, line: UInt = #line) {
-            guard value() else { fputs("FAIL: bookmark folders \(line): \(message)\n", stderr); exit(1) }
-        }
-        store.library = nil
-        let parent = BookmarkFolder(title: "Personal parent")
-        let child = BookmarkFolder(title: "Personal child", parentID: parent.id)
-        store.bookmarkFolders = [parent, child]
-        store.sites = [Site(title: "Root bookmark", address: "https://root.invalid", showOnHome: false),
-                       Site(title: "Nested bookmark", address: "https://nested.invalid", folderID: child.id),
-                       Site(title: "Nested sibling", address: "https://sibling.invalid", folderID: child.id)]
-        store.importedBookmarks = ["Chrome": [BookmarkNode(title: "Imported parent", children: [
-            BookmarkNode(title: "Imported child", children: [BookmarkNode(title: "Imported bookmark", address: "https://imported.invalid")])
-        ])]]
-        defaults.set(try! JSONEncoder().encode(store.sites), forKey: "sites")
-        defaults.set(try! JSONEncoder().encode(store.bookmarkFolders), forKey: "bookmarkFolders")
-        await settle()
-        var sheet: NSWindow = panel
-        var visited: [ObjectIdentifier: NSObject] = [:]
-        func button(_ node: Any, label: String, requireButtonRole: Bool = true) -> NSObject? {
-            guard let object = node as? NSObject, visited[ObjectIdentifier(object)] == nil else { return nil }
-            // Retain transient accessibility nodes so their addresses cannot be reused during traversal.
-            visited[ObjectIdentifier(object)] = object
-            let role = object.responds(to: NSSelectorFromString("accessibilityRole")) ? object.value(forKey: "accessibilityRole") as? String : nil
-            let name = object.responds(to: NSSelectorFromString("accessibilityLabel")) ? object.value(forKey: "accessibilityLabel") as? String : nil
-            if name == label && (!requireButtonRole || role == NSAccessibility.Role.button.rawValue) { return object }
-            for child in (object as? NSView)?.subviews ?? [] {
-                if let result = button(child, label: label, requireButtonRole: requireButtonRole) { return result }
+    func verifyTabRename() async throws {
+        let target = store.tabs[0].id, selected = store.selected
+        let list = table()
+        func openEditor() async throws -> (NSWindow, NSTextField) {
+            guard let row = list.ids.firstIndex(of: target) else { throw PerchError("Missing rename tab") }
+            let rect = list.rect(ofRow: row)
+            let event = NSEvent.mouseEvent(with: .rightMouseDown,
+                location: list.convert(NSPoint(x: rect.midX, y: rect.midY), to: nil),
+                modifierFlags: [], timestamp: 0, windowNumber: panel.windowNumber,
+                context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!
+            guard let menu = list.menu(for: event), let index = menu.items.firstIndex(where: { $0.title == "重命名…" }) else {
+                throw PerchError("Right-click did not offer Rename")
             }
-            for selector in ["accessibilityChildren", "accessibilityContents"] where object.responds(to: NSSelectorFromString(selector)) {
-                for child in object.value(forKey: selector) as? [Any] ?? [] {
-                    if let result = button(child, label: label, requireButtonRole: requireButtonRole) { return result }
-                }
+            menu.performActionForItem(at: index)
+            try await AISelfCheck.wait { self.panel.attachedSheet != nil }
+            let sheet = panel.attachedSheet!
+            func field(_ view: NSView) -> NSTextField? {
+                if let field = view as? NSTextField, field.isEditable { return field }
+                return view.subviews.lazy.compactMap(field).first
             }
-            return nil
+            guard let field = sheet.contentView.flatMap(field) else { throw PerchError("Rename sheet has no editor") }
+            return (sheet, field)
         }
-        func click(_ label: String, in window: NSWindow? = nil) async {
-            let window = window ?? sheet
-            var target: NSObject?
-            for _ in 0..<10 {
-                visited.removeAll()
-                target = button(window.contentView!, label: label, requireButtonRole: window !== panel)
-                if target != nil { break }
-                await settle()
+        func submit(_ text: String, button: String) async throws {
+            let (sheet, field) = try await openEditor()
+            guard field.stringValue == store.tabs.first(where: { $0.id == target })?.displayTitle else {
+                throw PerchError("Rename editor did not use the visible title")
             }
-            guard let target else {
-                check(false, "Missing real button \(label) in \(window === panel ? "home" : "manager"), scope \(store.libraryBookmarkScope)"); return
+            field.stringValue = text
+            if let editor = field.currentEditor() as? NSTextView { editor.string = text }
+            func find(_ view: NSView) -> NSButton? {
+                if let buttonView = view as? NSButton, buttonView.title == button { return buttonView }
+                return view.subviews.lazy.compactMap(find).first
             }
-            let frameValue = target.value(forKey: "accessibilityFrame")
-            guard let frame = (frameValue as? NSValue)?.rectValue else {
-                check(false, "Invalid frame for \(label): \(String(describing: frameValue)), \(target)"); return
-            }
-            let point = window.convertPoint(fromScreen: NSPoint(x: frame.midX, y: frame.midY))
-            window.makeKeyAndOrderFront(nil)
-            // SwiftUI's button gestures need AppKit to establish currentEvent through its queue.
-            for type: NSEvent.EventType in [.leftMouseUp, .leftMouseDown] {
-                NSApp.postEvent(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
-                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
-                    context: nil, eventNumber: 1, clickCount: 1, pressure: type == .leftMouseUp ? 0 : 1)!, atStart: true)
-            }
-            await settle()
+            guard let action = sheet.contentView.flatMap(find) else { throw PerchError("Missing rename action \(button)") }
+            action.performClick(nil)
+            try await AISelfCheck.wait { self.panel.attachedSheet == nil }
         }
-        let homeID = store.selected!
-        let homeEntry = CommandLine.arguments.contains("--verify-home-bookmarks")
-        if homeEntry {
-            check(!store.homeShortcuts.contains { $0.title == "Root bookmark" },
-                  "The home entry fixture must include a bookmark hidden from shortcuts")
-            await click("全部书签", in: panel)
-            check(store.library == .bookmarks && store.libraryBookmarkScope == .all,
-                  "The actual home button must open the all-bookmarks scope")
-        } else {
-            store.openBookmarks()
-            await settle()
+        try await submit("  我的标签  ", button: "保存")
+        let index = store.tabs.firstIndex(where: { $0.id == target })!
+        store.tabs[index].title = "更新的自动标题"
+        try await submit("不保存", button: "取消")
+        let restored = Store(defaults: defaults)
+        guard store.selected == selected, store.tabs[index].displayTitle == "我的标签",
+              restored.tabs.first(where: { $0.id == target })?.displayTitle == "我的标签" else {
+            throw PerchError("Rename changed selection or did not survive title updates and restore")
         }
-        guard let manager = panel.sheets.first else {
-            check(false, "Bookmark entry must present the manager"); return
-        }
-        sheet = manager
-        func find(_ view: NSView) -> BookmarkOutline? {
-            if let table = view as? BookmarkOutline { return table }
-            for subview in view.subviews { if let table = find(subview) { return table } }
-            return nil
-        }
-        let table = find(sheet.contentView!)!
-        let coordinator = table.delegate as! NativeBookmarks.Coordinator
-        func events(at point: NSPoint, count: Int = 1) {
-            sheet.makeKeyAndOrderFront(nil)
-            for click in 1...count {
-                func event(_ type: NSEvent.EventType) -> NSEvent {
-                    NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
-                        timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: sheet.windowNumber,
-                        context: nil, eventNumber: click, clickCount: click, pressure: type == .leftMouseUp ? 0 : 1)!
-                }
-                NSApp.postEvent(event(.leftMouseUp), atStart: true)
-                sheet.sendEvent(event(.leftMouseDown))
-            }
-        }
-        func doubleClick(_ item: BookmarkListItem) async {
-            let row = table.row(forItem: item)
-            check(row >= 0, "Double-click target must be in the real outline")
-            let rect = table.rect(ofRow: row)
-            events(at: table.convert(NSPoint(x: 80, y: rect.midY), to: nil), count: 2)
-            await settle()
-        }
-        func openFolder(_ id: UUID) async {
-            guard let item = coordinator.roots.first(where: { $0.folderID == id }) else {
-                check(false, "Open target must be in the current directory"); return
-            }
-            let row = table.row(forItem: item)
-            check(row >= 0, "Open target must have a visible outline row")
-            table.scrollRowToVisible(row)
-            table.layoutSubtreeIfNeeded()
-            let cell = table.view(atColumn: 0, row: row, makeIfNecessary: true) as! BookmarkCell
-            let point = cell.openButton.convert(NSPoint(x: cell.openButton.bounds.midX, y: cell.openButton.bounds.midY), to: nil)
-            let root = sheet.contentView!
-            var hit = root.hitTest(root.superview?.convert(point, from: nil) ?? point)
-            while let view = hit, view !== cell.openButton { hit = view.superview }
-            check(hit != nil && !cell.openButton.isHidden, "The visible open button must receive the native click")
-            events(at: point)
-            await settle()
-        }
-        if homeEntry {
-            check(coordinator.roots.contains { $0.key == "Chrome" } &&
-                  coordinator.roots.first { $0.folderID == parent.id }?.children?.first?.folderID == child.id,
-                  "Home all-bookmarks entry must include personal folder hierarchy and browser imports")
-            let bookmark = coordinator.roots.first { $0.site?.title == "Root bookmark" }!
-            let row = table.row(forItem: bookmark)
-            table.scrollRowToVisible(row)
-            table.layoutSubtreeIfNeeded()
-            let cell = table.view(atColumn: 0, row: row, makeIfNecessary: true) as! BookmarkCell
-            let point = cell.openButton.convert(NSPoint(x: cell.openButton.bounds.midX,
-                                                       y: cell.openButton.bounds.midY), to: nil)
-            let root = sheet.contentView!
-            var hit = root.hitTest(root.superview?.convert(point, from: nil) ?? point)
-            while let view = hit, view !== cell.openButton { hit = view.superview }
-            check(hit != nil && !cell.openButton.isHidden, "The hidden-shortcut bookmark open button must receive the native click")
-            events(at: point)
-            await settle()
-            let expectedAddress = URLInput.parse(bookmark.site!.address, search: false)!.absoluteString
-            let openedAddress = store.tabs.first { $0.id == homeID }?.address
-            check(store.library == nil && store.libraryBookmarkScope == .root && store.selected == homeID &&
-                  openedAddress == expectedAddress,
-                  "Opening a hidden-shortcut bookmark must use the current home tab and close/reset the manager (library \(String(describing: store.library)), scope \(store.libraryBookmarkScope), same tab \(store.selected == homeID), address \(String(describing: openedAddress)))")
-            print("PASS: home all-bookmarks native button, complete personal/imported tree and hidden-shortcut bookmark navigation in the current home tab")
-            fflush(stdout)
-            return
-        }
-        await click("Chrome")
-        let imported = coordinator.roots[0]
-        check(!table.isItemExpanded(imported), "Import directory starts collapsed")
-        await doubleClick(imported)
-        check(table.isItemExpanded(imported), "First double-click must expand the imported directory")
-        await doubleClick(imported)
-        check(!table.isItemExpanded(imported), "Second double-click must collapse the imported directory")
-        await click("个人书签")
-        guard var personal = coordinator.roots.first(where: { $0.folderID == parent.id }) else {
-            check(false, "Personal sidebar button must navigate to the personal tree"); return
-        }
-        check(personal.children?.first?.folderID == child.id &&
-              personal.children?.first?.children?.count == 2, "Personal view must project the complete folder hierarchy")
-        visited.removeAll()
-        check(button(sheet.contentView!, label: parent.title) == nil, "Personal folders must not be repeated in the sidebar")
-        await doubleClick(personal)
-        check(table.isItemExpanded(personal), "Personal folders must expand on double-click")
-        let nested = personal.children!.first!
-        await doubleClick(nested)
-        let first = nested.children![0], second = nested.children![1]
-        let board = NSPasteboard.withUniqueName()
-        defer { board.releaseGlobally() }
-        check(board.writeObjects([coordinator.outlineView(table, pasteboardWriterForItem: first)!]) &&
-              coordinator.beginDragPreview([first.site!.id]), "Expanded nested bookmarks must start sibling sorting")
-        let drag = BookmarkTestDrag(board: board, table: table)
-        let destination = table.rect(ofRow: table.row(forItem: second))
-        drag.draggingLocation = table.convert(NSPoint(x: 100, y: destination.midY), to: nil)
-        check(coordinator.outlineView(table, validateDrop: drag, proposedItem: nested, proposedChildIndex: 1) == .move,
-              "Nested sibling drop must preview the reorder")
-        await settle()
-        check(nested.children!.map(\.site?.id) == [second.site!.id, first.site!.id],
-              "Expanded child rows must reorder in their own directory")
-        store.sites[1].title = "Nested metadata during drag"
-        await settle()
-        check(table.row(forItem: first) > table.row(forItem: second),
-              "Nested metadata refresh must retain item identity and preview order")
-        check(coordinator.outlineView(table, acceptDrop: drag, item: nested, childIndex: 1),
-              "Nested reorder must persist without changing folder membership")
-        await settle()
-        check(store.sites.filter { $0.folderID == child.id }.map(\.id) == [second.site!.id, first.site!.id],
-              "Nested sibling order must reach the shared bookmark model")
-        personal = coordinator.roots.first { $0.folderID == parent.id }!
-        await doubleClick(personal)
-        check(!table.isItemExpanded(personal), "Personal folders must collapse on the next double-click")
-        await click("全部书签")
-        check(coordinator.roots.first { $0.folderID == parent.id }?.children?.first?.folderID == child.id,
-              "All bookmarks must retain the personal directory hierarchy")
-        check(coordinator.roots.contains { $0.key == "Chrome" }, "All bookmarks must retain the imported tree")
-        await click("个人书签")
-        check(!coordinator.roots.contains { $0.key == "Chrome" }, "Personal view must exclude imported roots")
-        await openFolder(parent.id)
-        check(coordinator.roots.first?.folderID == child.id && coordinator.roots.count == 1,
-              "The folder's open button must navigate into that directory")
-        await openFolder(child.id)
-        check(coordinator.roots.map(\.site?.title) == ["Nested sibling", "Nested metadata during drag"],
-              "Opening a nested folder must show only its contents")
-        await click("返回上一级")
-        check(coordinator.roots.first?.folderID == child.id, "Back must return to the parent directory")
-        await click("返回上一级")
-        check(coordinator.roots.contains { $0.folderID == parent.id }, "Back from a root folder must return to personal bookmarks")
-        visited.removeAll()
-        check(button(sheet.contentView!, label: "返回上一级") == nil, "Root view must not offer a dead back action")
-        store.library = nil
-        await settle()
-        print("PASS: real directory double-click expand/collapse, matching personal/all folder hierarchy, nested sibling drag/metadata/drop, sidebar without duplicate folders, open-button navigation and two-level back-button hit paths")
-        fflush(stdout)
+        try await submit(" ", button: "保存")
+        guard store.tabs[index].displayTitle == "更新的自动标题" else { throw PerchError("Blank rename did not restore automatic title") }
+        print("PASS: native tab menu opens rename sheet; save, cancel, persistence and automatic title reset")
     }
-    func verifyBookmarkDrag() async {
-        func check(_ value: @autoclosure () -> Bool, _ message: String, line: UInt = #line) {
-            guard value() else { fputs("FAIL: bookmark drag \(line): \(message)\n", stderr); exit(1) }
-        }
-        store.library = nil
-        await settle()
-        let folder = BookmarkFolder(title: "Drag folder")
-        store.bookmarkFolders = [folder]
-        store.sites = (0..<6).map { Site(title: "Bookmark drag \($0)", address: "https://drag-\($0).invalid",
-                                        folderID: $0 == 5 ? folder.id : nil) }
-        let ids = store.sites.map(\.id), home = store.homeShortcuts.map(\.id)
-        defaults.set(try! JSONEncoder().encode(store.sites), forKey: "sites")
-        defaults.set(try! JSONEncoder().encode(store.bookmarkFolders), forKey: "bookmarkFolders")
-        let originalData = defaults.data(forKey: "sites")
-        store.library = .bookmarks
-        await settle()
-        func find(_ view: NSView) -> BookmarkOutline? {
-            if let table = view as? BookmarkOutline { return table }
-            for child in view.subviews { if let table = find(child) { return table } }
-            return nil
-        }
-        let sheet = panel.sheets.first!, table = find(sheet.contentView!)!
-        let coordinator = table.delegate as! NativeBookmarks.Coordinator
-        check(coordinator.responds(to: NSSelectorFromString("outlineView:draggingSession:willBeginAtPoint:forItems:")),
-              "AppKit must recognize the custom drag-image source callback")
-        let source = coordinator.roots.first { $0.id == ids[1] }!
-        let cell = table.view(atColumn: 0, row: table.row(forItem: source), makeIfNecessary: true) as! BookmarkCell
-        for point in [NSPoint(x: 7, y: 18), NSPoint(x: 45, y: 10), NSPoint(x: cell.bounds.midX, y: 28)] {
-            let location = cell.convert(point, to: nil)
-            func event(_ type: NSEvent.EventType) -> NSEvent {
-                NSEvent.mouseEvent(with: type, location: location, modifierFlags: [],
-                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: sheet.windowNumber,
-                    context: nil, eventNumber: 1, clickCount: 1, pressure: type == .leftMouseUp ? 0 : 1)!
-            }
-            NSApp.postEvent(event(.leftMouseUp), atStart: true)
-            NSApp.sendEvent(event(.leftMouseDown))
-            check(sheet.firstResponder === table && coordinator.parent.selection == [ids[1]],
-                  "Icon, title and address presses must reach the native list")
-        }
-        let image = cell.dragPreview(radius: 9, background: NSColor(Style.paper))!
-        let bitmap = NSBitmapImageRep(data: image.tiffRepresentation!)!
-        let alpha = bitmap.colorAt(x: bitmap.pixelsWide / 2, y: bitmap.pixelsHigh / 2)!.alphaComponent
-        check((0.85...0.91).contains(alpha), "Bookmark floating row must have opacity 0.88")
-        try? bitmap.representation(using: .png, properties: [:])?.write(to:
-            FileManager.default.temporaryDirectory.appendingPathComponent("perch-bookmark-drag-card.png"))
-        let board = NSPasteboard.withUniqueName()
-        defer { board.releaseGlobally() }
-        let drag = BookmarkTestDrag(board: board, table: table)
-        func begin(_ selected: Set<UUID>) {
-            table.selectRowIndexes(IndexSet((0..<table.numberOfRows).filter {
-                (table.item(atRow: $0) as? BookmarkListItem)?.id.map(selected.contains) == true
-            }), byExtendingSelection: false)
-            board.clearContents()
-            check(board.writeObjects(coordinator.roots.filter { $0.id.map(selected.contains) == true }.map {
-                coordinator.outlineView(table, pasteboardWriterForItem: $0)!
-            }), "Native writer must write every moving bookmark")
-            check(coordinator.beginDragPreview(selected), "Editable rows must begin a local preview")
-        }
-        func move(to id: UUID) -> NSDragOperation {
-            let target = coordinator.roots.first { $0.id == id }!
-            let rect = table.rect(ofRow: table.row(forItem: target))
-            drag.draggingLocation = table.convert(NSPoint(x: rect.midX, y: rect.midY), to: nil)
-            return coordinator.outlineView(table, validateDrop: drag, proposedItem: nil, proposedChildIndex: 0)
-        }
-        func visible() -> [UUID] { coordinator.roots.filter { $0.site != nil }.compactMap(\.id) }
-        begin([ids[1]])
-        check(move(to: ids[3]) == .move && visible() == [ids[0], ids[2], ids[3], ids[1], ids[4]],
-              "Dragging down must reorder the visible bookmark rows")
-        await settle()
-        check(table.row(for: cell) == 4 && cell.isHidden && defaults.data(forKey: "sites") == originalData,
-              "Native outline rows must move while source is hidden and persistence is unchanged")
-        check(coordinator.parent.selection == [ids[1]], "Preview must retain selection")
-        store.sites[1].title = "Metadata refreshed during drag"
-        await settle()
-        check(visible().suffix(2) == [ids[1], ids[4]] && cell.isHidden,
-              "Metadata refresh must preserve preview order and placeholder")
-        check(table.row(forItem: source) == 4 && cell.name.stringValue == "Metadata refreshed during drag",
-              "Metadata must refresh the actual row while retaining its native item identity")
-        table.draggingExited(drag)
-        await settle()
-        check(visible() == Array(ids.prefix(5)), "Leaving the list must restore the original order")
-        coordinator.endDragPreview()
-        check(!cell.isHidden, "Cancellation must show the original row")
-        begin([ids[1]])
-        check(move(to: ids[3]) == .move && visible() == [ids[0], ids[2], ids[3], ids[1], ids[4]],
-              "Dragging after a metadata refresh must still find the native destination rows")
-        let foreign = BookmarkTestDrag(board: board, table: sheet.contentView!)
-        check(!coordinator.outlineView(table, acceptDrop: foreign, item: nil, childIndex: 0),
-              "Another drag source must not commit this preview")
-        check(coordinator.outlineView(table, acceptDrop: drag, item: nil, childIndex: 0), "Local drop must save")
-        await settle()
-        let accepted = [ids[0], ids[2], ids[3], ids[1], ids[4], ids[5]]
-        check(store.sites.map(\.id) == accepted && store.homeShortcuts.map(\.id) == home &&
-              Store(defaults: defaults).sites.map(\.id) == accepted, "Drop must persist bookmarks independently of home order")
-        begin([ids[0], ids[2]]); _ = move(to: ids[4])
-        check(Array(visible().suffix(2)) == [ids[0], ids[2]], "Multiple dragged rows must retain relative order")
-        coordinator.endDragPreview()
-        begin([ids[1]]); _ = move(to: ids[0])
-        let reorder = coordinator.parent.reorder
-        coordinator.parent.reorder = { _ in false }
-        check(!coordinator.outlineView(table, acceptDrop: drag, item: nil, childIndex: 0) &&
-              visible() == Array(accepted.prefix(5)), "A rejected save must restore the visible order")
-        coordinator.parent.reorder = reorder
-        begin([ids[1]])
-        check(move(to: folder.id) == .move, "Folder drops must retain their existing behavior")
-        let destination = coordinator.roots.first { $0.folderID == folder.id }!
-        check(coordinator.outlineView(table, acceptDrop: drag, item: destination, childIndex: -1),
-              "Dropping onto a folder must move membership")
-        coordinator.endDragPreview()
-        await settle()
-        check(store.sites.first { $0.id == ids[1] }?.folderID == folder.id && store.homeShortcuts.map(\.id) == home,
-              "Folder move must keep the independent homepage order")
-        begin([ids[0]]); _ = move(to: ids[4])
-        store.sites.append(Site(title: "New during drag", address: "https://new-during-drag.invalid"))
-        await settle()
-        check(coordinator.dragIDs.isEmpty, "External structure changes must cancel the preview")
-        let imported = BookmarkListItem(key: "readonly-fixture", site: Site(title: "Readonly", address: "https://readonly.invalid"))
-        check(coordinator.outlineView(table, pasteboardWriterForItem: imported) == nil &&
-              !coordinator.beginDragPreview([imported.site!.id]), "Imported rows must remain read-only")
-        store.library = nil
-        await settle()
-        print("PASS: bookmark icon/title/address native press path, translucent floating row, live outline moves, selection and metadata retention, cancel/exit, local drop/restart, independent home order, multiple rows, rejected save, folder move and read-only boundary; drag source capture and destination use synthetic local fixtures")
-        fflush(stdout)
-    }
+
     func verifyTabDrag() async {
         func check(_ value: @autoclosure () -> Bool, _ message: String, line: UInt = #line) {
             guard value() else { fputs("FAIL: tab drag \(line): \(message)\n", stderr); exit(1) }
         }
         let savedTabs = store.tabs, savedGroups = store.tabGroups, savedSelection = store.selected
         let savedCompact = defaults.bool(forKey: "sidebarHidden")
-        store.library = nil
         store.tabGroups = []
         store.tabs = (0..<5).map { Tab(title: "Drag fixture \($0)", address: "", pinned: $0 == 0) }
         let ids = store.tabs.map(\.id)
@@ -2259,417 +1950,6 @@ final class LayoutSelfCheck {
         store.recentlyClosed = savedClosed
         await settle()
         print("PASS: group header event path, colors, persistence, collapse/select, native drag validation/acceptance into/out/across groups, cancellation, whole-group moves, pin boundary, reopen and compact layout")
-    }
-    func verifySavedGroupManager(_ group: UUID) async {
-        func check(_ condition: @autoclosure () -> Bool, _ message: String) {
-            if !condition() { fputs("FAIL: saved group manager: \(message)\n", stderr); exit(1) }
-        }
-        NSApp.activate(ignoringOtherApps: true)
-        panel.sheets.first?.makeKeyAndOrderFront(nil)
-        SelfTests.prepareAccessibility()
-        await settle()
-        var visited = Set<ObjectIdentifier>()
-        func children(_ object: NSObject) -> [Any] {
-            let views: [Any] = (object as? NSView)?.subviews ?? []
-            for key in ["accessibilityChildren", "accessibilityRows", "accessibilityVisibleRows"] {
-                if object.responds(to: NSSelectorFromString(key)),
-                   let values = object.value(forKey: key) as? [Any], !values.isEmpty { return views + values }
-            }
-            return views
-        }
-        func element(_ node: Any, label: String) -> NSObject? {
-            guard let object = node as? NSObject, visited.insert(ObjectIdentifier(object)).inserted else { return nil }
-            if object.responds(to: NSSelectorFromString("accessibilityLabel")),
-               object.responds(to: NSSelectorFromString("accessibilityPerformPress")),
-               object.value(forKey: "accessibilityLabel") as? String == label { return object }
-            for child in children(object) {
-                if let button = element(child, label: label) { return button }
-            }
-            return nil
-        }
-        func press(_ root: NSView, _ label: String) async {
-            visited.removeAll()
-            guard let button = element(root, label: label) else {
-                visited.removeAll()
-                func labels(_ node: Any) -> [String] {
-                    guard let object = node as? NSObject, visited.insert(ObjectIdentifier(object)).inserted else { return [] }
-                    let own = object.responds(to: NSSelectorFromString("accessibilityLabel")) ?
-                        (object.value(forKey: "accessibilityLabel") as? String).map { [$0] } ?? [] : []
-                    return own + children(object).flatMap(labels)
-                }
-                fputs("Visible labels: \(labels(root))\n", stderr)
-                if let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds) {
-                    root.cacheDisplay(in: root.bounds, to: bitmap)
-                    try? bitmap.representation(using: .png, properties: [:])?.write(to:
-                        FileManager.default.temporaryDirectory.appendingPathComponent("perch-saved-group-failure.png"))
-                }
-                fputs("FAIL: saved group button missing: \(label)\n", stderr); exit(1)
-            }
-            _ = button.perform(NSSelectorFromString("accessibilityPerformPress"))
-            await settle()
-        }
-        func find(_ root: NSView) -> BookmarkOutline? {
-            (root as? BookmarkOutline) ?? root.subviews.lazy.compactMap(find).first
-        }
-        func clickScope(_ root: NSView, _ label: String, trailing: Bool) async {
-            visited.removeAll()
-            guard let button = element(root, label: label),
-                  let frame = (button.value(forKey: "accessibilityFrame") as? NSValue)?.rectValue,
-                  let window = root.window else {
-                fputs("FAIL: saved group sidebar geometry: \(label)\n", stderr); exit(1)
-            }
-            check(frame.width > 100, "Sidebar buttons must span the row")
-            let point = window.convertPoint(fromScreen: NSPoint(x: trailing ? frame.maxX - 2 : frame.minX + 2, y: frame.midY))
-            NSApp.postEvent(NSEvent.mouseEvent(with: .leftMouseUp, location: point, modifierFlags: [],
-                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
-                context: nil, eventNumber: 1, clickCount: 1, pressure: 0)!, atStart: true)
-            NSApp.sendEvent(NSEvent.mouseEvent(with: .leftMouseDown, location: point, modifierFlags: [],
-                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
-                context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!)
-            await settle()
-        }
-        func clickOpen(_ table: BookmarkOutline, row: Int) async {
-            let cell = table.view(atColumn: 0, row: row, makeIfNecessary: true) as! BookmarkCell
-            let window = table.window!
-            window.makeKeyAndOrderFront(nil)
-            let point = cell.openButton.convert(NSPoint(x: cell.openButton.bounds.midX, y: cell.openButton.bounds.midY), to: nil)
-            let hit = window.contentView?.hitTest(window.contentView!.superview?.convert(point, from: nil) ?? point)
-            var ancestor = hit
-            while let view = ancestor, view !== cell.openButton { ancestor = view.superview }
-            check(ancestor != nil, "Open button must receive the event across its visible bounds")
-            NSApp.postEvent(NSEvent.mouseEvent(with: .leftMouseUp, location: point, modifierFlags: [],
-                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
-                context: nil, eventNumber: 1, clickCount: 1, pressure: 0)!, atStart: true)
-            window.sendEvent(NSEvent.mouseEvent(with: .leftMouseDown, location: point, modifierFlags: [],
-                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
-                context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!)
-            await settle()
-        }
-        let sheet = panel.sheets.first!, root = sheet.contentView!
-        visited.removeAll()
-        check(element(root, label: "全部标签组") == nil, "The redundant all-groups entry must be absent")
-        await clickScope(root, "隐藏资料", trailing: true)
-        let list = find(root)!
-        let coordinator = list.dataSource as! NativeBookmarks.Coordinator
-        check(list.numberOfRows == 2 && coordinator.roots.allSatisfy { $0.groupID == group && $0.site != nil },
-              "Clicking the trailing blank area must open the saved group's tabs")
-        await clickScope(root, "个人书签", trailing: true)
-        check(coordinator.roots.allSatisfy { $0.groupID == nil }, "Other sidebar rows must also accept trailing clicks")
-        await clickScope(root, "隐藏资料", trailing: false)
-        check(list.numberOfRows == 2 && coordinator.roots.allSatisfy { $0.groupID == group },
-              "The leading edge must also open the saved group's tabs")
-        let menu = coordinator.menu(0)!
-        check(menu.items.map(\.title) == ["打开标签页", "复制网址"],
-              "Saved tab menus must expose their own tab actions")
-        if let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds) {
-            root.cacheDisplay(in: root.bounds, to: bitmap)
-            try? bitmap.representation(using: .png, properties: [:])?.write(to:
-                FileManager.default.temporaryDirectory.appendingPathComponent("perch-saved-groups.png"))
-        }
-        let members = store.tabs(inGroup: group).map(\.id)
-        await clickOpen(list, row: 1)
-        check(store.library == nil && store.selected == members[1], "A saved tab click must restore and select that tab")
-        check(store.tabs.filter { $0.groupID == group }.map(\.id) == members, "Restoring a saved tab must reopen its group once")
-        let tabCoordinator = table().delegate as! NativeTabList.Coordinator
-        tabCoordinator.editGroup(group)
-        await settle()
-        let editor = tabCoordinator.editor!.contentViewController!.view
-        check(editor.bounds.width <= 250, "The group menu must keep its compact width")
-        check(editor.bounds.height < 235, "The group menu must reduce vertical whitespace")
-        visited.removeAll()
-        let hoverButton = element(editor, label: "隐藏分组")!
-        let hoverFrame = (hoverButton.value(forKey: "accessibilityFrame") as! NSValue).rectValue
-        let hoverWindow = editor.window!
-        let hoverPoint = hoverWindow.convertPoint(fromScreen: NSPoint(x: hoverFrame.maxX - 12, y: hoverFrame.midY))
-        func backgroundSample(at location: NSPoint) -> NSColor {
-            let bitmap = editor.bitmapImageRepForCachingDisplay(in: editor.bounds)!
-            editor.cacheDisplay(in: editor.bounds, to: bitmap)
-            let point = editor.convert(location, from: nil)
-            let x = Int(point.x / editor.bounds.width * CGFloat(bitmap.pixelsWide))
-            let y = Int((editor.isFlipped ? point.y : editor.bounds.height - point.y) / editor.bounds.height * CGFloat(bitmap.pixelsHigh))
-            return bitmap.colorAt(x: x, y: y)!.usingColorSpace(.deviceRGB)!
-        }
-        func move(_ point: NSPoint, in window: NSWindow) async {
-            NSApp.sendEvent(NSEvent.mouseEvent(with: .mouseMoved, location: point, modifierFlags: [],
-                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
-                context: nil, eventNumber: 1, clickCount: 0, pressure: 0)!)
-            await settle()
-        }
-        func hoverRegions(_ view: NSView) -> [TabGroupMenuHoverView] {
-            (view as? TabGroupMenuHoverView).map { [$0] } ?? view.subviews.flatMap(hoverRegions)
-        }
-        let regions = hoverRegions(editor)
-        check(regions.count == TabGroupColor.allCases.count + 4 && hoverWindow.acceptsMouseMovedEvents,
-              "Every menu button must have a native hover region and the popover must accept mouse moves")
-        check(regions.allSatisfy { region in
-            region.trackingAreas.contains { $0.options.contains(.activeAlways) &&
-                $0.rect == region.bounds.intersection(region.visibleRect) }
-        }, "Popover tracking must stay within each button's bounds and work independently of key-window status")
-        await move(.zero, in: panel)
-        let idleBackground = backgroundSample(at: hoverPoint)
-        await move(hoverPoint, in: hoverWindow)
-        let hoveredBackground = backgroundSample(at: hoverPoint)
-        check(abs(hoveredBackground.alphaComponent - idleBackground.alphaComponent) +
-              abs(hoveredBackground.redComponent - idleBackground.redComponent) > 0.04,
-              "A mouse move over the menu's blank area must visibly paint its hover background")
-        check(regions.filter(\.hovered).count == 1, "Only the button under the pointer may be highlighted")
-        for region in regions {
-            let point = region.convert(NSPoint(x: region.bounds.midX, y: region.bounds.midY), to: nil)
-            await move(point, in: hoverWindow)
-            check(region.hovered && regions.filter(\.hovered).count == 1,
-                  "Moving between action rows and colors must transfer the hover state")
-            check(region.hitTest(.zero) == nil, "Decorative hover tracking must not intercept clicks")
-        }
-        store.editTabGroup(group, name: "悬停时更新名称")
-        await settle()
-        check(hoverRegions(editor).filter(\.hovered).count == 1, "An editor redraw must preserve its hover state")
-        await move(.zero, in: panel)
-        let restoredBackground = backgroundSample(at: hoverPoint)
-        check(hoverRegions(editor).allSatisfy { !$0.hovered } &&
-              abs(restoredBackground.alphaComponent - idleBackground.alphaComponent) < 0.01 &&
-              abs(restoredBackground.redComponent - idleBackground.redComponent) < 0.01,
-              "Leaving the popover must clear both hover state and rendered highlight")
-        store.editTabGroup(group, name: "隐藏资料")
-        await clickScope(editor, "隐藏分组", trailing: true)
-        check(!table().ids.contains(group) && store.tabGroups.first { $0.id == group }?.hidden == true,
-              "The native editor hide action must remove the whole group from the sidebar")
-        store.library = .bookmarks
-        await settle()
-        await press(panel.sheets.first!.contentView!, "隐藏资料")
-        check(find(panel.sheets.first!.contentView!)!.numberOfRows == members.count,
-              "The hidden group must remain accessible in the manager")
-        await press(panel.sheets.first!.contentView!, "打开分组")
-        check(store.library == nil && store.tabs.filter { $0.groupID == group }.count == members.count,
-              "The manager reopen button must restore one group without duplicate tabs")
-        print("PASS: saved group directories, whole-row clicks, native menu hover event/pixel checks, color/row transitions, redraw/exit cleanup, editor hide and manager reopen")
-    }
-    func verifyBookmarks() async {
-        let initialSites = store.sites
-        let initialFolders = store.bookmarkFolders
-        func find<T: NSView>(_ root: NSView, _ type: T.Type) -> T? {
-            if let result = root as? T { return result }
-            return root.subviews.lazy.compactMap { find($0, type) }.first
-        }
-        let sheet = panel.sheets.first!
-        let table = find(sheet.contentView!, BookmarkOutline.self)!
-        precondition(sheet.firstResponder === table, "Opening bookmark management must focus the bookmark list")
-        let folderFixture = BookmarkListItem(key: "folder-icon-fixture", title: "目录", children: [])
-        let folderCell = BookmarkCell()
-        folderCell.configure(folderFixture)
-        let closedFolder = folderCell.icon.image?.tiffRepresentation
-        folderCell.configure(folderFixture, expanded: true)
-        precondition(closedFolder != folderCell.icon.image?.tiffRepresentation,
-                     "Collapsed and expanded folders must use different icons")
-        let folderDelegate = table.delegate as! NativeBookmarks.Coordinator
-        precondition(folderDelegate.outlineView(table, shouldShowOutlineCellForItem: folderFixture) &&
-                     table.frameOfOutlineCell(atRow: 0) == .zero,
-                     "Bookmark folders must hide disclosure arrows while retaining native collapse")
-        print("PASS: bookmark folders use closed/open icons without disclosure arrows"); fflush(stdout)
-        print("PASS: bookmark manager opens with native list focus"); fflush(stdout)
-        let menuDelegate = AppDelegate(store: store)
-        menuDelegate.panel = panel
-        menuDelegate.installMenu()
-        let board = NSPasteboard.withUniqueName()
-        defer { board.releaseGlobally() }
-        table.clipboard = board
-        sheet.makeFirstResponder(table)
-        func key(_ text: String, code: UInt16) {
-            sheet.makeFirstResponder(table)
-            let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .command,
-                timestamp: 0, windowNumber: sheet.windowNumber, context: nil, characters: text,
-                charactersIgnoringModifiers: text, isARepeat: false, keyCode: code)!
-            precondition(table.performKeyEquivalent(with: event))
-        }
-        func escape(_ window: NSWindow) {
-            NSApp.sendEvent(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
-                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
-                context: nil, characters: "\u{1b}", charactersIgnoringModifiers: "\u{1b}",
-                isARepeat: false, keyCode: 53)!)
-        }
-        if !CommandLine.arguments.contains("--preview-size-only") {
-        let reloads = table.reloadCount
-        func checkSelection(_ expected: IndexSet) {
-            guard table.selectedRowIndexes == expected else {
-                fputs("FAIL: bookmark selection \(Array(table.selectedRowIndexes)), expected \(Array(expected))\n", stderr)
-                exit(1)
-            }
-        }
-        table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
-        await settle()
-        checkSelection(IndexSet(integer: 0))
-        // AppKit reads physical modifier state during tracking; use native selection APIs in this isolated harness.
-        table.selectRowIndexes(IndexSet(integer: 2), byExtendingSelection: true)
-        await settle()
-        checkSelection(IndexSet([0, 2]))
-        table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
-        await settle()
-        table.selectRowIndexes(IndexSet(integersIn: 0...2), byExtendingSelection: false)
-        await settle()
-        checkSelection(IndexSet(integersIn: 0...2))
-        print("PASS: native bookmark single/multiple/range selection synchronization"); fflush(stdout)
-        await settle()
-        precondition(table.reloadCount == reloads, "Selecting rows must not rebuild bookmark contents")
-        key("a", code: 0)
-        await settle()
-        precondition(table.selectedRowIndexes.count == 3)
-        precondition((table.item(atRow: 0) as? BookmarkListItem)?.folderID != nil,
-                     "Personal folders must be visible and selectable on opening management")
-        let delegate = table.dataSource as! NativeBookmarks.Coordinator
-        let writer = delegate.outlineView(table, pasteboardWriterForItem: table.item(atRow: 0)!)!
-        board.clearContents()
-        precondition(board.writeObjects([writer]))
-        precondition(BookmarkDrag.ids(board) == [initialFolders[0].id],
-                     "Native folder dragging must preserve the source item identity")
-        print("PASS: bookmark select-all"); fflush(stdout)
-        key("c", code: 8)
-        precondition(BookmarkClipboard.read(board)?.count == store.sites.count)
-        precondition(sheet.firstResponder?.tryToPerform(NSSelectorFromString("copy:"), with: nil) == true,
-                     "The native sheet responder must handle bookmark copy even in an inactive test application")
-        print("PASS: bookmark copy responder"); fflush(stdout)
-        let original = store.sites.count
-        key("v", code: 9)
-        await settle()
-        precondition(store.sites.count == original * 2)
-        precondition(store.bookmarkFolders.count == 4, "Folder copies must retain their nested hierarchy")
-        print("PASS: bookmark paste"); fflush(stdout)
-        // Make the list long enough to detect selection-induced scrolling and resizing.
-        for i in 0..<25 { _ = store.add(title: "滚动检查 \(i)", address: "https://scroll-\(i).invalid") }
-        await settle()
-        table.scrollRowToVisible(18)
-        await settle()
-        let origin = table.enclosingScrollView!.contentView.bounds.origin
-        let frame = table.enclosingScrollView!.frame
-        let row = table.row(at: NSPoint(x: 30, y: origin.y + 70))
-        let cell = table.view(atColumn: 0, row: row, makeIfNecessary: true) as! BookmarkCell
-        let stableReloads = table.reloadCount
-        let openRect = table.convert(cell.openButton.bounds, from: cell.openButton)
-        precondition(openRect.maxX <= table.visibleRect.maxX && openRect.minX >= table.visibleRect.minX,
-                     "Bookmark row actions must fit inside the viewport")
-        table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-        await settle()
-        precondition((table.dataSource as? NativeBookmarks.Coordinator)?.parent.selection.count == 1,
-                     "A plain click must replace selections hidden inside collapsed folders")
-        precondition(table.reloadCount == stableReloads)
-        precondition(table.enclosingScrollView!.contentView.bounds.origin == origin)
-        precondition(table.enclosingScrollView!.frame == frame)
-        let field = find(sheet.contentView!, NSTextField.self)!
-        sheet.makeFirstResponder(field)
-        let textEvent = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .command,
-            timestamp: 0, windowNumber: sheet.windowNumber, context: nil, characters: "a",
-            charactersIgnoringModifiers: "a", isARepeat: false, keyCode: 0)!
-        precondition(!table.performKeyEquivalent(with: textEvent), "Bookmark shortcuts must yield to text editing")
-        print("PASS: native bookmark multiple/range selection, Cmd-A/C/V, row selection scroll/frame stability and text-edit focus isolation")
-        store.sites = initialSites; store.bookmarkFolders = initialFolders
-        await settle()
-        table.scrollRowToVisible(0)
-        sheet.makeFirstResponder(table)
-        await settle()
-        let dragDelegate = table.dataSource as! NativeBookmarks.Coordinator
-        let destination = dragDelegate.roots[0]
-        let source = dragDelegate.roots[1]
-        board.clearContents()
-        let sourceWriter = dragDelegate.outlineView(table, pasteboardWriterForItem: source)!
-        precondition(board.writeObjects([sourceWriter]))
-        let drag = BookmarkTestDrag(board: board, table: table)
-        precondition(dragDelegate.outlineView(table, validateDrop: drag, proposedItem: destination,
-                                             proposedChildIndex: -1) == .move)
-        precondition(dragDelegate.outlineView(table, acceptDrop: drag, item: destination, childIndex: -1))
-        precondition(store.sites.first { $0.id == source.id }?.folderID == destination.folderID)
-        precondition(Store(defaults: defaults).sites.first { $0.id == source.id }?.folderID == destination.folderID)
-        await settle()
-        precondition(dragDelegate.outlineView(table, acceptDrop: drag, item: nil, childIndex: -1))
-        precondition(store.sites.first { $0.id == source.id }?.folderID == nil)
-        board.clearContents()
-        precondition(board.writeObjects([dragDelegate.outlineView(table, pasteboardWriterForItem: destination)!]))
-        precondition(!dragDelegate.outlineView(table, acceptDrop: drag, item: destination, childIndex: -1))
-        print("PASS: native bookmark drag writer, folder/root drop persistence and self-drop rejection")
-        store.notice = nil
-        await settle()
-        table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
-        sheet.makeFirstResponder(table)
-        await settle()
-        let savedSites = defaults.data(forKey: "sites")
-        key("\u{7f}", code: 51)
-        await settle()
-        guard let deleteAlert = sheet.attachedSheet else {
-            fputs("FAIL: Command-Backspace must open the existing deletion confirmation\n", stderr); exit(1)
-        }
-        precondition(defaults.data(forKey: "sites") == savedSites)
-        escape(deleteAlert)
-        await settle()
-        precondition(sheet.attachedSheet == nil && defaults.data(forKey: "sites") == savedSites)
-        }
-        let field = find(sheet.contentView!, NSTextField.self)!
-        precondition(store.edit(initialSites[0], title: initialSites[0].title, address: "http://127.0.0.1:9/bookmark-preview"))
-        await settle()
-        table.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
-        sheet.makeFirstResponder(table)
-        await settle()
-        let savedTabs = defaults.data(forKey: "tabs")
-        let historyCount = store.history.count
-        let previewOrigin = table.enclosingScrollView!.contentView.bounds.origin
-        let space = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
-            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: sheet.windowNumber,
-            context: nil, characters: " ", charactersIgnoringModifiers: " ", isARepeat: false, keyCode: 49)!
-        var presentedSizes: [NSSize] = []
-        let presentationObservers = [NSWindow.didBecomeKeyNotification, NSWindow.didResizeNotification,
-                                     NSWindow.didUpdateNotification].map { name in
-            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { notification in
-                guard let window = notification.object as? NSWindow, window.parent === sheet, window.isVisible,
-                      let content = window.contentView else { return }
-                presentedSizes.append(content.bounds.size)
-            }
-        }
-        table.keyDown(with: space)
-        await settle()
-        presentationObservers.forEach(NotificationCenter.default.removeObserver)
-        guard let previewWindow = sheet.childWindows?.first,
-              let webView = find(previewWindow.contentView!, WKWebView.self) else {
-            fputs("FAIL: Space must open a temporary bookmark web view\n", stderr); exit(1)
-        }
-        precondition(!webView.configuration.websiteDataStore.isPersistent)
-        precondition(previewWindow.styleMask.contains(.resizable), "Web previews must allow edge/corner resizing")
-        let defaultPreviewSize = previewWindow.contentView!.bounds.size
-        precondition(defaultPreviewSize.width > 740 && defaultPreviewSize.height > 500)
-        precondition(!presentedSizes.isEmpty && presentedSizes.allSatisfy {
-            abs($0.width - defaultPreviewSize.width) < 2 && abs($0.height - defaultPreviewSize.height) < 2
-        }, "Visible preview presentation must keep its initial size")
-        print("PASS: preview opens at \(defaultPreviewSize) with stable visible dimensions"); fflush(stdout)
-        let initialWebSize = webView.bounds.size
-        previewWindow.setContentSize(NSSize(width: defaultPreviewSize.width + 100, height: defaultPreviewSize.height + 60))
-        await settle()
-        precondition(webView.bounds.width > initialWebSize.width && webView.bounds.height > initialWebSize.height)
-        previewWindow.setContentSize(NSSize(width: 800, height: 540))
-        await settle()
-        precondition(abs(previewWindow.contentView!.bounds.width - 800) < 2)
-        precondition(abs(webView.bounds.width - 800) < 2)
-        webView.loadHTMLString("<html><title>Temporary preview fixture</title><body><input id='text'></body></html>",
-                               baseURL: URL(string: "http://127.0.0.1:9/"))
-        await settle()
-        precondition(abs(previewWindow.contentView!.bounds.width - 800) < 2 &&
-                     abs(previewWindow.contentView!.bounds.height - 540) < 2,
-                     "Page loading and title changes must preserve the resized window")
-        precondition(defaults.data(forKey: "tabs") == savedTabs && store.history.count == historyCount)
-        escape(previewWindow)
-        await settle()
-        precondition(sheet.childWindows?.isEmpty != false && sheet.firstResponder === table)
-        precondition(table.enclosingScrollView!.contentView.bounds.origin == previewOrigin)
-        precondition(table.selectedRowIndexes == IndexSet(integer: 1))
-        sheet.makeFirstResponder(field)
-        let deleteEvent = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .command,
-            timestamp: 0, windowNumber: sheet.windowNumber, context: nil, characters: "\u{7f}",
-            charactersIgnoringModifiers: "\u{7f}", isARepeat: false, keyCode: 51)!
-        precondition(!table.performKeyEquivalent(with: deleteEvent))
-        let previewAction = table.previewItem
-        var stolenSpace = false
-        table.previewItem = { stolenSpace = true }
-        table.keyDown(with: space)
-        precondition(!stolenSpace, "Space must remain text input when editing")
-        table.previewItem = previewAction
-        store.sites = initialSites
-        await settle()
-        sheet.makeFirstResponder(table)
-        print("PASS: stable resizable Space preview, page-update dimensions, Escape focus/selection/scroll restoration and text-edit shortcut isolation")
     }
     func addressField() -> NSTextField {
         func find(_ view: NSView) -> NSTextField? {
@@ -3537,173 +2817,6 @@ final class LayoutSelfCheck {
         check(store.tabs.map(\.id) == tabs && store.history.count == visits, "Preview must not add tabs or history")
         print("PASS: hover/frame link tracking, isolated bridge, invalid URL rejection, zero-delay immediate trigger, huge-delay cancellation, hold/release/leave/edit cancellation, custom trigger, global switch, Esc, no nesting, remembered size and tab/history isolation")
     }
-    func verifySettingsFocus() async {
-        let initial = store.settings
-        var settings = initial
-        settings.linkPreviewDelay = 0
-        try! store.saveSettings(settings)
-        store.library = .settings
-        await settle()
-        guard let sheet = panel.sheets.first, let root = sheet.contentView else {
-            preconditionFailure("Settings sheet must appear")
-        }
-        precondition(root.bounds.size == NSSize(width: 780, height: 580),
-                     "Settings must open at the shared bookmark manager size")
-        precondition(LibraryPage.allCases.map(\.rawValue) == ["常规", "AI", "书签与分组", "密码", "导入导出"],
-                     "Manager tabs must keep the requested labels and order")
-        precondition(!(sheet.firstResponder is NSTextView), "Opening settings must not auto-focus numeric input")
-        SelfTests.prepareAccessibility()
-        func themeButton(_ node: Any, label: String) -> NSObject? {
-            guard let object = node as? NSObject else { return nil }
-            if object.responds(to: NSSelectorFromString("accessibilityLabel")),
-               object.value(forKey: "accessibilityLabel") as? String == label { return object }
-            guard object.responds(to: NSSelectorFromString("accessibilityChildren")) else { return nil }
-            return (object.value(forKey: "accessibilityChildren") as? [Any] ?? []).lazy.compactMap {
-                themeButton($0, label: label)
-            }.first
-        }
-        for color in ThemeColor.allCases {
-            guard let button = themeButton(root, label: "\(color.name)色主题"),
-                  button.responds(to: NSSelectorFromString("accessibilityPerformPress")) else {
-                preconditionFailure("Each theme needs an accessible settings button")
-            }
-            _ = button.perform(NSSelectorFromString("accessibilityPerformPress"))
-            await settle()
-            precondition(store.settings.theme == color && PerchTheme.shared.selection == color,
-                         "Pressing a theme swatch must immediately save and apply its palette")
-            precondition(table().theme == color, "Native tabs must receive theme changes without collapsing the sidebar")
-            if let row = table().rowView(atRow: 0, makeIfNecessary: true) as? TabSelectionRow {
-                precondition(row.theme == color, "Visible native tab rows must redraw with the current theme")
-            }
-            precondition(root.bounds.size == NSSize(width: 780, height: 580), "Theme changes must not resize the settings window")
-        }
-        if let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds) {
-            root.cacheDisplay(in: root.bounds, to: bitmap)
-            try? bitmap.representation(using: .png, properties: [:])?.write(to:
-                FileManager.default.temporaryDirectory.appendingPathComponent("perch-theme-settings.png"))
-        }
-        _ = themeButton(root, label: "\(initial.theme.name)色主题")?.perform(NSSelectorFromString("accessibilityPerformPress"))
-        await settle()
-        print("PASS: eight accessible settings swatches apply and save without resizing the manager")
-        func numberField(_ view: NSView) -> NSTextField? {
-            if let field = view as? NSTextField, field.isEditable, Double(field.stringValue) != nil { return field }
-            return view.subviews.lazy.compactMap { numberField($0) }.first
-        }
-        let field = numberField(root)!
-        NSApp.activate(ignoringOtherApps: true)
-        sheet.makeKeyAndOrderFront(nil)
-        sheet.makeFirstResponder(field)
-        await settle()
-        guard let editor = sheet.firstResponder as? NSTextView else {
-            fputs("FAIL: the settings numeric field must install its native field editor\n", stderr)
-            exit(1)
-        }
-        editor.insertText("0.25", replacementRange: NSRange(location: 0, length: editor.string.utf16.count))
-        func click(_ point: NSPoint) {
-            for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
-                let event = NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
-                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: sheet.windowNumber,
-                    context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!
-                NSApp.sendEvent(event)
-            }
-        }
-        let fieldRect = field.convert(field.bounds, to: nil)
-        click(NSPoint(x: fieldRect.minX + 10, y: fieldRect.midY))
-        await settle()
-        precondition(sheet.firstResponder === editor, "Clicking inside the numeric field must retain editing")
-        click(NSPoint(x: fieldRect.maxX + 150, y: fieldRect.midY))
-        await settle()
-        precondition(!(sheet.firstResponder is NSTextView), "Clicking settings whitespace must end numeric editing")
-        precondition(store.settings.linkPreviewDelay == 0.25, "Ending numeric editing must save the entered decimal")
-        func pagePicker(_ view: NSView) -> NSSegmentedControl? {
-            if let picker = view as? NSSegmentedControl, picker.segmentCount == LibraryPage.allCases.count { return picker }
-            return view.subviews.lazy.compactMap { pagePicker($0) }.first
-        }
-        let picker = pagePicker(root)!
-        let frame = sheet.frame
-        for page in LibraryPage.allCases.filter({ $0 != .settings }) + [.settings] {
-            let index = LibraryPage.allCases.firstIndex(of: page)!
-            picker.selectedSegment = index
-            _ = picker.sendAction(picker.action!, to: picker.target)
-            precondition(sheet.frame == frame, "Changing library pages must not immediately resize the window")
-            await settle()
-            precondition(panel.sheets.first === sheet && sheet.frame == frame &&
-                         root.bounds.size == NSSize(width: 780, height: 580),
-                         "All library pages must preserve the same sheet and content size")
-            if page == .importer {
-                for label in ["导出 ZIP…", "导入 ZIP…"] {
-                    guard let button = themeButton(root, label: label),
-                          let frame = (button.value(forKey: "accessibilityFrame") as? NSValue)?.rectValue else {
-                        preconditionFailure("Backup actions must be accessible")
-                    }
-                    precondition(frame.width > 40 && frame.height > 10 && sheet.frame.contains(frame),
-                                 "Backup actions must be visible in the fixed-size manager")
-                }
-            }
-            let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds)!
-            root.cacheDisplay(in: root.bounds, to: bitmap)
-            let color = bitmap.colorAt(x: Int(10 * CGFloat(bitmap.pixelsWide) / root.bounds.width),
-                                       y: Int(150 * CGFloat(bitmap.pixelsHigh) / root.bounds.height))!
-                .usingColorSpace(.deviceRGB)!
-            precondition(abs(color.redComponent - 0.98) < 0.015 && abs(color.greenComponent - 0.98) < 0.015 &&
-                         abs(color.blueComponent - 0.96) < 0.015, "All library pages must share the warm paper background")
-        }
-        precondition(!(sheet.firstResponder is NSTextView), "Returning to settings must not auto-focus numeric input")
-        print("PASS: native library picker preserves the same 780x580 window and paper background through all \(LibraryPage.allCases.count) pages")
-        store.library = nil
-        await settle()
-        let originalFrame = panel.frame
-        func closeSettings() {
-            guard let current = panel.attachedSheet, let content = current.contentView,
-                  let done = themeButton(content, label: "完成"),
-                  let buttonFrame = (done.value(forKey: "accessibilityFrame") as? NSValue)?.rectValue else {
-                preconditionFailure("Settings must expose its Done button")
-            }
-            current.makeKeyAndOrderFront(nil)
-            let point = current.convertPoint(fromScreen: NSPoint(x: buttonFrame.midX, y: buttonFrame.midY))
-            for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
-                NSApp.sendEvent(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
-                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: current.windowNumber,
-                    context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!)
-            }
-        }
-        let screens = NSScreen.screens.map(\.visibleFrame)
-        for (index, bounds) in screens.enumerated() {
-            let small = NSRect(x: bounds.minX + 90, y: bounds.minY + 1, width: 700, height: 552)
-            panel.setFrame(small, display: true)
-            await settle()
-            let beforeSheet = panel.frame
-            store.library = .settings
-            await settle()
-            closeSettings()
-            await settle()
-            precondition(panel.attachedSheet == nil && panel.frame == beforeSheet,
-                         "An unmoved tall sheet must retain AppKit's ordinary parent restoration")
-            store.library = .settings
-            await settle()
-            let destination = screens[(index + 1) % screens.count]
-            panel.setPlacement(NSRect(origin: NSPoint(x: destination.minX + 120, y: destination.minY + 160),
-                                      size: panel.frame.size), display: true)
-            await settle()
-            let moved = panel.frame
-            var dismissalFrames: [NSRect] = []
-            let observer = NotificationCenter.default.addObserver(forName: NSWindow.didMoveNotification,
-                object: panel, queue: nil) { notification in
-                    dismissalFrames.append((notification.object as! NSWindow).frame)
-                }
-            closeSettings()
-            await settle()
-            NotificationCenter.default.removeObserver(observer)
-            precondition(panel.attachedSheet == nil && panel.frame == moved,
-                         "Closing a tall sheet must preserve the latest explicit window placement")
-            precondition(dismissalFrames.allSatisfy { $0 == moved },
-                         "The entire sheet dismissal must stay on the destination, without moving back first")
-        }
-        panel.setFrame(originalFrame, display: true)
-        print("PASS: actual Done clicks restore unmoved parents and keep relocated parents stationary throughout dismissal across \(screens.count) screens")
-        try! store.saveSettings(initial)
-        print("PASS: settings open without numeric focus; actual clicks retain input focus inside the field, blur on whitespace and save the decimal")
-    }
     func run() async {
         setbuf(stdout, nil)
         func check(_ condition: @autoclosure () -> Bool, _ message: String, line: UInt = #line) {
@@ -4058,7 +3171,6 @@ final class LayoutSelfCheck {
         precondition(command("9", code: 25) && store.selected == store.tabs.last?.id)
         precondition(command("1", code: 18) && store.selected == store.tabs.first?.id)
         print("PASS: native menu shortcuts for reload, forced reload, page zoom, find and tab switching")
-        await verifySettingsFocus()
         print("PASS: real root layout keeps sidebar width through tab insert/remove/reorder/reopen; rounded rows, icon rail and inactive-window activation")
     }
     private func verifyTabClosing() async {

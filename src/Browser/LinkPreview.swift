@@ -128,7 +128,7 @@ final class LinkPreviewController {
         if store?.settings.linkPreviewEnabled == false { preview?.close() }
     }
     private func eligibleBrowser() -> Browser? {
-        guard let store, store.settings.linkPreviewEnabled, store.library == nil, !store.adding,
+        guard let store, store.settings.linkPreviewEnabled, !store.adding,
               store.pendingPassword == nil, let browser = store.browser,
               let window = browser.webView.window, window.isKeyWindow, window.isVisible,
               window.attachedSheet == nil, NSApp.isActive,
