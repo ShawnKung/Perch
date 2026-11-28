@@ -116,7 +116,13 @@ enum WebsiteCookies {
 
 final class HomeHistoryPage: NSObject, WKURLSchemeHandler {
     static let url = URL(string: "perch-home://new-tab/")!
+    static let homeURL = URL(string: "perch://home")!
+    static let title = "首页"
+    static func matches(_ url: URL?) -> Bool { InternalPage.matches(url, host: "home") }
     func webView(_ webView: WKWebView, start urlSchemeTask: WKURLSchemeTask) {
+        guard urlSchemeTask.request.url == Self.url else {
+            urlSchemeTask.didFailWithError(URLError(.unsupportedURL)); return
+        }
         let data = Data("<!doctype html><title>新标签页</title>".utf8)
         urlSchemeTask.didReceive(URLResponse(url: Self.url, mimeType: "text/html",
                                             expectedContentLength: data.count, textEncodingName: "utf-8"))
@@ -195,18 +201,17 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     private var activeNavigation: WKNavigation?
     private var pendingHistoryItem: WKBackForwardListItem?
     private var provisionalFailure = false
-    private var firstHomeDestination: URL?
-    private let startsAtHome: Bool
-    var isHome: Bool { startsAtHome && webView.url == HomeHistoryPage.url }
+    private var nextAfterInitialLoad: URL?
+    var isHome: Bool { webView.url == HomeHistoryPage.url || HomeHistoryPage.matches(webView.url) }
     private func displayAddress(_ url: URL?) -> String {
         url == HomeHistoryPage.url ? "" : url?.absoluteString ?? ""
     }
 
     init(url: URL, userAgent: String? = nil, dataStore: WKWebsiteDataStore? = nil,
          trackHoverLinks: Bool = false, previewDefaults: UserDefaults = .standard, startsAtHome: Bool = false,
-         downloads: DownloadController? = nil) {
+         downloads: DownloadController? = nil, nextAfterInitialLoad: URL? = nil) {
         self.downloads = downloads
-        self.startsAtHome = startsAtHome
+        self.nextAfterInitialLoad = startsAtHome ? url : nextAfterInitialLoad
         self.previewDefaults = previewDefaults
         let tracker = trackHoverLinks ? HoverLinkTracker() : nil
         hoverLinks = tracker
@@ -277,10 +282,13 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
                 DispatchQueue.main.async { self?.address = self?.displayAddress(view.url) ?? ""; self?.syncNavigationState() }
             }
         ]
-        if startsAtHome {
-            firstHomeDestination = url
-            activeNavigation = webView.load(URLRequest(url: HomeHistoryPage.url))
-        } else { load(url) }
+        if self.nextAfterInitialLoad != nil {
+            let initial = startsAtHome ? HomeHistoryPage.url : url
+            activeNavigation = webView.load(URLRequest(url: initial))
+            address = displayAddress(initial)
+        } else {
+            load(url)
+        }
     }
 
     func extendContextMenu(_ menu: NSMenu) {
@@ -429,14 +437,14 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     }
 
     func load(_ url: URL, reuseSettings: Bool = true) {
-        if firstHomeDestination != nil && webView.backForwardList.currentItem == nil {
-            firstHomeDestination = url
+        if nextAfterInitialLoad != nil && webView.backForwardList.currentItem == nil {
+            nextAfterInitialLoad = url
             return
         }
-        firstHomeDestination = nil
+        nextAfterInitialLoad = nil
         error = nil
         httpAlternative = nil
-        address = url.absoluteString
+        address = displayAddress(url)
         provisionalFailure = false; pendingHistoryItem = nil
         if reuseSettings, let destination = SettingsRoute(url), let source = webView.url,
            SettingsRoute(source) != nil, source != url, !webView.isLoading {
@@ -524,7 +532,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         settingsPage.stop()
         if SettingsRoute(webView.url) != nil { settingsPage.start() }
         address = displayAddress(webView.url)
-        if startsAtHome && firstHomeDestination == nil { onHomeChanged?(isHome) }
+        if nextAfterInitialLoad == nil { onHomeChanged?(isHome) }
         syncNavigationState()
     }
 
@@ -535,17 +543,15 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         syncNavigationState()
         title = webView.title ?? ""
         historyPage.restoreView()
-        if isHome {
-            if let destination = firstHomeDestination { load(destination) }
-            else { onHomeChanged?(true) }
-            return
-        }
+        if nextAfterInitialLoad != nil { openNextAfterInitialLoad(); return }
+        if isHome { return }
         if let url = webView.url { onVisit?(url.absoluteString, title) }
         favicon.load(from: webView)
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         guard navigation === activeNavigation, (error as NSError).code != NSURLErrorCancelled else { return }
+        if nextAfterInitialLoad != nil { openNextAfterInitialLoad(); return }
         pendingHistoryItem = nil; provisionalFailure = true
         report(error)
         syncNavigationState()
@@ -553,9 +559,16 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
         guard navigation === activeNavigation, (error as NSError).code != NSURLErrorCancelled else { return }
+        if nextAfterInitialLoad != nil { openNextAfterInitialLoad(); return }
         pendingHistoryItem = nil
         report(error)
         syncNavigationState()
+    }
+
+    private func openNextAfterInitialLoad() {
+        guard let destination = nextAfterInitialLoad else { return }
+        nextAfterInitialLoad = nil
+        load(destination)
     }
 
     private func report(_ error: Error) {
@@ -578,7 +591,8 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
                 HistoryPage.matches(url) ||
                 SettingsRoute(url) != nil ||
                 ChatPage.matches(url) ||
-                (startsAtHome && url == HomeHistoryPage.url && navigationAction.targetFrame?.isMainFrame == true) else {
+                ((url == HomeHistoryPage.url || HomeHistoryPage.matches(url)) &&
+                    navigationAction.targetFrame?.isMainFrame == true) else {
             error = "此链接使用其他应用的专用协议，Perch 暂不支持打开。"
             decisionHandler(.cancel)
             return
@@ -623,7 +637,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         pendingHistoryItem = nil; provisionalFailure = false
         let document = webView.backForwardList.currentItem?.url
         address = displayAddress(document); error = nil; syncNavigationState()
-        onHomeChanged?(document == nil || (startsAtHome && document == HomeHistoryPage.url))
+        onHomeChanged?(document == nil || document == HomeHistoryPage.url || HomeHistoryPage.matches(document))
     }
 
     // shortcut: links open in tabs; OAuth flows requiring window.opener need a dedicated popup implementation.
@@ -770,7 +784,7 @@ final class Store: ObservableObject {
     @Published var pinned = false
     @Published var adding = false
     @Published var notice: String?
-    @Published private(set) var availableUpdate: String?
+    @Published var availableUpdate: UpdateCheck.Release?
     @Published private(set) var checkingUpdate = false
     @Published private(set) var updateCheckMessage: String?
     private var updateTask: Task<Void, Never>?
@@ -783,22 +797,19 @@ final class Store: ObservableObject {
     var hasWindowedTabList: (() -> Bool)?
     private var activationHistory: [UUID] = []
     let defaults: UserDefaults
-    func receiveUpdate(_ version: String?) {
-        availableUpdate = version
-    }
     func checkForUpdates(manual: Bool = false, current: String = UpdateCheck.currentVersion,
                          session: URLSession = .shared) {
         guard !checkingUpdate else { return }
         checkingUpdate = true
         updateCheckMessage = nil
         updateTask = Task { @MainActor [weak self] in
-            let result: Result<String?, Error>
-            do { result = .success(try await UpdateCheck.latestVersion(current: current, session: session)) }
+            let result: Result<UpdateCheck.Release?, Error>
+            do { result = .success(try await UpdateCheck.latestRelease(current: current, session: session)) }
             catch { result = .failure(error) }
             guard !Task.isCancelled, let self else { return }
             switch result {
             case .success(let latest):
-                self.receiveUpdate(latest)
+                self.availableUpdate = latest
                 if manual && latest == nil { self.updateCheckMessage = "当前已是最新版本" }
             case .failure(let error):
                 if manual { self.updateCheckMessage = "无法检查更新：\(error.localizedDescription)" }
@@ -882,7 +893,7 @@ final class Store: ObservableObject {
         }
         normalizeTabGroups()
         let savedPages = tabs + tabGroups.flatMap { $0.hiddenTabs ?? [] }
-        ai.classifyWebConversations(owners: Set(savedPages.filter { !$0.address.isEmpty && !$0.isChat }.map { $0.aiOwner ?? $0.id }))
+        ai.classifyWebConversations(owners: Set(savedPages.filter { !$0.isHome && !$0.isChat }.map { $0.aiOwner ?? $0.id }))
         for tab in tabs { icons[tab.id] = FaviconCache.image(for: tab.address, defaults: defaults) }
         history = restore([Visit].self, key: "history") ?? []
         importedBookmarks = restore([String: [BookmarkNode]].self, key: "importedBookmarks") ?? [:]
@@ -895,13 +906,13 @@ final class Store: ObservableObject {
     }
 
     var browser: Browser? {
-        guard let selected, tabs.contains(where: { $0.id == selected && !$0.address.isEmpty && !$0.isChat }) else { return nil }
+        guard let selected, tabs.contains(where: { $0.id == selected && !$0.isHome && !$0.isChat }) else { return nil }
         return browsers[selected]
     }
     func cachedBrowser(for id: UUID) -> Browser? { browsers[id] }
 
     func open(_ site: Site) {
-        if !isChatPage && (selected == nil || tabs.first(where: { $0.id == selected })?.address.isEmpty == true) {
+        if selected == nil || tabs.first(where: { $0.id == selected })?.isHome == true {
             navigate(site.address)
         } else { newTab(address: site.address, title: site.title) }
     }
@@ -931,7 +942,7 @@ final class Store: ObservableObject {
         activate(first.id)
     }
 
-    func activate(_ id: UUID, select: Bool = true, startsAtHome: Bool = false) {
+    func activate(_ id: UUID, select: Bool = true, startsAtHome: Bool = false, nextAfterInitialLoad: URL? = nil) {
         guard let tab = tabs.first(where: { $0.id == id }) else { return }
         if select, selected != id, let groupID = tab.groupID, let index = tabGroups.firstIndex(where: { $0.id == groupID }),
            tabGroups[index].collapsed { tabGroups[index].collapsed = false }
@@ -940,14 +951,17 @@ final class Store: ObservableObject {
            let url = URLInput.parseNavigation(tab.address, search: false) {
             let view = Browser(url: url, userAgent: settings.userAgent,
                                dataStore: defaults === UserDefaults.standard ? .default() : .nonPersistent(),
-                               trackHoverLinks: true, previewDefaults: defaults, startsAtHome: startsAtHome, downloads: downloads)
+                               trackHoverLinks: true, previewDefaults: defaults, startsAtHome: startsAtHome, downloads: downloads,
+                               nextAfterInitialLoad: nextAfterInitialLoad)
             view.historyPage.store = self
             view.settingsPage.store = self
             view.onHomeChanged = { [weak self, weak view] home in
                 guard let self, let view, let index = self.tabs.firstIndex(where: { $0.id == id }) else { return }
-                self.tabs[index].address = home ? "" : view.address
-                self.tabs[index].title = home ? "新标签页" :
+                let title = home ? (view.address.isEmpty ? "新标签页" : HomeHistoryPage.title) :
                     (view.title.isEmpty ? URL(string: view.address)?.host ?? view.address : view.title)
+                guard self.tabs[index].address != view.address || self.tabs[index].title != title else { return }
+                self.tabs[index].address = view.address
+                self.tabs[index].title = title
                 self.persistTabs()
             }
             linkPreview.start()
@@ -1025,9 +1039,10 @@ final class Store: ObservableObject {
 
     func newTab(address: String = "", title: String = "新标签页", after: UUID? = nil, select: Bool = true,
                 customTitle: String? = nil) {
-        var tab = Tab(title: title == "新标签页" ? URL(string: address)?.host ?? title : title,
-                      address: address, customTitle: customTitle)
         let url = URL(string: address)
+        let pageTitle = HomeHistoryPage.matches(url) ? HomeHistoryPage.title : URL(string: address)?.host ?? title
+        var tab = Tab(title: title == "新标签页" ? pageTitle : title,
+                      address: address, customTitle: customTitle)
         if select, hasWindowedTabList?() == true,
            DownloadsPage.matches(url) || HistoryPage.matches(url) || SettingsRoute(url) != nil {
             pendingInternalPageLoads.insert(tab.id)
@@ -1142,17 +1157,17 @@ final class Store: ObservableObject {
             fullChatOwner = chatOwner
         }
         if !isChatPage {
-            if selected == nil || tabs.first(where: { $0.id == selected })?.address.isEmpty == true {
+            if selected == nil || tabs.first(where: { $0.id == selected })?.isHome == true {
                 navigate(ChatPage.url.absoluteString)
             } else { newTab(address: ChatPage.url.absoluteString, title: "AI 聊天") }
         }
         aiVisible = false
     }
     func referenceBrowser(_ id: UUID) -> Browser? {
-        guard tabs.contains(where: { $0.id == id && !$0.address.isEmpty && !$0.isChat }) else { return nil }
+        guard tabs.contains(where: { $0.id == id && !$0.isHome && !$0.isChat }) else { return nil }
         activate(id, select: false); return browsers[id]
     }
-    var loadedReferencePages: [Browser] { tabs.filter { !$0.address.isEmpty && !$0.isChat }.compactMap { browsers[$0.id] } }
+    var loadedReferencePages: [Browser] { tabs.filter { !$0.isHome && !$0.isChat }.compactMap { browsers[$0.id] } }
     func restoreReference(_ reference: AIPageReference) -> Browser? {
         func matches(_ tab: Tab) -> Bool {
             guard !tab.isChat, let url = URL(string: tab.address) else { return false }
@@ -1556,6 +1571,11 @@ final class Store: ObservableObject {
         }
     }
 
+    func goHome() {
+        guard selected.flatMap({ browsers[$0]?.address }) != HomeHistoryPage.homeURL.absoluteString else { return }
+        navigate(HomeHistoryPage.homeURL.absoluteString)
+    }
+
     func navigate(_ text: String) {
         guard let url = URLInput.parseNavigation(text, searchTemplate: settings.searchURL) else {
             notice = "请输入有效的 http / https 网址，或输入关键词搜索。"
@@ -1563,8 +1583,12 @@ final class Store: ObservableObject {
         }
         pendingAddressFocus = nil
         prepareNavigation?()
+        if HomeHistoryPage.matches(url), let selected, pendingInternalPageLoads.remove(selected) != nil {
+            activate(selected, nextAfterInitialLoad: url)
+            return
+        }
         if let selected, let browser = browsers[selected] {
-            if let index = tabs.firstIndex(where: { $0.id == selected }) {
+            if !HomeHistoryPage.matches(url), let index = tabs.firstIndex(where: { $0.id == selected }) {
                 tabs[index].address = url.absoluteString
                 tabs[index].title = url.host ?? url.absoluteString
                 persistTabs()
@@ -1577,6 +1601,7 @@ final class Store: ObservableObject {
                 let startsAtHome = tabs[index].address.isEmpty
                 pendingInternalPageLoads.remove(selected)
                 tabs[index].address = url.absoluteString
+                if HomeHistoryPage.matches(url) { tabs[index].title = HomeHistoryPage.title }
                 activate(selected, startsAtHome: startsAtHome)
             } else {
                 newTab()
@@ -2069,8 +2094,8 @@ struct BrowserAddressBar: View {
 struct HomeAddressBar: View {
     @ObservedObject private var theme = PerchTheme.shared
     private let entry: AddressEntry
-    init(store: Store, tabID: UUID) {
-        entry = AddressEntry(store: store, homeTab: tabID)
+    init(store: Store, tabID: UUID, address: String = "") {
+        entry = AddressEntry(store: store, currentAddress: address, homeTab: address.isEmpty ? tabID : nil, ownerTab: tabID)
     }
     var body: some View {
         entry
@@ -2090,7 +2115,7 @@ struct HomeHistoryAddressBar: View {
                 .disabled(!browser.canGoBack)
             GlyphButton(symbol: "chevron.right", label: "前进", size: 28) { browser.goForward() }
                 .disabled(!browser.canGoForward)
-            HomeAddressBar(store: store, tabID: tabID)
+            HomeAddressBar(store: store, tabID: tabID, address: HomeHistoryPage.matches(URL(string: browser.address)) ? browser.address : "")
         }
     }
 }
@@ -2276,13 +2301,12 @@ struct WindowTools: View {
     private let chatPage: Bool
     private let aiVisible: Bool
     private let pinned: Bool
-    private let hasBrowser: Bool
     private let canClearCookies: Bool
     private static let menuIconSize = NSSize(width: 18, height: 18)
     private static let emptyMenuIcon = NSImage(size: menuIconSize, flipped: false) { _ in true }
     private static let menuIcons: [String: NSImage] = {
         var icons: [String: NSImage] = [:]
-        for name in ["bookmark", "clock.arrow.circlepath", "arrow.down.to.line", "key", "house"] {
+        for name in ["bookmark", "clock.arrow.circlepath", "arrow.down.to.line", "key", "house", "gearshape"] {
             guard let symbol = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
                 .withSymbolConfiguration(.init(pointSize: 13, weight: .regular)) else { continue }
             let icon = NSImage(size: menuIconSize, flipped: false) { bounds in
@@ -2301,8 +2325,8 @@ struct WindowTools: View {
     init(store: Store) {
         self.store = store
         chatPage = store.isChatPage; aiVisible = store.aiVisible; pinned = store.pinned
-        hasBrowser = store.selected.flatMap { store.cachedBrowser(for: $0) } != nil
-        canClearCookies = store.browser?.webView.url?.host != nil && !store.isChatPage
+        let scheme = store.browser?.webView.url?.scheme?.lowercased()
+        canClearCookies = scheme == "http" || scheme == "https"
     }
     private func menuButton(_ title: String, icon: String? = nil, action: @escaping () -> Void) -> some View {
         Button(action: action) {
@@ -2326,19 +2350,12 @@ struct WindowTools: View {
             }
             DownloadToolbarButton(downloads: store.downloads) { store.openDownloads() }
             Menu {
+                menuButton("回到首页", icon: "house", action: store.goHome)
                 menuButton("书签管理", icon: "bookmark") { store.openBookmarks() }
                 menuButton("历史记录", icon: "clock.arrow.circlepath") { store.openHistory() }
                 menuButton("下载记录", icon: "arrow.down.to.line") { store.openDownloads() }
                 menuButton("密码管理", icon: "key") { store.openSettings(.passwords) }
                 Divider()
-                menuButton("在新标签页打开") {
-                    if let id = store.selected, let address = store.tabs.first(where: { $0.id == id })?.address,
-                       let url = URLInput.parseNavigation(address, search: false) { store.newTab(address: url.absoluteString) }
-                }.disabled(!hasBrowser)
-                Divider()
-                menuButton("回到首页", icon: "house") { store.selected = nil }
-                menuButton("添加网站") { store.adding = true }
-                menuButton("从浏览器导入…") { store.openSettings(.importer) }
                 menuButton("清除当前网站的 Cookie…") {
                     guard let browser = store.browser, let url = browser.webView.url,
                           ["http", "https"].contains(url.scheme?.lowercased() ?? ""), let host = url.host else { return }
@@ -2346,8 +2363,8 @@ struct WindowTools: View {
                     confirmingCookies = true
                 }.disabled(!canClearCookies)
                 Divider()
-                menuButton("Perch \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")") {}
-                    .disabled(true)
+                menuButton("设置", icon: "gearshape") { store.openSettings() }
+                menuButton("Perch \(UpdateCheck.currentVersion)") { store.openSettings(.about) }
                 menuButton("退出 Perch") { NSApp.terminate(nil) }.keyboardShortcut("q")
             } label: { Image(systemName: "ellipsis").frame(width: 28, height: 28) }
                 .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()

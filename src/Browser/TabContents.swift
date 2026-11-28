@@ -219,14 +219,14 @@ struct TabContentView: View {
     private var tabID: UUID { page.tabID }
     let controlsInset: CGFloat
     private var tab: Tab? { store.tabs.first { $0.id == tabID } }
-    private var browser: Browser? { tab?.address.isEmpty == false ? store.cachedBrowser(for: tabID) : nil }
+    private var browser: Browser? { tab?.isHome == false ? store.cachedBrowser(for: tabID) : nil }
 
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 6) {
                 if let browser {
                     BrowserAddressBar(browser: browser, store: store, tabID: tabID).id(ObjectIdentifier(browser))
-                } else if let tab, !tab.address.isEmpty {
+                } else if let tab, !tab.isHome {
                     Text(tab.address).font(.system(size: 13)).lineLimit(1)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
                         .padding(.horizontal, 8)
@@ -243,7 +243,7 @@ struct TabContentView: View {
                     Color.clear
                 } else if let browser {
                     BrowserTabContent(browser: browser)
-                } else if tab?.address.isEmpty == false {
+                } else if tab?.isHome == false {
                     Style.paper
                 } else { HomeScreen(page: page) }
             }.modifier(ContentTopChrome(enabled: true))

@@ -188,6 +188,8 @@ final class AIChatPageController: NSObject, ObservableObject, WKScriptMessageHan
         state["reading"] = encoded(ai.readingPosition(for: value.id))
         state["focus"] = focusRequest?.uuidString ?? ""
         state["sendWithCommand"] = store.settings.aiSendWithCommand
+        state["revealDuration"] = store.settings.aiRevealDuration
+        state["revealWidth"] = store.settings.aiRevealWidth
         state["providers"] = ai.providers.map { ["id": $0.id.uuidString, "name": $0.name, "models": $0.models] as [String: Any] }
         state["providerID"] = provider.id.uuidString
         state["model"] = ai.model(for: owner)

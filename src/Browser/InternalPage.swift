@@ -72,12 +72,14 @@ final class InternalPageSchemeHandler: NSObject, WKURLSchemeHandler {
         else if HistoryPage.matches(task.request.url) { name = "history" }
         else if SettingsRoute(task.request.url) != nil { name = "settings" }
         else if ChatPage.matches(task.request.url) { name = "chat" }
+        else if HomeHistoryPage.matches(task.request.url) { name = "home" }
         else { task.didFailWithError(URLError(.unsupportedURL)); return }
         // Chat's shared renderer lives above this navigation document.
         // The outgoing Appearance page may still be previewing a different theme.
         let theme = name == "settings" ? (settingsPage?.store?.settings.theme ?? PerchTheme.shared.selection).webColors : [:]
         let style = theme.isEmpty ? "" : "\n:root{\(theme.map { "--perch-\($0.key):\($0.value)" }.joined(separator: ";"))}\n"
-        let data = name == "chat" ? Data("<!doctype html><title>AI 聊天</title>".utf8) : InternalPage.document(name, style: style)
+        let title = name == "chat" ? "AI 聊天" : name == "home" ? HomeHistoryPage.title : nil
+        let data = title.map { Data("<!doctype html><title>\($0)</title>".utf8) } ?? InternalPage.document(name, style: style)
         task.didReceive(URLResponse(url: task.request.url!, mimeType: "text/html",
                                    expectedContentLength: data.count, textEncodingName: "utf-8"))
         task.didReceive(data); task.didFinish()

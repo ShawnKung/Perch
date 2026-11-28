@@ -43,6 +43,23 @@ enum SettingsPageSelfCheck {
         try await AISelfCheck.wait { web.url == SettingsRoute.ai.url && !web.isLoading }
         try await AIChatPageSelfCheck.waitFor(web, "document.querySelector('#aiSendWithCommand')?.value==='false'")
         try await AISelfCheck.wait { store.tabs.first?.address == SettingsRoute.ai.url.absoluteString }
+        try await AIChatPageSelfCheck.check(web, """
+            (() => {
+                const duration=document.querySelector('#aiRevealDuration'), width=document.querySelector('#aiRevealWidth');
+                return duration.min==='0' && duration.max==='1000' && duration.value==='400' &&
+                    width.min==='0' && width.max==='1000' && width.value==='600';
+            })()
+            """, "AI animation sliders must show defaults and allow the full range")
+        _ = try await web.callAsyncJavaScript("""
+            for (const [id,value] of [['aiRevealDuration',0],['aiRevealWidth',1000]]) {
+                const slider=document.getElementById(id);
+                slider.value=value;
+                slider.dispatchEvent(new Event('change'));
+            }
+            """, arguments: [:], in: nil, contentWorld: .defaultClient)
+        try await AISelfCheck.wait { store.settings.aiRevealDuration == 0 && store.settings.aiRevealWidth == 1000 }
+        let savedAnimation = Store(defaults: defaults).settings
+        precondition(savedAnimation.aiRevealDuration == 0 && savedAnimation.aiRevealWidth == 1000)
         store.openSettings()
         precondition(store.selected == id && store.tabs.count == 1 && panel.attachedSheet == nil)
         // Attempt a valid bridge command from the wrong category.

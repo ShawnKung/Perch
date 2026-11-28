@@ -75,6 +75,24 @@
     if (max !== undefined) control.max = max;
     return control;
   }
+  function slider(key, label, max, unit) {
+    const control = make('input'), value = make('output'), wrapper = group(control,value);
+    wrapper.classList.add('settings-slider');
+    Object.assign(control,{type:'range',id:key,min:0,max});
+    control.setAttribute('aria-label',label);
+    value.setAttribute('for',key);
+    const readout = () => {
+      value.textContent = `${control.value} ${unit}`;
+      control.setAttribute('aria-valuetext',value.textContent);
+    };
+    control.addEventListener('input',readout);
+    control.addEventListener('change',()=>send('change',{key,value:control.valueAsNumber}));
+    bind(() => {
+      if (control.valueAsNumber !== state.values[key]) control.value = state.values[key];
+      readout();
+    });
+    return wrapper;
+  }
   function button(title, action) {
     const node = make('button', title, 'action');
     node.addEventListener('click', () => send(action)); return node;
@@ -142,6 +160,26 @@
       if (previous === key) return;
       previous = key; container.replaceChildren(...render(data));
     });
+  }
+  function releaseNotes(html) {
+    const template = make('template');
+    template.innerHTML = html;
+    // Rebuild formatted text without carrying over remote attributes, links or resources.
+    const tags = new Set('h1 h2 h3 h4 h5 h6 p br ul ol li strong b em i del blockquote pre code hr a div span table thead tbody tr th td'.split(' '));
+    function copy(parent, source) {
+      for (const child of source.childNodes) {
+        if (child.nodeType === Node.TEXT_NODE) parent.append(document.createTextNode(child.data));
+        else if (tags.has(child.localName)) {
+          const tag = child.localName;
+          const node = tag === 'a' ? parent : make(tag);
+          copy(node, child);
+          if (node !== parent) parent.append(node);
+        }
+      }
+    }
+    const body = make('div', '', 'release-notes');
+    copy(body, template.content);
+    return body.textContent.trim() ? [body] : [];
   }
   function credentialField(hasKey) {
     const key = field('password');
@@ -213,6 +251,9 @@
     sender.setAttribute('aria-label','发送消息按键');
     const general=make('div','','ai-panel');
     general.append(make('strong','发送消息按键'),sender); block('常规').append(general);
+    block('流式动画').append(
+      panel('动画时长','设为 0 时立即显示新内容。',slider('aiRevealDuration','动画时长',1000,'ms')),
+      panel('柔边宽度','设为 0 时保留平滑出字，不显示柔边。',slider('aiRevealWidth','柔边宽度',1000,'px')));
 
     function openEditor(p) {
       if(pending)return;
@@ -822,16 +863,26 @@
     case 'importer': buildImports(); break;
     case 'about': {
       const check = button('检查更新','check');
-      const release = button('查看发布说明','release'), controls = group(check, release);
+      const release = button('下载更新','release');
+      const version = make('span', '', 'about-value'), status = make('span', '', 'about-value');
+      const controls = group(status, check, release);
+      controls.classList.add('about-controls');
       check.id='check-update'; release.id='view-release';
       bind(() => {
+        version.textContent = `版本 ${state.version}`;
+        status.textContent = state.update ? `发现新版本 ${state.update}` : state.updateMessage;
         check.hidden=Boolean(state.update); release.hidden=!state.update;
         check.disabled = state.checking; check.textContent = state.checking ? '正在检查…' : '检查更新';
       });
       const about = section('关于');
-      about('Perch', null, s => `版本 ${s.version}`);
+      about('Perch', version);
       about('开源仓库', button('在 GitHub 打开','source'));
-      about('软件更新', controls, s => s.update ? `发现新版本 ${s.update}` : s.updateMessage);
+      about('软件更新', controls);
+      const notes = make('div');
+      replaceIfChanged(notes, () => state.releaseNotes || '', releaseNotes);
+      const changes = section('发布说明');
+      changes('', notes, null, () => Boolean(notes.firstChild));
+      notes.parentElement.classList.add('release-notes-row');
       break;
     }
     }

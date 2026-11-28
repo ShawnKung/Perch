@@ -7,6 +7,8 @@ private final class UpdateFixtureProtocol: URLProtocol {
     static var body = Data(#"{"tag_name":"v0.2.10","draft":false,"prerelease":false}"#.utf8)
     static var fallbackStatus = 200
     static var responseURL = UpdateCheck.repositoryURL.appendingPathComponent("releases/tag/v0.2.10")
+    static var feedStatus = 200
+    static var feedBody = Data()
     static var failure: Error?
     static var requests = 0
     static var urls: [URL] = []
@@ -17,10 +19,11 @@ private final class UpdateFixtureProtocol: URLProtocol {
         Self.requests += 1
         Self.urls.append(request.url!)
         let api = request.url == UpdateCheck.apiURL
-        precondition(api || request.url == UpdateCheck.releaseURL)
-        precondition(request.httpMethod == (api ? "GET" : "HEAD"))
+        let feed = request.url == UpdateCheck.feedURL
+        precondition(api || feed || request.url == UpdateCheck.releaseURL)
+        precondition(request.httpMethod == (api || feed ? "GET" : "HEAD"))
         if api {
-            precondition(request.value(forHTTPHeaderField: "Accept") == "application/vnd.github+json")
+            precondition(request.value(forHTTPHeaderField: "Accept") == "application/vnd.github.html+json")
         }
         precondition(request.value(forHTTPHeaderField: "Authorization") == nil)
         if let failure = Self.failure {
@@ -28,19 +31,20 @@ private final class UpdateFixtureProtocol: URLProtocol {
             return
         }
         let headers = api ? Self.remaining.map { ["X-RateLimit-Remaining": $0] } : nil
-        let response = HTTPURLResponse(url: api ? request.url! : Self.responseURL,
-                                       statusCode: api ? Self.status : Self.fallbackStatus,
+        let response = HTTPURLResponse(url: api || feed ? request.url! : Self.responseURL,
+                                       statusCode: api ? Self.status : feed ? Self.feedStatus : Self.fallbackStatus,
                                        httpVersion: "HTTP/1.1", headerFields: headers)!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         if api { client?.urlProtocol(self, didLoad: Self.body) }
+        if feed { client?.urlProtocol(self, didLoad: Self.feedBody) }
         client?.urlProtocolDidFinishLoading(self)
     }
     override func stopLoading() {}
 }
 
 enum UpdateSelfCheck {
-    private static func releaseData(_ tag: String, draft: Bool = false, prerelease: Bool = false) -> Data {
-        try! JSONSerialization.data(withJSONObject: ["tag_name": tag, "draft": draft, "prerelease": prerelease])
+    private static func releaseData(_ tag: String, draft: Bool = false, prerelease: Bool = false, notes: String = "") -> Data {
+        try! JSONSerialization.data(withJSONObject: ["tag_name": tag, "draft": draft, "prerelease": prerelease, "body_html": notes])
     }
 
     private static func release(_ tag: String) -> URL {
@@ -55,13 +59,13 @@ enum UpdateSelfCheck {
             ("0.2.5", "v0.2.5", nil),
             ("0.3.0", "v0.2.10", nil)
         ] as [(String, String, String?)] {
-            let actual = try UpdateCheck.newerVersion(at: release(remote), than: current)
+            let actual = try UpdateCheck.newerRelease(at: release(remote), than: current)?.version
             precondition(actual == expected, "Unexpected version comparison: \(current), \(remote)")
-            let api = try UpdateCheck.newerVersion(in: releaseData(remote), than: current)
+            let api = try UpdateCheck.newerRelease(in: releaseData(remote), than: current)?.version
             precondition(api == expected)
         }
         for data in [releaseData("v1.0.0", draft: true), releaseData("v1.0.0", prerelease: true)] {
-            let actual = try UpdateCheck.newerVersion(in: data, than: "0.2.5")
+            let actual = try UpdateCheck.newerRelease(in: data, than: "0.2.5")
             precondition(actual == nil)
         }
         for url in [
@@ -74,7 +78,7 @@ enum UpdateSelfCheck {
             URL(string: "http://github.com/ShawnKung/Perch/releases/tag/v1.0.0")!
         ] {
             do {
-                _ = try UpdateCheck.newerVersion(at: url, than: "0.2.5")
+                _ = try UpdateCheck.newerRelease(at: url, than: "0.2.5")
                 preconditionFailure("An invalid release URL must not report an up-to-date version")
             } catch is PerchError {}
         }
@@ -82,16 +86,17 @@ enum UpdateSelfCheck {
         configuration.protocolClasses = [UpdateFixtureProtocol.self]
         let session = URLSession(configuration: configuration)
         defer { session.invalidateAndCancel() }
-        UpdateFixtureProtocol.body = releaseData("v0.2.10")
+        UpdateFixtureProtocol.body = releaseData("v0.2.10", notes: "<p>API notes</p>")
         let beforeAPI = UpdateFixtureProtocol.requests
-        let latest = try await UpdateCheck.latestVersion(current: "0.2.9", session: session)
-        precondition(latest == "0.2.10" && UpdateFixtureProtocol.requests == beforeAPI + 1 &&
+        let latest = try await UpdateCheck.latestRelease(current: "0.2.9", session: session)
+        precondition(latest?.url == release("v0.2.10") && latest?.notesHTML == "<p>API notes</p>" &&
+                     UpdateFixtureProtocol.requests == beforeAPI + 1 &&
                      UpdateFixtureProtocol.urls.last == UpdateCheck.apiURL)
         for status in [404, 403, 429, 500] {
             UpdateFixtureProtocol.status = status
             let before = UpdateFixtureProtocol.requests
             do {
-                _ = try await UpdateCheck.latestVersion(current: "0.2.9", session: session)
+                _ = try await UpdateCheck.latestRelease(current: "0.2.9", session: session)
                 preconditionFailure("HTTP failure must not report an up-to-date version")
             } catch is PerchError {}
             precondition(UpdateFixtureProtocol.requests == before + 1, "Other HTTP errors must not fall back")
@@ -100,7 +105,7 @@ enum UpdateSelfCheck {
         UpdateFixtureProtocol.body = Data("{}".utf8)
         let beforeInvalid = UpdateFixtureProtocol.requests
         do {
-            _ = try await UpdateCheck.latestVersion(current: "0.2.9", session: session)
+            _ = try await UpdateCheck.latestRelease(current: "0.2.9", session: session)
             preconditionFailure("Invalid API data must fail")
         } catch is DecodingError {}
         precondition(UpdateFixtureProtocol.requests == beforeInvalid + 1)
@@ -109,39 +114,54 @@ enum UpdateSelfCheck {
         UpdateFixtureProtocol.remaining = "1"
         let beforeForbidden = UpdateFixtureProtocol.requests
         do {
-            _ = try await UpdateCheck.latestVersion(current: "0.2.9", session: session)
+            _ = try await UpdateCheck.latestRelease(current: "0.2.9", session: session)
             preconditionFailure("A non-exhausted 403 must fail")
         } catch is PerchError {}
         precondition(UpdateFixtureProtocol.requests == beforeForbidden + 1)
         UpdateFixtureProtocol.remaining = "0"
+        UpdateFixtureProtocol.feedBody = Data("""
+            <feed xmlns="http://www.w3.org/2005/Atom">
+              <entry><link rel="alternate" href="\(release("v0.2.11"))"/><content type="html">Wrong version</content></entry>
+              <entry><content type="html">&lt;p&gt;Atom notes &amp;amp; details&lt;/p&gt;</content>
+                <link rel="alternate" href="\(release("v0.2.10"))"/></entry>
+            </feed>
+            """.utf8)
         let beforeFallback = UpdateFixtureProtocol.requests
-        let fallback = try await UpdateCheck.latestVersion(current: "0.2.9", session: session)
-        precondition(fallback == "0.2.10" && UpdateFixtureProtocol.requests == beforeFallback + 2 &&
-                     Array(UpdateFixtureProtocol.urls.suffix(2)) == [UpdateCheck.apiURL, UpdateCheck.releaseURL])
+        let fallback = try await UpdateCheck.latestRelease(current: "0.2.9", session: session)
+        precondition(fallback?.url == release("v0.2.10") && fallback?.notesHTML == "<p>Atom notes &amp; details</p>" &&
+                     UpdateFixtureProtocol.requests == beforeFallback + 3 &&
+                     Array(UpdateFixtureProtocol.urls.suffix(3)) == [UpdateCheck.apiURL, UpdateCheck.releaseURL, UpdateCheck.feedURL])
+        let beforeCurrent = UpdateFixtureProtocol.requests
+        let current = try await UpdateCheck.latestRelease(current: "0.2.10", session: session)
+        precondition(current == nil && UpdateFixtureProtocol.requests == beforeCurrent + 2)
+        UpdateFixtureProtocol.feedStatus = 503
+        let withoutNotes = try await UpdateCheck.latestRelease(current: "0.2.9", session: session)
+        precondition(withoutNotes?.url == release("v0.2.10") && withoutNotes?.notesHTML == nil)
+        UpdateFixtureProtocol.feedStatus = 200
         for status in [403, 500] {
             UpdateFixtureProtocol.fallbackStatus = status
             do {
-                _ = try await UpdateCheck.latestVersion(current: "0.2.9", session: session)
+                _ = try await UpdateCheck.latestRelease(current: "0.2.9", session: session)
                 preconditionFailure("A failed fallback must not report a current version")
             } catch is PerchError {}
         }
         UpdateFixtureProtocol.fallbackStatus = 200
         UpdateFixtureProtocol.responseURL = UpdateCheck.releaseURL
         do {
-            _ = try await UpdateCheck.latestVersion(current: "0.2.9", session: session)
+            _ = try await UpdateCheck.latestRelease(current: "0.2.9", session: session)
             preconditionFailure("A missing version redirect must fail")
         } catch is PerchError {}
         UpdateFixtureProtocol.responseURL = release("v0.2.10")
         UpdateFixtureProtocol.status = 200
         UpdateFixtureProtocol.remaining = nil
         do {
-            _ = try await UpdateCheck.latestVersion(current: "invalid", session: session)
+            _ = try await UpdateCheck.latestRelease(current: "invalid", session: session)
             preconditionFailure("An invalid installed version must fail")
         } catch is PerchError {}
         UpdateFixtureProtocol.failure = URLError(.notConnectedToInternet)
         let beforeOffline = UpdateFixtureProtocol.requests
         do {
-            _ = try await UpdateCheck.latestVersion(current: "0.2.9", session: session)
+            _ = try await UpdateCheck.latestRelease(current: "0.2.9", session: session)
             preconditionFailure("Offline check must fail")
         } catch is URLError {}
         precondition(UpdateFixtureProtocol.requests == beforeOffline + 1, "Offline errors must not fall back")
@@ -149,14 +169,7 @@ enum UpdateSelfCheck {
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
         let store = Store(defaults: defaults)
-        store.receiveUpdate("0.2.10")
-        precondition(store.availableUpdate == "0.2.10")
-        store.receiveUpdate(nil)
-        precondition(store.availableUpdate == nil)
-        store.receiveUpdate("0.3.0")
-        precondition(store.availableUpdate == "0.3.0")
-        print("PASS: API-first checks, exhausted-403 HEAD fallback only, stable releases, trusted redirects and failure boundaries")
-        print("PASS: detected versions control the passive update indicator")
+        print("PASS: API notes, exhausted-403 HEAD and version-matched Atom, stable releases, trusted redirects and failure boundaries")
         UpdateFixtureProtocol.failure = nil
         UpdateFixtureProtocol.body = releaseData("v0.2.9")
         let before = UpdateFixtureProtocol.requests
@@ -177,11 +190,11 @@ enum UpdateSelfCheck {
         UpdateFixtureProtocol.body = releaseData("v0.2.10")
         store.checkForUpdates(manual: true, current: "0.2.9", session: session)
         try await AISelfCheck.wait { !store.checkingUpdate }
-        precondition(store.availableUpdate == "0.2.10" && store.updateCheckMessage == nil)
+        precondition(store.availableUpdate?.version == "0.2.10" && store.updateCheckMessage == nil)
         UpdateFixtureProtocol.failure = URLError(.notConnectedToInternet)
         store.checkForUpdates(manual: true, current: "0.2.9", session: session)
         try await AISelfCheck.wait { !store.checkingUpdate }
-        precondition(store.updateCheckMessage != nil && store.availableUpdate == "0.2.10",
+        precondition(store.updateCheckMessage != nil && store.availableUpdate?.version == "0.2.10",
                      "A failed recheck must preserve an already detected update")
         store.checkForUpdates(manual: true, current: "0.2.9", session: session)
         store.cancelUpdateCheck()
@@ -189,7 +202,7 @@ enum UpdateSelfCheck {
         UpdateFixtureProtocol.failure = nil
         store.checkForUpdates(manual: true, current: "0.2.9", session: session)
         try await AISelfCheck.wait { !store.checkingUpdate }
-        precondition(store.availableUpdate == "0.2.10" && store.updateCheckMessage == nil)
+        precondition(store.availableUpdate?.version == "0.2.10" && store.updateCheckMessage == nil)
         print("PASS: shared automatic/manual checks, duplicate prevention, current version feedback, HTTP/offline errors, cancellation and retry")
     }
 
@@ -230,7 +243,7 @@ enum UpdateSelfCheck {
         }
         await settle()
         precondition(find("更新 Perch", in: root) == nil, "No update indicator is shown before detection")
-        store.receiveUpdate("0.2.10")
+        store.availableUpdate = .init(tag: "v0.2.10", version: "0.2.10")
         await settle()
         precondition(window.attachedSheet == nil && NSApp.modalWindow == nil,
                      "Detecting an update must not open a dialog")
@@ -254,9 +267,6 @@ enum UpdateSelfCheck {
                          nativeButton.title == (collapsed ? "" : "发现新版本"),
                          "The update indicator must show the correct label and version tooltip")
             let frame = (button.value(forKey: "accessibilityFrame") as! NSValue).rectValue
-            let settings = find("设置", in: root)!
-            let settingsFrame = (settings.value(forKey: "accessibilityFrame") as! NSValue).rectValue
-            precondition(frame.minY > settingsFrame.maxY, "Update must appear above Settings")
             precondition(frame.width > (collapsed ? 20 : 100) && frame.height >= 32,
                          "The entire update row must be clickable")
             let list = tabList(in: root)!
@@ -266,6 +276,8 @@ enum UpdateSelfCheck {
             let newTabFrame = window.convertFromScreen((newTab.value(forKey: "accessibilityFrame") as! NSValue).rectValue)
             precondition(list.layer?.masksToBounds == true && listFrame.minY >= newTabFrame.maxY,
                          "Tabs must be clipped above the bottom actions")
+            precondition(newTabFrame.minY > window.convertFromScreen(frame).maxY && find("设置", in: root) == nil,
+                         "The update indicator remains below the tabs after moving Settings to More")
             precondition(list.layer?.mask is CAGradientLayer,
                          "An overflowing tab list must fade above the bottom actions")
             let scrollPoint = list.convert(NSPoint(x: list.bounds.midX,
@@ -304,9 +316,9 @@ enum UpdateSelfCheck {
             coordinator.indicator.openRelease = { opened.append($0); return true }
             _ = nativeButton.accessibilityPerformPress()
             await settle()
-            precondition(opened == [UpdateCheck.releaseURL] && store.availableUpdate == "0.2.10" &&
+            precondition(opened == [release("v0.2.10")] && store.availableUpdate?.version == "0.2.10" &&
                          window.attachedSheet == nil && NSApp.modalWindow == nil,
-                         "Pressing the update indicator must directly open the latest release without a dialog")
+                         "Pressing the update indicator must directly open the detected release without a dialog")
             coordinator.indicator.openRelease = { _ in false }
             _ = nativeButton.accessibilityPerformPress()
             await settle()
@@ -316,7 +328,7 @@ enum UpdateSelfCheck {
         }
         preview(expanded: expanded, compact: compact)
         print("PASS: clipped long tab list, bottom gradient, native wheel routing and fully visible last tab in both sidebar widths")
-        print("PASS: passive sidebar indicator, expanded/compact labels, full-row hits and native accessibility press directly route to latest release without dialogs")
+        print("PASS: passive sidebar indicator, expanded/compact labels, full-row hits and native accessibility press directly route to the detected release")
     }
 
     @MainActor static func aboutUI() async {
@@ -336,7 +348,10 @@ enum UpdateSelfCheck {
                           styleMask: [.titled, .resizable], backing: .buffered, defer: false)
         panel.isReleasedWhenClosed = false
         store.openSettings(.about)
-        let web = store.browser!.webView
+        let browser = store.browser!
+        let web = browser.webView
+        var opened: [URL] = []
+        browser.settingsPage.openRelease = { opened.append($0); return true }
         panel.contentView = RootHostingView(rootView: RootView(store: store).defaultAppStorage(defaults))
         panel.bindTabFocus(to: store)
         panel.makeKeyAndOrderFront(nil)
@@ -345,20 +360,49 @@ enum UpdateSelfCheck {
             try await AISelfCheck.wait { web.url == SettingsRoute.about.url && !web.isLoading }
             try await AIChatPageSelfCheck.waitFor(web, "document.body.innerText.includes('开源仓库')")
             store.checkForUpdates(manual: true, current: "0.2.9", session: session)
-            try await AIChatPageSelfCheck.waitFor(web, "document.body.innerText.includes('当前已是最新版本')")
+            try await AIChatPageSelfCheck.waitFor(web, """
+                (() => {
+                    const [version, status] = document.querySelectorAll('.about-value');
+                    const button = document.querySelector('#check-update');
+                    if (!version || status?.textContent !== '当前已是最新版本' || !button || button.hidden) return false;
+                    const v = version.getBoundingClientRect(), s = status.getBoundingClientRect(),
+                          b = button.getBoundingClientRect();
+                    return v.left > version.previousElementSibling.getBoundingClientRect().right &&
+                        Math.abs(v.right - b.right) <= 1 && s.right < b.left && s.top < b.bottom && s.bottom > b.top;
+                })()
+                """)
             UpdateFixtureProtocol.status = 403
             store.checkForUpdates(manual: true, current: "0.2.9", session: session)
             try await AIChatPageSelfCheck.waitFor(web, "document.body.innerText.includes('403')")
             UpdateFixtureProtocol.status = 200
-            UpdateFixtureProtocol.body = releaseData("v0.2.10")
+            UpdateFixtureProtocol.body = releaseData("v0.2.10", notes: """
+                <p class="remote">Fixture release notes</p><ul><li><strong>Native updates</strong></li></ul>
+                <img src="https://example.invalid/pixel" onerror="alert(1)">
+                <script>alert(1)</script><a href="https://example.invalid/">External link text</a>
+                """)
             store.checkForUpdates(manual: true, current: "0.2.9", session: session)
             try await AIChatPageSelfCheck.waitFor(web, """
                 document.querySelector('#check-update')?.hidden &&
-                    !document.querySelector('#view-release')?.hidden &&
-                    document.body.innerText.includes('0.2.10')
+                    document.querySelector('#view-release:not([hidden])')?.textContent==='下载更新' &&
+                    document.body.innerText.includes('0.2.10') &&
+                    document.querySelector('.release-notes li strong')?.textContent==='Native updates' &&
+                    document.querySelector('.release-notes')?.textContent.includes('External link text') &&
+                    !document.querySelector('.release-notes :is(a,img,script,[class])')
                 """)
-            print("PASS: HTML About shows current, error and update states inline")
-} catch { fputs("FAIL: HTML About: \(error.localizedDescription)\n", stderr); exit(1) }
+            let fixture = HomePageFixture(store: store, panel: panel)
+            try await fixture.click("#view-release", web: web)
+            try await AISelfCheck.wait { opened == [release("v0.2.10")] }
+            UpdateFixtureProtocol.body = releaseData("v0.2.11")
+            store.checkForUpdates(manual: true, current: "0.2.9", session: session)
+            try await AIChatPageSelfCheck.waitFor(web, """
+                !document.querySelector('.release-notes') &&
+                    document.querySelector('#view-release:not([hidden])') &&
+                    document.body.innerText.includes('0.2.11')
+                """)
+            try await fixture.click("#view-release", web: web)
+            try await AISelfCheck.wait { opened == [release("v0.2.10"), release("v0.2.11")] }
+            print("PASS: HTML About safely shows release notes and native clicks open the exact detected release, even without notes")
+        } catch { fputs("FAIL: HTML About: \(error.localizedDescription)\n", stderr); exit(1) }
     }
 
     @MainActor private static func snapshot(_ view: NSView, rect: NSRect) -> NSImage {

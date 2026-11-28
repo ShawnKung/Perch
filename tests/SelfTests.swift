@@ -3337,6 +3337,9 @@ final class LayoutSelfCheck {
             let list = table()
             precondition(!list.animatingRows && Set(list.ids).count == list.ids.count)
             precondition(list.ids == store.tabRows.map(\.id))
+            let newest = list.rect(ofRow: list.ids.firstIndex(of: store.selected!)!)
+            precondition(list.visibleRect.insetBy(dx: 0, dy: -1).contains(newest),
+                         "The newest selected tab must be fully visible after overlapping insertions")
             func controller(_ view: NSView) -> TabContentsController? {
                 if let found = view.nextResponder as? TabContentsController { return found }
                 return view.subviews.lazy.compactMap(controller).first
@@ -3379,7 +3382,7 @@ final class LayoutSelfCheck {
         precondition(returnedHome === originalHome && centralDraft == "central draft")
         store.tabs = savedTabs; store.tabGroups = savedGroups; store.selected = savedSelection
         await settle()
-        print("PASS: overlapping selected-homepage insertions, retained input identity, ownership, drafts and homepage scroll")
+        print("PASS: overlapping selected-homepage insertions stay visible; retained input identity, ownership, drafts and homepage scroll")
     }
     private func verifyTabPerformance() async {
         func check(_ condition: Bool, _ message: String) {

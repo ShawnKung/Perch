@@ -147,11 +147,145 @@
   new ResizeObserver(() => { restore(); window.quoteViewport = {top:0,bottom:scroll.getBoundingClientRect().bottom}; }).observe(messages);
   new ResizeObserver(restore).observe(scroll);
 
-  async function markdown(card, value) {
+  const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
+  const reveals = new Map(), glyphClass = 'chat-reveal-glyph';
+  const measure = document.createElement('canvas').getContext('2d'), widths = new Map();
+  let revealFrame = 0, revealTime = 0, revealFont = '';
+  const canReveal = () => state?.revealDuration > 0 && followsBottom && !document.hidden && !reducedMotion.matches;
+  const selected = root => {
+    const selection = getSelection();
+    return selection?.rangeCount && !selection.isCollapsed && selection.getRangeAt(0).intersectsNode(root);
+  };
+  function showGlyph(glyph, keepNode) {
+    glyph.style.opacity = '';
+    if (!keepNode && glyph.isConnected) glyph.replaceWith(glyph.firstChild);
+  }
+  function finishReveal(root) {
+    const stream = reveals.get(root);
+    if (!stream) return;
+    const keep = selected(root);
+    for (const item of stream.items) showGlyph(item.glyph,keep);
+    reveals.delete(root);
+  }
+  function finishReveals() {
+    for (const root of reveals.keys()) finishReveal(root);
+    cancelAnimationFrame(revealFrame); revealFrame = revealTime = 0;
+  }
+  function animateReveal(time) {
+    revealFrame = 0;
+    const dt = revealTime ? Math.min(32,time-revealTime) : 0;
+    revealTime = time;
+    if (!canReveal()) {finishReveals();return;}
+    for (const [root,stream] of reveals) {
+      if (!root.isConnected || (stream.thinking && !root.parentElement.open) || selected(root)) {
+        finishReveal(root);continue;
+      }
+      const pending = stream.items.reduce((n,item) => n + (item.born === null),0);
+      let release = 0;
+      if (pending) {
+        const target = Math.min(650,Math.max(55,pending/0.13));
+        stream.speed += (target-stream.speed)*(1-Math.exp(-dt/60));
+        stream.credit += stream.speed*dt/1000;
+        release = Math.min(pending,Math.floor(stream.credit));
+        stream.credit -= release;
+      } else {
+        stream.speed *= Math.exp(-dt/60);
+        stream.credit = 0;
+      }
+      for (const item of stream.items) {
+        if (item.born !== null) continue;
+        if (!release) break;
+        release--; item.born = time; stream.head = item.middle;
+      }
+      const edge = state.revealWidth, duration = state.revealDuration;
+      stream.items = stream.items.filter(item => {
+        if (item.born === null) return true;
+        item.progress = edge ? Math.min(1,Math.max(item.progress,(stream.head-item.middle)/edge,(time-item.born)/duration)) : 1;
+        if (item.progress === 1) {showGlyph(item.glyph,false);return false;}
+        item.glyph.style.opacity = String(0.03 + 0.97*(1-Math.log1p(5*(1-item.progress))/Math.log(6)));
+        return true;
+      });
+      if (!stream.items.length) reveals.delete(root);
+    }
+    if (reveals.size) revealFrame = requestAnimationFrame(animateReveal);
+    else revealTime = 0;
+  }
+  function bindReveal(root, previous, thinking = false) {
+    let stream = reveals.get(root);
+    const full = root.textContent, value = full.trimEnd();
+    let common = previous.length;
+    if (!value.startsWith(previous)) {
+      common = 0;
+      while (common < previous.length && previous[common] === value[common]) common++;
+    }
+    // Rebind the unfinished tail after a Markdown commit. Its time and distance
+    // belong to the stream, so the next packet cannot reset an earlier fade.
+    const old = new Map(stream?.items.filter(item => item.end <= common).map(item => [item.start,item]));
+    const from = Math.max(0,value.length-192,Math.min(common,...old.keys()));
+    if (from >= value.length) {finishReveal(root);return;}
+    stream ??= {thinking,items:[],speed:0,credit:0,distance:0,head:0};
+    const font = getComputedStyle(root);
+    const key = `${font.fontWeight} ${font.fontSize} ${font.fontFamily}`;
+    if (measure && key !== revealFont) {measure.font = revealFont = key;widths.clear();}
+    const walker = document.createTreeWalker(root,NodeFilter.SHOW_TEXT);
+    let last = root;
+    while (last.lastChild) last = last.lastChild;
+    walker.currentNode = last;
+    let offset = full.length;
+    const groups = [];
+    for (let tail = last.nodeType === Node.TEXT_NODE ? last : walker.previousNode(); tail && offset > from; tail = walker.previousNode()) {
+      const end = offset;
+      offset -= tail.length;
+      if (!thinking && tail.parentElement.closest('pre,code,table,blockquote,svg,button,.mermaid-diagram,.quoted-text,a')) continue;
+      const start = Math.max(0,from-offset), limit = Math.min(end,value.length)-offset;
+      if (start < limit) groups.push({tail,offset,start,limit});
+    }
+    stream.items = [];
+    for (const {tail,offset,start,limit} of groups.reverse()) {
+      const fragment = document.createDocumentFragment();
+      let cursor = 0;
+      // Start at a complete grapheme even when the bounded tail begins inside one.
+      const boundary = graphemes.segment(tail.data).containing(start).index;
+      for (const {segment,index} of graphemes.segment(tail.data.slice(boundary,limit))) {
+        if (!segment.trim()) continue;
+        const at = boundary + index, position = offset+at;
+        let item = old.get(position);
+        if (!item) {
+          if (position < common || (common < previous.length && previous.length-common > 2)) continue;
+          if (!widths.has(segment)) {
+            if (widths.size >= 512) widths.clear();
+            widths.set(segment,measure?.measureText(segment).width ?? parseFloat(font.fontSize));
+          }
+          const width = widths.get(segment);
+          item = {start:position,end:position+segment.length,middle:stream.distance+width/2,born:null,progress:0};
+          stream.distance += width;
+        }
+        if (at > cursor) fragment.append(tail.data.slice(cursor,at));
+        const glyph = node('span',glyphClass,segment);
+        glyph.style.opacity = item.glyph?.style.opacity || '0';
+        fragment.append(glyph);
+        stream.items.push(Object.assign(item,{glyph}));
+        cursor = at+segment.length;
+      }
+      if (cursor) {
+        fragment.append(tail.data.slice(cursor));
+        tail.replaceWith(fragment);
+      }
+    }
+    if (!stream.items.length) {reveals.delete(root);return;}
+    reveals.set(root,stream);
+    if (!revealFrame) revealFrame = requestAnimationFrame(animateReveal);
+  }
+  document.addEventListener('visibilitychange',() => {if (document.hidden) finishReveals();});
+
+  async function markdown(card, value, active = false) {
     if (!window.marked || !window.DOMPurify) {text(card.body,'Markdown 组件缺失，请重新安装应用。');return;}
     if (card.markdownText === value.text && card.sourcesKey === signature(value.searchSources || [])) return;
     const selection = window.answerSelection?.();
     if (selection && card.body.contains(selection.anchorNode)) { card.pending = value; return; }
+    const animate = active && card.body.isConnected && canReveal();
+    const previous = animate ? card.body.textContent.trimEnd() : '';
+    if (!animate) finishReveal(card.body);
     card.pending = null; card.markdownText = value.text; card.sourcesKey = signature(value.searchSources || []);
     const revision = ++card.revision, root = card.body;
     const diagramStates = new Map(Array.from(root.querySelectorAll('.mermaid-diagram'), d => [d.dataset.source,d]));
@@ -175,6 +309,7 @@
     });
     enhanceCitations(root,value.searchSources || [],payload => send('markdown',{payload,id:value.id}));
     updateQuotedText();
+    if (animate) bindReveal(root,previous);
     for (const code of root.querySelectorAll('pre code.language-mermaid')) {
       if (!window.mermaid) { card.markdownText = null; continue; }
       const source = code.textContent, prior = diagramStates.get(source);
@@ -199,7 +334,14 @@
     }
     card.pendingReasoning=null;
     const atBottom=root.scrollHeight-root.clientHeight-root.scrollTop<4;
-    text(root,value || '');
+    value ||= '';
+    const previous = root.textContent;
+    if (previous !== value) {
+      const animate = active && atBottom && card.reasoning.open && root.isConnected && canReveal();
+      if (!animate) finishReveal(root);
+      root.textContent = value;
+      if (animate) bindReveal(root,previous.trimEnd(),true);
+    }
     if (active && atBottom) root.scrollTop=root.scrollHeight;
   }
   function makeMessage(value) {
@@ -262,8 +404,9 @@
       if (active) card.reasoningTitle.append(node('span','spinner'));
     });
     reasoning(card,value.reasoning,active);
-    if (value.role === 'assistant' && value.text) markdown(card,value);
+    if (value.role === 'assistant' && value.text) markdown(card,value,active || card.active);
     else text(card.body,value.text || (value.role === 'assistant' && !active && !value.reasoning && !value.generatedFiles?.length && !value.clarification ? '已停止' : ''));
+    card.active = active;
     preserve('signature',card.files,signature([value.generatedFiles,value.versions]),() => {
       for (const file of Array.from(fileCards)) if (card.files.contains(file.root)) fileCards.delete(file);
       card.files.replaceChildren(...(value.generatedFiles || []).map(file => makeFile(file,value.versions[file.id] || [file],value.id)));
@@ -506,10 +649,11 @@
   for (const event of ['select','keyup','mouseup','scroll','focus']) composer.addEventListener(event,saveSelection);
   const updateQuotedText = () => window.updateQuotedText?.(
     Array.from(cards,([id,card])=>({id,root:card.body})),state?.quote);
-  window.perchSuspend = () => {saveSelection();capture();window.closeQuotePopover?.();window.clearQuotedTextHighlight?.();window.updateChatHover(null,null);window.updateCitationHover?.(null,null);window.perchMarkdown({citation:{action:'clear'}});};
+  window.perchSuspend = () => {finishReveals();saveSelection();capture();window.closeQuotePopover?.();window.clearQuotedTextHighlight?.();window.updateChatHover(null,null);window.updateCitationHover?.(null,null);window.perchMarkdown({citation:{action:'clear'}});};
   window.perchUpdate = next => {
     const changed = !state || state.owner !== next.owner || state.conversation !== next.conversation;
     if (changed) {
+      finishReveals();
       window.closeQuotePopover?.();
       hideReferences();
       saveSelection(); capture(); cards.clear(); fileCards.clear();messages.replaceChildren();
@@ -517,6 +661,7 @@
       $('models').hidden=true;composing=false;
     }
     state=next;window.quoteEnabled=!state.archived;
+    if (!canReveal()) finishReveals();
     if (changed) {
       window.updateCitationHover?.(null,null);
       window.perchMarkdown({citation:{action:'clear'}});

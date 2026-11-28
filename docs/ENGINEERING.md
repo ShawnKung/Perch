@@ -4,7 +4,7 @@
 
 ## 更新检查
 
-- 自动与手动检查共用 Store 的请求状态，优先读取 GitHub Releases API。仅在 API 返回 403 且 `X-RateLimit-Remaining: 0` 时，对公开 `releases/latest` 地址发起 HEAD 请求，从最终跳转的本仓库 HTTPS `releases/tag/<版本>` 地址比较三段数字版本；兜底不下载页面正文，也不需要内置凭据。其他 HTTP/网络失败、无效数据及无效跳转均按检查失败处理，不能误报「当前已是最新版本」。手动检查结果与按钮同排，位于按钮左侧，长消息省略并提供完整悬停说明。`--update-self-test` 验证 API 优先、限流兜底边界、失败保留已有提示、取消与重试；`--update-ui-self-test` 验证结果位置和原生按钮动作。
+- 自动与手动检查共用 Store 的请求状态，优先从 GitHub Releases API 读取版本和格式化的发布说明。仅在 API 返回 403 且 `X-RateLimit-Remaining: 0` 时，对公开 `releases/latest` 发起 HEAD，从最终跳转的本仓库 HTTPS 地址确认正式版本；确有新版才从公开 Atom 源按完整版本 URL 匹配说明。说明缺失或 Atom 请求失败时仍显示更新入口。设置页只重建说明中允许的排版元素，不加载其中的链接或资源；侧栏和「下载更新」均打开检测到的版本页。其他版本检查失败不会误报「当前已是最新版本」。`--update-self-test` 覆盖 API、限流兜底及失败处理；`--update-ui-self-test` 覆盖说明显示与原生点击。
 
 ## 网页、标签与窗口
 
@@ -48,7 +48,7 @@
 - AppKit 的 Services 菜单不属于 `NSMenu.items`，关闭上下文插件也不能移除；`PageWebView.validRequestor` 返回 nil，网页不参与系统 Services，防止系统追加此入口。原生复制、粘贴及其他视图的 Services 保持原行为。隔离 WKWebView 实验通过实际菜单截图验证，自动回归检查网页 Services 请求者边界。「问 AI」使用侧栏同款 `sparkles`；macOS 27 的 AppKit 默认可能隐藏菜单图片，需通过公开 `preferredImageVisibility` 指定 `NSMenuItemImageVisibilityVisible`（整数值 1）。`NSMenuItem.showImageIfSupported` 先检查 setter，再经 KVC 设置此公开属性，以支持旧 SDK 编译；缺少 setter 的系统沿用默认图片显示。仅运行时 `#available` 不能让旧 SDK 识别新属性。
 - 首页由 `HomePageController` 持有独立的非持久化 WKWebView，加载本地 HTML；中央输入、选区与滚动由同一 DOM 保留，草稿同时按标签同步到 Store，工具栏仍使用原生输入。HTML 建议复用 Store 的异步检索与取消机制，输入法组合态不发布草稿、不接管候选键或提交。内部消息桥使用隔离 content world、弱代理和主框架/文档/标签校验，仅接受动作与书签 ID；原生菜单、编辑器、添加及管理入口复用既有控制器。前端不会执行书签或建议内容中的 HTML。`--home-page-state-self-test` 在隔离配置和窗口中验证空白首页复用后的标签及书签更新、草稿/选区/滚动/DOM 保留与桥接隔离；使用合成 DOM 状态，不替代原生输入及指针回归。
 - 新标签页首次提交网址或搜索时，Browser 先通过 WKURLSchemeHandler 建立内部 `perch-home://new-tab/` 历史项，再打开目标网页；后退至该项重新挂载保留的首页 WebView，保留同一 Browser 与前进栈。首页中央和工具栏输入草稿按标签独立保留，重新提交沿用 WebKit 的历史分支行为。内部首页不写入浏览历史、不作为 AI 网页引用，历史栈与草稿仅在本次运行中保留。`tests/HomePageSelfCheck.swift` 覆盖原生 WebKit 文本插入、组合态 Return、建议键盘/鼠标事件、切页焦点和选区、前进后退及 DOM 身份。
-- 首页书签直接在当前标签导航，复用首页返回和草稿保留逻辑；网页中打开书签仍新建标签。新标签优先继承显式来源，否则继承当前标签的分组并插入其后；批量打开书签同样保持组内连续顺序。
+- 更多菜单的「回到首页」在当前标签打开 `perch://home`，复用同一个 Browser 历史和已保留的首页内容，地址栏显示该 URL，默认标签标题为「首页」。后退回到来源页，前进重新显示首页。首页书签也在当前标签导航；网页中打开书签仍新建标签。新标签优先继承显式来源，否则继承当前标签的分组并插入其后；批量打开书签同样保持组内连续顺序。
 - 首页输入法合成检查通过 `NSTextInputClient` 设置组合文本，使用实际 DOM `compositionstart` / `compositionend` 判断组合态；独立 WKWebView 实验中 `hasMarkedText()` 在 DOM 组合态仍会返回 false，不能据此认定输入被清空。下载悬停检查向原生窗口及 WebKit 的 `NSTrackingArea.owner` 发送窗口内鼠标移动事件，验证进入显示、离开隐藏，不点击建立悬停、不移动系统鼠标；WebKit owner 检查仅覆盖其跟踪处理，应用命中与原生窗口事件另外校验，不代表已验证 AppKit 根据真实系统鼠标自动投递跟踪事件的整条链路。这些合成检查不替代真实输入法候选面板及硬件鼠标验收。
 - 首页「全部书签」和工具栏「书签管理」进入 `perch://settings/bookmarks`，分别聚焦全部和个人书签。范围是界面状态，不写入书签或首页排序；浏览历史仍用独立页面。
 - 设置分类首屏由内部协议按已保存主题生成颜色，外观临时预览只影响当前页面。所有分类共用内容宽度和边距。书签管理的工具栏和底栏固定，宽窗时目录侧栏与结果独立滚动，窄窗时范围导航移到结果上方。进出目录时恢复该范围的列表位置；目录收展的高度和箭头过渡遵循系统「减少动态效果」。
