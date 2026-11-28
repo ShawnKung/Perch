@@ -254,9 +254,6 @@ enum UpdateSelfCheck {
                          nativeButton.title == (collapsed ? "" : "发现新版本"),
                          "The update indicator must show the correct label and version tooltip")
             let frame = (button.value(forKey: "accessibilityFrame") as! NSValue).rectValue
-            let settings = find("设置", in: root)!
-            let settingsFrame = (settings.value(forKey: "accessibilityFrame") as! NSValue).rectValue
-            precondition(frame.minY > settingsFrame.maxY, "Update must appear above Settings")
             precondition(frame.width > (collapsed ? 20 : 100) && frame.height >= 32,
                          "The entire update row must be clickable")
             let list = tabList(in: root)!
@@ -266,6 +263,8 @@ enum UpdateSelfCheck {
             let newTabFrame = window.convertFromScreen((newTab.value(forKey: "accessibilityFrame") as! NSValue).rectValue)
             precondition(list.layer?.masksToBounds == true && listFrame.minY >= newTabFrame.maxY,
                          "Tabs must be clipped above the bottom actions")
+            precondition(newTabFrame.minY > window.convertFromScreen(frame).maxY && find("设置", in: root) == nil,
+                         "The update indicator remains below the tabs after moving Settings to More")
             precondition(list.layer?.mask is CAGradientLayer,
                          "An overflowing tab list must fade above the bottom actions")
             let scrollPoint = list.convert(NSPoint(x: list.bounds.midX,

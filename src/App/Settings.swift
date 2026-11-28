@@ -334,6 +334,7 @@ struct Tab: Identifiable, Codable, Equatable {
     var aiSidebarOpen: Bool?
     var groupID: UUID?
     var isChat: Bool { ChatPage.matches(URL(string: address)) || chatOwner != nil }
+    var isHome: Bool { address.isEmpty || HomeHistoryPage.matches(URL(string: address)) }
     var displayTitle: String { customTitle ?? title }
     mutating func migrateChat() {
         guard chatOwner != nil else { return }

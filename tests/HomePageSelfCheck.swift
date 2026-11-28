@@ -115,6 +115,9 @@ struct HomePageFixture {
 
 @MainActor
 enum HomePageSelfCheck {
+    @MainActor private final class MenuCapture {
+        var menu: NSMenu?
+    }
     static func state() async throws {
         let suite = "dev.perch.home-state-tests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
@@ -377,6 +380,67 @@ enum HomePageSelfCheck {
         store.browser!.goBack()
         try await AISelfCheck.wait(timeout: 10) { store.browser == nil }
         guard try await fixture.home() === original else { throw PerchError("Bookmark navigation rebuilt the home DOM") }
-        print("PASS: HTML/native Return navigation, back/forward, retained home WebView, both drafts and actual shortcut click")
+
+        store.newTab(address: baseURL + "/nav/a")
+        let webTab = store.selected!, browser = store.browser!
+        let webTabCount = store.tabs.count
+        try await AISelfCheck.wait(timeout: 10) { browser.webView.title == "a" && !browser.loading }
+        try await fixture.focus()
+        let capture = MenuCapture()
+        let tracking = NotificationCenter.default.addObserver(forName: NSMenu.didBeginTrackingNotification,
+                                                               object: nil, queue: .main) { note in
+            MainActor.assumeIsolated {
+                guard let menu = note.object as? NSMenu, menu.items.contains(where: { $0.title == "回到首页" }) else { return }
+                capture.menu = menu
+                RunLoop.main.add(Timer(timeInterval: 0.05, repeats: false) { _ in
+                    menu.cancelTrackingWithoutAnimation()
+                }, forMode: .common)
+            }
+        }
+        defer { NotificationCenter.default.removeObserver(tracking) }
+        let content = panel.contentView!, edge = content.convert(content.bounds, to: nil).maxX
+        func openMore() async throws -> NSMenu {
+            capture.menu = nil
+            let toolbar = fixture.toolbar(), field = toolbar.convert(toolbar.bounds, to: nil)
+            let point = NSPoint(x: edge - 22, y: field.midY)
+            fixture.mouse(.leftMouseDown, at: point)
+            fixture.mouse(.leftMouseUp, at: point)
+            try await AISelfCheck.wait { capture.menu != nil }
+            return capture.menu!
+        }
+        let more = try await openMore()
+        guard !more.items.contains(where: { ["添加网站", "在新标签页打开", "从浏览器导入…"].contains($0.title) }),
+              let passwords = more.items.firstIndex(where: { $0.title == "密码管理" }),
+              more.items.indices.contains(passwords + 2), more.items[passwords + 1].isSeparatorItem,
+              more.items[passwords + 2].title == "清除当前网站的 Cookie…",
+              let homeIndex = more.items.firstIndex(where: { !$0.isSeparatorItem }),
+              more.items[homeIndex].title == "回到首页" else {
+            throw PerchError("More must start with Home and put one divider between Passwords and Clear Cookies")
+        }
+        more.performActionForItem(at: homeIndex)
+        try await AISelfCheck.wait(timeout: 10) { browser.isHome && browser.canGoBack && store.browser == nil }
+        _ = try await fixture.home()
+        guard store.selected == webTab, store.tabs.count == webTabCount,
+              store.tabs.first(where: { $0.id == webTab })?.displayTitle == "首页",
+              fixture.toolbar().stringValue == "perch://home",
+              browser.webView.backForwardList.backList.count == 1 else {
+            throw PerchError("Return to Home did not create exactly one navigation in the selected tab")
+        }
+        store.goHome()
+        browser.goBack()
+        try await AISelfCheck.wait(timeout: 10) { store.browser === browser && browser.webView.title == "a" }
+        browser.goForward()
+        try await AISelfCheck.wait(timeout: 10) { browser.webView.url == HomeHistoryPage.homeURL && store.browser == nil }
+        _ = try await fixture.home()
+        let aboutMenu = try await openMore()
+        guard let version = aboutMenu.items.firstIndex(where: { $0.title == "Perch \(UpdateCheck.currentVersion)" }),
+              version >= 2, aboutMenu.items[version].isEnabled, aboutMenu.items[version - 1].title == "设置",
+              aboutMenu.items[version - 2].isSeparatorItem else {
+            throw PerchError("More must show a divider above Settings, followed by the clickable version")
+        }
+        aboutMenu.performActionForItem(at: version)
+        try await AISelfCheck.wait(timeout: 10) { store.browser?.webView.url == SettingsRoute.about.url }
+        print("PASS: HTML/native Return navigation, retained home drafts, actual shortcut click, and Go Home in the same tab with back/forward")
+        print("PASS: actual More menu puts Settings above the version and opens About from the version")
     }
 }

@@ -126,7 +126,7 @@ struct TabSidebar: View, Animatable {
     var body: some View {
         let palette = theme.selection
         GeometryReader { geometry in
-            let availableHeight = max(0, geometry.size.height - 122 - (store.availableUpdate == nil ? 0 : 40))
+            let availableHeight = max(0, geometry.size.height - 81 - (store.availableUpdate == nil ? 0 : 40))
             VStack(alignment: .leading, spacing: 4) {
                 NativeTabList(store: store, compact: compact, expansion: expansion)
                     .frame(height: min(contentHeight, availableHeight))
@@ -150,15 +150,6 @@ struct TabSidebar: View, Animatable {
                         .frame(height: 36)
                         .padding(.horizontal, compact ? 0 : 8)
                 }
-                Color(palette.line).frame(height: 1)
-                Button { store.openSettings() } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: "gearshape").font(.system(size: 15))
-                        if !compact { Text("设置").font(.system(size: 12)) }
-                    }.frame(maxWidth: .infinity, alignment: compact ? .center : .leading).frame(height: 36)
-                        .padding(.horizontal, compact ? 0 : 8).contentShape(Rectangle())
-                }.buttonStyle(.plain).foregroundStyle(Style.muted)
-                    .help("设置 ⌘,").accessibilityLabel("设置")
             }
             .padding(.bottom, 4)
         }.padding(.horizontal, 8).padding(.top, 12)

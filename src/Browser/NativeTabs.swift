@@ -631,7 +631,7 @@ final class TabCell: NSTableCellView {
         let symbol: String? = tab.isChat ? "bubble.left.and.bubble.right.fill" :
             historyPage ? "clock.arrow.circlepath" : downloadsPage ? "arrow.down.to.line" :
             SettingsRoute(URL(string: tab.address)) != nil ? "gearshape" :
-            tab.address.isEmpty ? "house" : nil
+            tab.isHome ? "house" : nil
         label.font = .systemFont(ofSize: 12, weight: symbol != nil ? .semibold : .regular)
         icon.imageScaling = .scaleProportionallyUpOrDown
         if let symbol {
@@ -1510,7 +1510,7 @@ struct NativeTabList: NSViewRepresentable {
             add("复制", "duplicate")
             add(tab.pinned ? "取消固定" : "固定", "pin")
             menu.addItem(.separator())
-            add("将此标签页加入书签", "bookmark", enabled: !tab.address.isEmpty)
+            add("将此标签页加入书签", "bookmark", enabled: !tab.isHome)
             add("复制网址", "copy", enabled: !tab.address.isEmpty)
             menu.addItem(.separator())
             add("关闭", "close")
