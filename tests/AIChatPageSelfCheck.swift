@@ -741,14 +741,31 @@ enum AIChatPageSelfCheck {
             let diagnostic = try await web.evaluateJavaScript("JSON.stringify({click:window.lastFixtureClick,items:document.getElementById('draft-items').innerHTML,owner:document.documentElement.dataset.owner})")
             throw PerchError("Closed-reference removal: \(diagnostic ?? "none"); remaining=\(String(describing: store.ai.draftClosedReferences[owner])), active=\(NSApp.isActive), key=\(panel.isKeyWindow)")
         }
+        if let baseURL {
+            var stream = config
+            stream.baseURL = baseURL + "/streaming"
+            guard store.ai.send("Thinking streaming fixture", tab: owner, browser: nil, usePage: false,
+                                configurationOverride: stream, searchOverride: .off) else {
+                throw PerchError("Could not start the stop/edit fixture")
+            }
+            try await waitFor(web, "!document.getElementById('stop').hidden && !!document.querySelector('.assistant:last-of-type .reasoning-text')?.textContent")
+            try await fixture.click("#stop", web: web)
+            try await waitFor(web, "document.getElementById('stop').hidden")
+            guard store.ai.sessions[owner]?.requestID == nil,
+                  store.ai.sessions[owner]?.messages.last?.text.isEmpty == true else {
+                throw PerchError("Stop did not interrupt the fixture while thinking")
+            }
+        }
         let draftBeforeEdit = store.ai.drafts[owner], originalMessages = store.ai.sessions[owner]!.messages
         for action in ["重新编辑这条消息", "从这轮 Fork 新对话"] {
             _ = try await web.evaluateJavaScript("document.querySelector('.message.user').scrollIntoView({block:'start'})")
             let target = ".message.user [aria-label='\(action)']"
-            // Hover through the application event route so the real message action becomes hittable.
-            fixture.mouse(.mouseMoved, at: try await fixture.point(".message.user", web: web))
-            try await Task.sleep(nanoseconds: 150_000_000)
-            try await fixture.click(target, web: web)
+            try await waitFor(web, "!document.querySelector('.message.user').classList.contains('hovered')")
+            // A fast click can arrive before the native hover callback updates WebKit.
+            let point = try await fixture.point(target, web: web)
+            fixture.mouse(.leftMouseDown, at: point)
+            try await Task.sleep(nanoseconds: 40_000_000)
+            fixture.mouse(.leftMouseUp, at: point)
             do { try await AISelfCheck.wait { store.ai.pendingEdits[owner] != nil } }
             catch {
                 let diagnostic = try await web.evaluateJavaScript("""
@@ -768,7 +785,7 @@ enum AIChatPageSelfCheck {
                 throw PerchError("Cancel edit changed conversation history")
             }
         }
-        print("PASS: native @ filtering/Return, closed-reference removal, rewind/Fork preview and Escape preserve drafts/history")
+        print("PASS: native @ filtering/Return, closed-reference removal, rewind/Fork without a hover update and Escape preserve drafts/history")
 
         _ = try await web.evaluateJavaScript("""
             document.querySelector('.markdown').scrollIntoView({block:'start'});
@@ -831,7 +848,7 @@ enum AIChatPageSelfCheck {
         try await fixture.key(36, "\r")
         try await check(web, "document.getElementById('send').disabled && document.getElementById('composer').value.length===8001",
                         "超长输入必须保留草稿并拒绝发送")
-        guard store.ai.sessions[owner]!.messages.count == messageCount else { throw PerchError("Oversized draft was sent") }
+        guard store.ai.sessions[owner]!.messages.count == originalMessages.count else { throw PerchError("Oversized draft was sent") }
         try await type("保留草稿", fixture: fixture, web: web)
         try await richContent(fixture: fixture, web: web, owner: owner)
 

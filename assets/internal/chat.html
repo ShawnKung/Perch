@@ -18,8 +18,9 @@ button:focus-visible,summary:focus-visible,select:focus-visible{outline:2px soli
 .message.user{background:var(--perch-mint)}.message.editing{outline:1.5px solid var(--perch-accent)}
 .message.dimmed{opacity:.32}.message header{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:calc(1em * 10 / 13);font-weight:600;margin-bottom:4px}
 .message header>span{flex:1;min-width:0}
-.message-actions{display:flex;flex:none;opacity:0;pointer-events:none;transition:opacity .16s ease-in-out}
-.message.hovered .message-actions,.message:focus-within .message-actions{opacity:1;pointer-events:auto}
+/* Hover controls visibility; a delayed native hover update must not swallow a click. */
+.message-actions{display:flex;flex:none;opacity:0;transition:opacity .16s ease-in-out}
+.message.hovered .message-actions,.message:focus-within .message-actions,.message-actions:hover{opacity:1}
 .icon-button{display:inline-flex;align-items:center;justify-content:center;min-width:24px;min-height:24px;border-radius:5px}
 .icon-button:hover{background:var(--perch-sidebar)}
 .message-actions .icon-button,.followup .icon-button{position:relative;isolation:isolate}
